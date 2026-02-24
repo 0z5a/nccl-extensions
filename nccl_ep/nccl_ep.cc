@@ -4,24 +4,22 @@
  * See LICENSE.txt for more license information.
  */
 
-#include "nccl.h"
-#include "nccl_ep.h"
+#include <unistd.h>
+#include <algorithm>
 #include <cassert>
-#include "nccl_device.h"
-#include "nccl_device/core.h"
-#include "nccl_device/gin.h"
-#include <cstdlib>
 #include <cstdio>
-#include <vector>
-#include <optional>
+#include <cstdlib>
+#include <functional>
 #include <memory>
 #include <new>
-#include <algorithm>
-#include <functional>
+#include <optional>
 #include <set>
 #include <string>
-#include <unistd.h>
-#include "common.hpp"
+#include <vector>
+#include <nccl.h>
+#include <nccl_device.h>
+#include "include/common.hpp"
+#include "include/nccl_ep.h"
 
 // HT (High Throughput) includes
 #include "device/hybridep_adapter.cuh"

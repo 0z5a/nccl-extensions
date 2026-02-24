@@ -1,19 +1,20 @@
+/*
+ * Portions of this file are adapted from DeepEP (https://github.com/deepseek-ai/DeepEP).
+ * Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
+ */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ * See LICENSE.txt for more license information.
+ */
+
 #pragma once
 
 #include <cstdint>
-#include <cuda_runtime_api.h>
-
-// GIN types are provided by the NCCL GIN headers.
-// When compiling with nvcc, include the full device API headers.
-// When compiling with g++, the types are already available through
-// nccl_device.h -> gin/gin_device_common.h include chain.
+#include <cuda_runtime.h>
 #include <nccl.h>
 #include "nccl_device.h"
-#include "nccl_device/gin.h"
-#include "nccl_device/gin/gin_device_common.h"
-#include "nccl_device/gin/gin_device_host_common.h"
-// Note: ncclGinCtx_M and ncclGinSignal_t are already defined in
-// gin/gin_device_common.h which is included via nccl_device.h
 
 namespace nccl_ep {
 namespace hybridep {

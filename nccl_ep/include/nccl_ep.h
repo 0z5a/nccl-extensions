@@ -6,8 +6,8 @@
 
 #pragma once
 
-#include <nccl.h>
 #include <cuda.h>
+#include <nccl.h>
 
 #ifdef __cplusplus
 extern "C" {

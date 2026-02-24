@@ -2,13 +2,32 @@
 
 ## Quick Start
 
+## Binary: build and test nccl_ep/ep_bench
+
+### Discover compute capabilities
+Use `nvidia-smi` command to detect the compute capabilities of your NVIDIA GPU.
+For example, on Hopper system with `compute_cap` of `90`, the output looks like below:
+```bash
+$ nvidia-smi --query-gpu=compute_cap --format=csv
+compute_cap
+9.0
+...
+```
+
+### Set the environment
+```bash
+export COMPUTE_CAP=<discovered compute_cap>
+export CUDA_HOME=/path/to/cuda
+export MPI_HOME=/path/to/openmpi
+export NCCL_HOME=/path/to/nccl/build # The desired NCCL build
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:$LD_LIBRARY_PATH"
+export PATH="${CUDA_HOME}/bin:${NCCL_HOME}/bin:${MPI_HOME}/bin:$PATH"
+```
+
+### Build and Run
 ```bash
 # Build (from nccl root; builds lib + ep_test + ep_bench)
-make -C contrib/nccl_ep MPI=1 MPI_HOME=$HPCX_MPI_DIR NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"
-
-# Binary: build/test/nccl_ep/ep_bench
-export NCCL_HOME=/path/to/nccl/build
-export LD_LIBRARY_PATH=$NCCL_HOME/lib:${CUDA_HOME}/lib64:$LD_LIBRARY_PATH
+make -C contrib/nccl_ep MPI=1 NVCC_GENCODE="-gencode=arch=compute_${COMPUTE_CAP},code=sm_${COMPUTE_CAP}" BUILDDIR=$NCCL_HOME
 
 # Run Low Latency benchmark with validation (8 GPUs, single node)
 mpirun -np 8 --oversubscribe --allow-run-as-root -x LD_LIBRARY_PATH $NCCL_HOME/test/nccl_ep/ep_bench --algorithm low-latency --validate

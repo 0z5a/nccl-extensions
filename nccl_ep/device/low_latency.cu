@@ -9,21 +9,21 @@
  * See LICENSE.txt for more license information.
  */
 
-#include "device_primitives.cuh"
-#include "nccl_device.h"
 #include <cooperative_groups.h>
+#include "nccl_device.h"
+#include "device_primitives.cuh"
 
 namespace cg = cooperative_groups;
 
 namespace nccl_ep {
 
 namespace internode_ll {
-template <bool use_warp_sync = false>
-__forceinline__ __device__ bool is_rank_masked(int* rankMask, int rank) {
+template <bool useWarpSync = false>
+__forceinline__ __device__ bool isRankMasked(int* rankMask, int rank) {
     if (rankMask == nullptr) {
         return false;
     }
-    if constexpr (use_warp_sync) {
+    if constexpr (useWarpSync) {
         return __shfl_sync(0xffffffff, ld_acquire_global(rankMask + rank), 0) != 0;
     } else {
         return ld_acquire_global(rankMask + rank) != 0;
@@ -138,7 +138,7 @@ __forceinline__ __device__ void sendToken(
     const auto dstP2pPtr = ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank,
                                          dstRank, dstExpertLocalIdx, windows, devComms);
 
-    if (not is_rank_masked<true>(rankMask, dstRank)) {
+    if (not isRankMasked<true>(rankMask, dstRank)) {
         if (dstP2pPtr == 0) {
             if (laneId == 0) {
                 size_t expectedSrcOffset = sendOff + tokenIdx * numBytesPerMsg;
@@ -228,7 +228,7 @@ __forceinline__ __device__ void sendExpertCount(
     const auto dstP2pPtr = ncclGetP2pPtr(recvCntPtr, recvCntOffset, currRank, dstRank,
                                           dstExpertLocalIdx, windows, devComms);
 
-    if (not is_rank_masked(rankMask, dstRank)) {
+    if (not isRankMasked(rankMask, dstRank)) {
         if (dstP2pPtr == 0) {
             auto commId = dstExpertLocalIdx / MAX_NCCL_GIN_CTX_PER_COMM;
             auto ctxId = dstExpertLocalIdx % MAX_NCCL_GIN_CTX_PER_COMM;
@@ -270,7 +270,7 @@ __forceinline__ __device__ int waitForRecvTokens(
     uint64_t waitRecvCost = 0;
     int numRecvTokens = 0;
 
-    if (not is_rank_masked(rankMask, srcRank)) {
+    if (not isRankMasked(rankMask, srcRank)) {
         size_t srcOffset = recvCntOff + (localExpertIdx * numRanks + srcRank) * sizeof(int);
         auto srcP2pPtr = ncclGetP2pPtr(0x01, srcOffset, currRank, srcRank, localExpertIdx, windows, devComms);
 
@@ -624,19 +624,19 @@ void dispatch(const void* inData,
               int numExperts,
               int currRank,
               int numRanks,
-              bool use_fp8,
+              bool useFp8,
               bool roundScale,
-              bool use_ue8m0,
+              bool useUe8m0,
               int phases,
               int numComms,
               ncclDevComm* devComms,
               const ncclWindow_t* windows,
               unsigned signalsBase,
               void* workspace,
-              int num_device_sms,
+              int numDeviceSms,
               cudaStream_t stream) {
     constexpr int kNumMaxTopK = 9;
-    const int numWarpGroups = ceil_div(numExperts, num_device_sms);
+    const int numWarpGroups = ceil_div(numExperts, numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
     EP_HOST_ASSERT(numWarpGroups > 0 and numWarpsPerGroup > 0);
     EP_HOST_ASSERT(kNumMaxTopK + 1 <= numWarpGroups * numWarpsPerGroup);
@@ -651,16 +651,16 @@ void dispatch(const void* inData,
     EP_HOST_ASSERT(numExperts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
     // FP8 checks
-    if (use_ue8m0)
+    if (useUe8m0)
         EP_HOST_ASSERT(roundScale and "UE8M0 SF requires `round_scale=True`");
 
 #define DISPATCH_LAUNCH_CASE(hidden) { \
-auto dispatch_func = dispatch<false, false, hidden>; \
-if (use_fp8 and not use_ue8m0) \
-    dispatch_func = dispatch<true, false, hidden>; \
-if (use_fp8 and use_ue8m0) \
-    dispatch_func = dispatch<true, true, hidden>; \
-LAUNCH_KERNEL(&cfg, dispatch_func, \
+auto dispatchFunc = dispatch<false, false, hidden>; \
+if (useFp8 and not useUe8m0) \
+    dispatchFunc = dispatch<true, false, hidden>; \
+if (useFp8 and useUe8m0) \
+    dispatchFunc = dispatch<true, true, hidden>; \
+LAUNCH_KERNEL(&cfg, dispatchFunc, \
               inData, \
               inTopkIdx, \
               /*rankMask=*/nullptr, \
@@ -702,7 +702,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
 }
 
 template <int kNumSendUnrolls>
-__forceinline__ __device__ int logfmt_encode(void* buffer, nv_bfloat162 *shared_amaxmin, const int& lane_id) {
+__forceinline__ __device__ int logfmtEncode(void* buffer, nv_bfloat162 *sharedAmaxmin, const int& laneId) {
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
     constexpr float kLogThreshold = 0;
     constexpr float kMinClip = 32; // `== log_2(2 ^ (2 ^ 5))`
@@ -714,8 +714,8 @@ __forceinline__ __device__ int logfmt_encode(void* buffer, nv_bfloat162 *shared_
     const auto& bf162Data = reinterpret_cast<nv_bfloat162*>(int4Data);
 
     // Calculate lane offset
-    const auto& loadBuf = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(buffer) + lane_id * (kNumSendUnrolls * sizeof(int4)));
-    const auto& storeBuf = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(buffer) + lane_id * (kNumSendUnrolls * sizeof(int4) * 10 / 16));
+    const auto& loadBuf = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(buffer) + laneId * (kNumSendUnrolls * sizeof(int4)));
+    const auto& storeBuf = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(buffer) + laneId * (kNumSendUnrolls * sizeof(int4) * 10 / 16));
 
     // Local log amax
     auto bf162Amax = __nv_bfloat162(CUDART_ZERO_BF16, CUDART_ZERO_BF16);
@@ -740,8 +740,8 @@ __forceinline__ __device__ int logfmt_encode(void* buffer, nv_bfloat162 *shared_
     amin = warp_reduce_min<kNumLanesToReduce>(amin);
 
     // Write min/max into the shared memory
-    if (shared_amaxmin != nullptr)
-        *shared_amaxmin = __nv_bfloat162(amax, amin);
+    if (sharedAmaxmin != nullptr)
+        *sharedAmaxmin = __nv_bfloat162(amax, amin);
     __syncwarp();
 
     // Calculate log amin/amax float
@@ -783,16 +783,16 @@ __forceinline__ __device__ int logfmt_encode(void* buffer, nv_bfloat162 *shared_
 }
 
 template <int kNumLanes, int kNumSendUnrolls, int kNumRecvUnrolls>
-__forceinline__ __device__ void logfmt_check_amaxmin(uint8_t* meta_buffer, float2* shared_log_amax,
-                                                     float2* shared_log_amin, int* shared_cast_info,
-                                                     const int lane_id) {
+__forceinline__ __device__ void logfmtCheckAmaxmin(uint8_t* metaBuffer, float2* sharedLogAmax,
+                                                   float2* sharedLogAmin, int* sharedCastInfo,
+                                                   const int laneId) {
     constexpr float kLogThreshold = 0;
     constexpr float kMinClip = 32; // `== log_2(2 ^ (2 ^ 5))`
 
     bool enableCast = true;
-    if (lane_id < kNumLanes) {
+    if (laneId < kNumLanes) {
         // Calculate log amin/amax float
-        auto amaxminData = reinterpret_cast<uint64_t*>(meta_buffer)[lane_id];
+        auto amaxminData = reinterpret_cast<uint64_t*>(metaBuffer)[laneId];
         const auto& bf162Amaxmin = reinterpret_cast<__nv_bfloat162*>(&amaxminData);
         float logAmax[2], logAmin[2];
         #pragma unroll
@@ -803,29 +803,29 @@ __forceinline__ __device__ void logfmt_check_amaxmin(uint8_t* meta_buffer, float
             logAmin[i] = amin == 0 ? logAmax[i] - kMinClip : fmaxf(log2f_approx(amin), logAmax[i] - kMinClip);
             enableCast = enableCast and logAmax[i] < kLogThreshold and logAmin[i] < logAmax[i];
         }
-        shared_log_amax[lane_id] = make_float2(logAmax[0], logAmax[1]);
-        shared_log_amin[lane_id] = make_float2(logAmin[0], logAmin[1]);
+        sharedLogAmax[laneId] = make_float2(logAmax[0], logAmax[1]);
+        sharedLogAmin[laneId] = make_float2(logAmin[0], logAmin[1]);
     }
 
-    const auto& casted = warp_reduce_and<kNumSendUnrolls>(enableCast) ? 1u << (lane_id / kNumRecvUnrolls): 0u;
-    const auto& numCastedPrefix = __popc(warp_reduce_or<kNumRecvUnrolls, true>(casted) & ((1u << (lane_id / kNumRecvUnrolls)) - 1));
+    const auto& casted = warp_reduce_and<kNumSendUnrolls>(enableCast) ? 1u << (laneId / kNumRecvUnrolls): 0u;
+    const auto& numCastedPrefix = __popc(warp_reduce_or<kNumRecvUnrolls, true>(casted) & ((1u << (laneId / kNumRecvUnrolls)) - 1));
 
-    if (lane_id < kNumLanes and lane_id % kNumRecvUnrolls == 0)
-        shared_cast_info[lane_id / kNumRecvUnrolls] = (numCastedPrefix << 1) | (casted ? 1u : 0u);
+    if (laneId < kNumLanes and laneId % kNumRecvUnrolls == 0)
+        sharedCastInfo[laneId / kNumRecvUnrolls] = (numCastedPrefix << 1) | (casted ? 1u : 0u);
     __syncwarp();
 }
 
 template <int kNumRecvUnrolls>
-__forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float* accum,
-                                                      const float& log_amax, const float& log_amin,
-                                                      const bool& enable_cast, const float& weight) {
-    if (enable_cast) {
+__forceinline__ __device__ void decodeAndAccumulate(uint32_t* ldBuffer, float* accum,
+                                                    const float& logAmax, const float& logAmin,
+                                                    const bool& enableCast, const float& weight) {
+    if (enableCast) {
         constexpr int kNumBits = 10;
         constexpr int kNumValues = 1 << (kNumBits - 1);
 
-        const auto& step = (log_amax - log_amin) / static_cast<float>(kNumValues - 2);
+        const auto& step = (logAmax - logAmin) / static_cast<float>(kNumValues - 2);
         auto decode = [=](const uint32_t &encoded, const uint32_t &sign) {
-            const auto decoded = encoded == 0 ? .0f : exp2f_approx((encoded - 1) * step + log_amin);
+            const auto decoded = encoded == 0 ? .0f : exp2f_approx((encoded - 1) * step + logAmin);
             return sign ? -decoded : decoded;
         };
 
@@ -833,13 +833,13 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
         #pragma unroll
         for (int i = 0; i < kNumRecvUnrolls / 2; ++ i) {
             uint32_t concatData[6];
-            concatData[0] = ld_buffer[i * 5];
+            concatData[0] = ldBuffer[i * 5];
             #pragma unroll
             for (int k = 1; k < 5; ++ k)
-                concatData[k] = (ld_buffer[i * 5 + k - 1] >> (32 - k * 5)) | (ld_buffer[i * 5 + k] << (k * 5));
-            concatData[5] = ld_buffer[i * 5 + 4] >> 7;
+                concatData[k] = (ldBuffer[i * 5 + k - 1] >> (32 - k * 5)) | (ldBuffer[i * 5 + k] << (k * 5));
+            concatData[5] = ldBuffer[i * 5 + 4] >> 7;
 
-            const uint32_t& localSigns = ld_buffer[i * 5 + 4] >> 16;
+            const uint32_t& localSigns = ldBuffer[i * 5 + 4] >> 16;
             #pragma unroll
             for (int k = 0; k < 5; ++ k) {
                 accum[i * 16 + k * 3 + 0] += decode((concatData[k] >>  0) & 0x1ff, (localSigns >> (k * 3 + 0)) & 1) * weight;
@@ -851,7 +851,7 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
     } else {
         #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
-            auto bf16Pack = *reinterpret_cast<__nv_bfloat162*>(ld_buffer + k);
+            auto bf16Pack = *reinterpret_cast<__nv_bfloat162*>(ldBuffer + k);
             accum[k * 2 + 0] += static_cast<float>(bf16Pack.x) * weight;
             accum[k * 2 + 1] += static_cast<float>(bf16Pack.y) * weight;
         }
@@ -893,7 +893,7 @@ __forceinline__ __device__ void sendFinishFlag(
     auto dstP2pPtr = ncclGetP2pPtr(
         recvFlagPtr, recvFlagOffset, currRank, dstRank, localExpertIdx, windows, devComms);
 
-    if (not is_rank_masked(rankMask, dstRank)) {
+    if (not isRankMasked(rankMask, dstRank)) {
         if (dstP2pPtr == 0) {
             auto signalId = signalsBase + globalExpertIdx;
             auto localExpertIdxFlag = localExpertIdx;
@@ -939,7 +939,7 @@ __forceinline__ __device__ void waitForRecvFlag(
     size_t srcOffset = recvFlagOff + responsibleExpertIdx * sizeof(int);
     auto srcP2pPtr = ncclGetP2pPtr(
         0x01, srcOffset, currRank, srcRank, (responsibleExpertIdx % numLocalExperts), windows, devComms);
-    if (not is_rank_masked(rankMask, srcRank)) {
+    if (not isRankMasked(rankMask, srcRank)) {
         if (srcP2pPtr == 0) {
             uint64_t curValue;
             auto localExpertIdxWait = responsibleExpertIdx % numLocalExperts;
@@ -1079,7 +1079,7 @@ __forceinline__ __device__ void processAndSendToken(
             if constexpr (kUseLogFMT) {
                 // Cast if possible
                 constexpr int kNumInt4PerDivision = 128 / kNumElemsPerInt4;
-                int numTmaBytes = logfmt_encode<kNumSendUnrolls>(
+                int numTmaBytes = logfmtEncode<kNumSendUnrolls>(
                     tmaBuffers[stageIdx],
                     // NOTES: only the leader lane will write the result
                     (i % kNumInt4PerDivision == 0) ? metaBuffers + i / kNumInt4PerDivision : nullptr,
@@ -1243,7 +1243,7 @@ __global__ __launch_bounds__(1024, 1) void combine(// INPUT
         };
 
         // Issue IBGDA send
-        if (not is_rank_masked<true>(rankMask, dstRank)) {
+        if (not isRankMasked<true>(rankMask, dstRank)) {
             for (int tokenIdx = offset + subWarpId; tokenIdx < offset + numTokensToSend; tokenIdx += numWarpsPerGroup) {
                 const auto srcDataInt4Ptr = srcDataInt4 + tokenIdx * hiddenBf16Int4;
                 const auto sendBufTypeRow = reinterpret_cast<int*>(sendBufUint8 + tokenIdx * numBytesPerSlot);
@@ -1367,13 +1367,13 @@ LOW_LATENCY_COMBINE_RECV:
                     int topkIdxReg = __shfl_sync(0xffffffff, topkIdxByLane, i);
                     if (topkIdxReg < 0)
                         continue;
-                    if (is_rank_masked(rankMask, topkIdxReg / numLocalExperts))
+                    if (isRankMasked(rankMask, topkIdxReg / numLocalExperts))
                         continue;
 
                     mbarrier_wait<true>(emptyBarriers[stageIdx], tmaPhase, stageIdx);
                     auto recvBufData = static_cast<uint8_t*>(recvBuf) + (topkIdxReg * maxTokensPerRank + tokenIdx) * numBytesPerSlot;
                     if constexpr (kUseLogFMT) {
-                        logfmt_check_amaxmin<kNumDivisions / 2, kNumSendUnrolls, kNumRecvUnrolls>(
+                        logfmtCheckAmaxmin<kNumDivisions / 2, kNumSendUnrolls, kNumRecvUnrolls>(
                             recvBufData,
                             reinterpret_cast<float2*>(logAmaxBuffers[stageIdx]),
                             reinterpret_cast<float2*>(logAminBuffers[stageIdx]),
@@ -1409,7 +1409,7 @@ LOW_LATENCY_COMBINE_RECV:
                     int topkIdxReg = __shfl_sync(0xffffffff, topkIdxByLane, i);
                     if (topkIdxReg < 0)
                         continue;
-                    if (is_rank_masked(rankMask, topkIdxReg / numLocalExperts))
+                    if (isRankMasked(rankMask, topkIdxReg / numLocalExperts))
                         continue;
                     const auto& topkWeight = __shfl_sync(0xffffffff, topkWeightsByLane, i);
 
@@ -1420,7 +1420,7 @@ LOW_LATENCY_COMBINE_RECV:
                         int numCastedPrefix = info >> 1;
                         int tmaOffset = kNumLogFMTPerWarpBytes * numCastedPrefix + kNumBF16PerWarpBytes * (decodeWarpIdx - numCastedPrefix);
                         int divisionIdx = decodeWarpIdx * (kNumRecvUnrolls * 2) + laneId * kNumRecvUnrolls / 16;
-                        decode_and_accumulate<kNumRecvUnrolls>(
+                        decodeAndAccumulate<kNumRecvUnrolls>(
                             reinterpret_cast<uint32_t*>(tmaLdBuffers[stageIdx] + tmaOffset +
                                                         (enableCast ? kNumLogFMTPerWarpBytes : kNumBF16PerWarpBytes) / 32 * laneId),
                             combinedData,
@@ -1430,7 +1430,7 @@ LOW_LATENCY_COMBINE_RECV:
                             topkWeight);
                     } else {
                         int tmaOffset = kNumBF16PerWarpBytes * decodeWarpIdx;
-                        decode_and_accumulate<kNumRecvUnrolls>(
+                        decodeAndAccumulate<kNumRecvUnrolls>(
                             reinterpret_cast<uint32_t*>(tmaLdBuffers[stageIdx] + tmaOffset + kNumBF16PerWarpBytes / 32 * laneId),
                             combinedData,
                             0,
@@ -1488,7 +1488,7 @@ void combine(const void* inData,
              int numExperts,
              int currRank,
              int numRanks,
-             bool use_logfmt,
+             bool useLogfmt,
              int phases,
              bool zeroCopy,
              int numComms,
@@ -1496,11 +1496,11 @@ void combine(const void* inData,
              const ncclWindow_t* windows,
              unsigned signalsBase,
              void* workspace,
-             int num_device_sms,
+             int numDeviceSms,
              cudaStream_t stream) {
-    const int numWarpGroups = ceil_div(numExperts, num_device_sms);
+    const int numWarpGroups = ceil_div(numExperts, numDeviceSms);
     const int numWarpsPerGroup = 32 / numWarpGroups;
-    const int numRecvPerSm = ceil_div(numCombinedTokens, num_device_sms);
+    const int numRecvPerSm = ceil_div(numCombinedTokens, numDeviceSms);
     EP_HOST_ASSERT(numWarpGroups > 0 and numWarpsPerGroup > 0 and numRecvPerSm >= 0);
 
     const auto numWarps = numWarpGroups * numWarpsPerGroup;
@@ -1513,7 +1513,7 @@ void combine(const void* inData,
     EP_HOST_ASSERT(numTopk <= kCombineMaxTopk);
 
     // Online cast cannot use zero-copy
-    EP_HOST_ASSERT(not (zeroCopy and use_logfmt));
+    EP_HOST_ASSERT(not (zeroCopy and useLogfmt));
 
     constexpr int kNumStages = 3;
     constexpr int kMaxNumGroups = 2;
@@ -1531,7 +1531,7 @@ void combine(const void* inData,
     const int smem_size = max(smemSendSize, smemRecvSize);
 
 #define COMBINE_LAUNCH_CASE(hidden) { \
-if (use_logfmt) { \
+if (useLogfmt) { \
     SET_SHARED_MEMORY_FOR_TMA((combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls>)); \
     LAUNCH_KERNEL(&cfg, combine<true, hidden, kCombineMaxTopk, kCombineMaxUnrolls>, \
                   inData, \

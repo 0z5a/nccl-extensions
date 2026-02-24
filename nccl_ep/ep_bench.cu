@@ -5,25 +5,26 @@
  */
 // Throughput and validation methodology aligned with DeepEP (https://github.com/deepseek-ai/DeepEP).
 
+#include <getopt.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <vector>
+#include <string.h>
+#include <unistd.h>
 #include <algorithm>
-#include <numeric>
+#include <cmath>
 #include <functional>
+#include <numeric>
 #include <random>
 #include <set>
-#include <cmath>
-#include "cuda_runtime.h"
-#include "cuda_profiler_api.h"
-#include "nccl.h"
-#include "nccl_ep.h"
-#include "mpi.h"
-#include <unistd.h>
-#include <stdint.h>
-#include <string.h>
-#include <getopt.h>
+#include <vector>
+#include <mpi.h>
+#include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <nvtx3/nvToolsExt.h>
+#include <nccl.h>
+#include "nccl_ep.h"
+
 
 #define MPICHECK(cmd) do {                          \
   int e = cmd;                                      \
@@ -416,23 +417,6 @@ struct ValidationResult {
     std::string message;
 };
 
-// Calculate relative difference (like DeepEP's calc_diff)
-// Returns a value where 0 = perfect match, larger = more difference
-double calcDiff(const float* x, const float* y, size_t n) {
-    double sum_xy = 0.0, sum_xx = 0.0, sum_yy = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        double xi = static_cast<double>(x[i]) + 1.0;  // Add 1 to handle zeros (like DeepEP)
-        double yi = static_cast<double>(y[i]) + 1.0;
-        sum_xy += xi * yi;
-        sum_xx += xi * xi;
-        sum_yy += yi * yi;
-    }
-    double denominator = sum_xx + sum_yy;
-    if (denominator < 1e-10) return 0.0;  // Both near zero
-    double sim = 2.0 * sum_xy / denominator;
-    return 1.0 - sim;
-}
-
 // Validate dispatch output: check that received data came from correct source ranks
 // For HT mode: validates recv_tokens tensor
 ValidationResult validateDispatchOutput(
@@ -724,60 +708,6 @@ struct BenchResult {
     double max_ms;
     double throughput_gbps;
 };
-
-// Run benchmark with CUDA events
-BenchResult runBenchmark(
-    std::function<void()> fn,
-    int num_warmup,
-    int num_iters,
-    size_t data_bytes,
-    cudaStream_t stream
-) {
-    // Warmup
-    for (int i = 0; i < num_warmup; i++) {
-        fn();
-    }
-    CUDACHECK(cudaStreamSynchronize(stream));
-
-    // Create events
-    std::vector<cudaEvent_t> start_events(num_iters);
-    std::vector<cudaEvent_t> end_events(num_iters);
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventCreate(&start_events[i]));
-        CUDACHECK(cudaEventCreate(&end_events[i]));
-    }
-
-    // Run benchmark
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventRecord(start_events[i], stream));
-        fn();
-        CUDACHECK(cudaEventRecord(end_events[i], stream));
-    }
-    CUDACHECK(cudaStreamSynchronize(stream));
-
-    // Collect times
-    std::vector<float> times(num_iters);
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventElapsedTime(&times[i], start_events[i], end_events[i]));
-    }
-
-    // Cleanup events
-    for (int i = 0; i < num_iters; i++) {
-        CUDACHECK(cudaEventDestroy(start_events[i]));
-        CUDACHECK(cudaEventDestroy(end_events[i]));
-    }
-
-    // Calculate statistics (skip first iteration for more stable results)
-    std::vector<float> times_trimmed(times.begin() + 1, times.end());
-
-    BenchResult result;
-    result.avg_ms = std::accumulate(times_trimmed.begin(), times_trimmed.end(), 0.0) / times_trimmed.size();
-    result.min_ms = *std::min_element(times_trimmed.begin(), times_trimmed.end());
-    result.max_ms = *std::max_element(times_trimmed.begin(), times_trimmed.end());
-    result.throughput_gbps = (data_bytes / 1e9) / (result.avg_ms / 1000.0);
-
-    return result;
-}
 
 // Structure to hold paired dispatch+combine benchmark results
 struct PairedBenchResult {

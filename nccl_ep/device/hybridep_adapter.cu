@@ -1,8 +1,19 @@
+/*
+ * Portions of this file are adapted from DeepEP (https://github.com/deepseek-ai/DeepEP).
+ * Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
+ */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ * See LICENSE.txt for more license information.
+ */
+
+#include "nccl_device.h"
 #include "hybridep_adapter.cuh"
-#include "common.hpp"
 #include "hybridep_configs.cuh"
-#include "nccl_device/gin/gin_device_api.h"
 #include "hybrid_ep.cuh"
+#include "include/common.hpp"
 
 namespace nccl_ep {
 namespace hybridep {

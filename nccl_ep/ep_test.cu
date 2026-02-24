@@ -4,16 +4,16 @@
  * See LICENSE.txt for more license information.
  */
 
+#include <getopt.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "cuda_runtime.h"
-#include "nccl.h"
-#include "nccl_ep.h"
-#include "mpi.h"
-#include <unistd.h>
-#include <stdint.h>
 #include <string.h>
-#include <getopt.h>
+#include <unistd.h>
+#include <mpi.h>
+#include <cuda_runtime.h>
+#include <nccl.h>
+#include <nccl_ep.h>
 
 // Custom allocator wrappers (can be replaced with custom memory pool)
 static cudaError_t torchMalloc(void** ptr, size_t size) {
@@ -98,15 +98,6 @@ void printUsage(const char* programName, int myRank) {
         printf("  -d <num>                     Set hidden dimension size (default: 7168)\n");
         printf("  -h                           Show this help message\n");
     }
-}
-
-ncclResult_t ncclBarrier(ncclComm_t comm, cudaStream_t stream) {
-    int *nccl_barrier_var = nullptr;
-    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&nccl_barrier_var), sizeof(int)));
-    CUDACHECK(cudaMemset(nccl_barrier_var, 0, sizeof(int)));
-    NCCLCHECK(ncclAllReduce(nccl_barrier_var, nccl_barrier_var, 1, ncclInt, ncclSum, comm, stream));
-    CUDACHECK(cudaFree(nccl_barrier_var));
-    return ncclSuccess;
 }
 
 int main(int argc, char* argv[])

@@ -11,8 +11,8 @@
 
 #pragma once
 
-#include <string>
 #include <exception>
+#include <string>
 #include <cuda_runtime.h>
 
 //==============================================================================

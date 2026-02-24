@@ -71,11 +71,8 @@
 #include <stdexcept>
 #include <vector>
 #include <cuda_bf16.h>
-#include <cuda_runtime.h>
 #include <cuda_fp8.h>
-
-#include <infiniband/mlx5dv.h>
-
+#include <cuda_runtime.h>
 #include "nccl.h"
 #include "nccl_device.h"
 #include "device/macros.cuh"

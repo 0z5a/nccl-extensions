@@ -7,6 +7,14 @@
 CXXSTD := -std=c++17
 include ../../makefiles/common.mk
 
+# Check that NVCC_GENCODE does not include compute capabilities below sm_90
+# Extract all sm_XX numbers and check if any is < 90
+SM_NUMBERS := $(shell echo '$(NVCC_GENCODE)' | grep -oE 'sm_([0-9]+)' | sed 's/sm_//' | sort -u)
+HAS_SM_BELOW_90 := $(shell for sm in $(SM_NUMBERS); do if [ $$sm -lt 90 ]; then echo yes; break; fi; done)
+ifeq ($(HAS_SM_BELOW_90),yes)
+  $(error ERROR: NVCC_GENCODE for NCCL_EP must include at least sm_90 (compute capability 9.0). Found incompatible compute capability. Current value: $(NVCC_GENCODE))
+endif
+
 .PHONY: all clean lib ep_test ep_bench
 
 BUILDDIR ?= $(abspath ../../build)
@@ -14,9 +22,6 @@ OBJDIR := $(BUILDDIR)/obj/nccl_ep
 LIBDIR := $(BUILDDIR)/lib
 INCDIR := $(BUILDDIR)/include
 DST_DIR := $(BUILDDIR)/test/nccl_ep
-
-# Default to sm_90 if not specified (can be overridden: NVCC_GENCODE="-gencode=..." make)
-NVCC_GENCODE ?= -gencode=arch=compute_90,code=sm_90
 
 # Include paths - add current directory so common.hpp can find device/ep headers
 # Include NCCL source headers for GIN support

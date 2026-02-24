@@ -1,19 +1,23 @@
+/*
+ * Portions of this file are adapted from DeepEP (https://github.com/deepseek-ai/DeepEP).
+ * Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
+ */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ * See LICENSE.txt for more license information.
+ */
+
 #pragma once
-#include "common.hpp"
 #include <assert.h>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda/ptx>
-#include "cuda_compat_shims.cuh" // Compatibility shims for CUDA 12.x
-#include <cooperative_groups.h>
 #include <nccl.h>
 #include "nccl_device.h"
-#include "nccl_device/gin.h"
-#include "nccl_device/gin/gin_device_api.h"
-#include "nccl_device/gin/gin_device_common.h"
-#include "nccl_device/gin/gin_device_host_common.h"
-
-#include "infiniband/verbs.h"
-#include "infiniband/mlx5dv.h"
+#include "cuda_compat_shims.cuh" // Compatibility shims for CUDA 12.x
+#include "include/common.hpp"
 
 namespace hybrid_ep{
 
