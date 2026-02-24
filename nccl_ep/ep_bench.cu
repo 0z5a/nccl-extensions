@@ -159,13 +159,13 @@ void setupLowLatencyTensors(
     // Dispatch input: tokens
     tensors.inputs[0] = new ncclNDTensor_t;
     NCCLCHECK(ncclEpTensorCreate(ep_group, tensors.inputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_tokens, hidden));
 
     // Dispatch output: 3D [num_local_experts, num_recv_tokens, hidden]
     tensors.outputs[0] = new ncclNDTensor_t;
     NCCLCHECK(ncclEpTensorCreate(ep_group, tensors.outputs[0], 3, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_local_experts, num_recv_tokens, hidden));
 
     // Local tensors: recv expert counter (device memory) - required for dispatch
@@ -176,17 +176,17 @@ void setupLowLatencyTensors(
 
     // Combine input: 3D expert outputs
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.expert_outputs, 3, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_local_experts, num_recv_tokens, hidden));
 
     // Combine output
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.combined_output, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_tokens, hidden));
 
     // topk_weights as local tensor for combine
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOPK_WEIGHTS,
+                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                                    num_tokens, top_k));
 
     // Setup combine arrays
@@ -217,14 +217,14 @@ void setupHighThroughputTensors(
     // Dispatch input: tokens - initialize with test pattern
     tensors.inputs[0] = new ncclNDTensor_t;
     NCCLCHECK(ncclEpTensorCreate(ep_group, tensors.inputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_tokens, hidden));
     // Initialize token data (required for HT mode)
     CUDACHECK(cudaMemset(tensors.inputs[0]->data, 0, num_tokens * hidden * 2));
 
     // Dispatch input: topk_weights - initialize with equal weights
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.dispatch_topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOPK_WEIGHTS,
+                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                                    num_tokens, top_k));
     // Initialize topk_weights with 1.0f/top_k (required for HT mode)
     {
@@ -239,25 +239,25 @@ void setupHighThroughputTensors(
     tensors.inputs[1] = &tensors.dispatch_topk_weights;
 
     // Dispatch input: topk_idx (reuse the handle tensor with different tag)
-    topk_idx.tag = NCCL_EP_TENSOR_TAG_TOPK_IDX_DISPATCH;
+    topk_idx.tag = NCCL_EP_TENSOR_TAG_TOPK_IDX;
     tensors.inputs[2] = &topk_idx;
 
     // Dispatch output: 2D [num_recv_tokens, hidden]
     tensors.outputs[0] = new ncclNDTensor_t;
     NCCLCHECK(ncclEpTensorCreate(ep_group, tensors.outputs[0], 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_recv_tokens, hidden));
 
     // Dispatch output: recv_topk_weights
     tensors.outputs[1] = new ncclNDTensor_t;
     NCCLCHECK(ncclEpTensorCreate(ep_group, tensors.outputs[1], 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_WEIGHTS,
+                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                                    num_recv_tokens, top_k));
 
     // Dispatch output: recv_topk_idx
     tensors.outputs[2] = new ncclNDTensor_t;
     NCCLCHECK(ncclEpTensorCreate(ep_group, tensors.outputs[2], 2, ncclInt64,
-                                   NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_IDX,
+                                   NCCL_EP_TENSOR_TAG_TOPK_IDX,
                                    num_recv_tokens, top_k));
 
     // Local tensors: recv expert counter (device memory) - required for dispatch
@@ -268,23 +268,23 @@ void setupHighThroughputTensors(
 
     // Combine input: 2D expert outputs - same size as dispatch output (received token count)
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.expert_outputs, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_recv_tokens, hidden));
     CUDACHECK(cudaMemset(tensors.expert_outputs.data, 0, num_recv_tokens * hidden * 2));
 
     // Combine output - sized to num_tokens (original token count per rank)
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.combined_output, 2, ncclBfloat16,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOKENS,
+                                   NCCL_EP_TENSOR_TAG_TOKENS,
                                    num_tokens, hidden));
 
     // topk_weights as regular input for combine
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOPK_WEIGHTS,
+                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                                    num_tokens, top_k));
 
     // Combine output: topk_weights
     NCCLCHECK(ncclEpTensorCreate(ep_group, &tensors.combine_output_topk_weights, 2, ncclFloat32,
-                                   NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOPK_WEIGHTS,
+                                   NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS,
                                    num_tokens, top_k));
 
     // Setup combine arrays
@@ -1559,7 +1559,7 @@ int main(int argc, char* argv[]) {
 
     // Initialize topk_idx tensor
     ncclNDTensor_t topk_idx;
-    TENSOR_INIT_CONTIG(&topk_idx, 2, ncclInt64, sizeof(int64_t), NCCL_EP_TENSOR_TAG_TOPK_IDX_HANDLE,
+    TENSOR_INIT_CONTIG(&topk_idx, 2, ncclInt64, sizeof(int64_t), NCCL_EP_TENSOR_TAG_TOPK_IDX,
                        static_cast<unsigned int>(num_tokens), static_cast<unsigned int>(top_k));
 
     // Generate topk indices

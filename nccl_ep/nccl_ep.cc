@@ -1610,7 +1610,7 @@ ncclResult_t ncclEpCreateHandle(
     // Validate tensor properties
     assert(topk_idx->ndim == 2);
     assert(topk_idx->datatype == ncclInt64);
-    assert(topk_idx->tag == NCCL_EP_TENSOR_TAG_TOPK_IDX_HANDLE);
+    assert(topk_idx->tag == NCCL_EP_TENSOR_TAG_TOPK_IDX);
     assert(tensor_is_contiguous(topk_idx));
 
     // Validate expert configuration
@@ -1866,7 +1866,7 @@ ncclResult_t ncclEpDispatch(
         ncclEpGroup_t group = handle->group;
     if (group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         const ncclNDTensor_t* x = find_tensor_by_tag(
-            inputs, num_inputs, NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS
+            inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOKENS
         );
         assert(x != nullptr);
         assert(x->ndim == 2);
@@ -1880,10 +1880,10 @@ ncclResult_t ncclEpDispatch(
 
         // Find and validate output tensors
         const ncclNDTensor_t* recv_x = find_tensor_by_tag(
-            outputs, num_outputs, NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOKENS
+            outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS
         );
         const ncclNDTensor_t* scales = find_tensor_by_tag(
-            outputs, num_outputs, NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_SCALES
+            outputs, num_outputs, NCCL_EP_TENSOR_TAG_SCALES
         );
         assert(recv_x != nullptr);
         assert(recv_x->ndim == 3);
@@ -1986,10 +1986,10 @@ ncclResult_t ncclEpDispatch(
 
         assert(num_local_tensors == 0 && "HT dispatch does not accept local_tensors");
 
-        const ncclNDTensor_t* x = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS);
-        const ncclNDTensor_t* topk_idx = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_IDX_DISPATCH);
-        const ncclNDTensor_t* topk_weights = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOPK_WEIGHTS);
-        const ncclNDTensor_t* scales = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_SCALES);
+        const ncclNDTensor_t* x = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOKENS);
+        const ncclNDTensor_t* topk_idx = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_IDX);
+        const ncclNDTensor_t* topk_weights = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+        const ncclNDTensor_t* scales = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_SCALES);
 
         assert(x != nullptr);
         assert(x->ndim == 2 && tensor_is_contiguous(x));
@@ -2026,8 +2026,8 @@ ncclResult_t ncclEpDispatch(
         }
 
         // Output tensors
-        ncclNDTensor_t* recv_topk_weights = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_WEIGHTS);
-        ncclNDTensor_t* recv_topk_idx = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_IDX);
+        ncclNDTensor_t* recv_topk_weights = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+        ncclNDTensor_t* recv_topk_idx = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOPK_IDX);
 
         // Detect forward/backward mode
         bool forward_dispatch = (topk_idx != nullptr);
@@ -2137,7 +2137,7 @@ ncclResult_t ncclEpDispatch(
         /* ===== Copy IPC staging → caller outputs ===== */
         // HT kernel writes to IPC-mapped buffers (dispatch_expert_output_*_buffer_ptrs)
         // Copy results to user-provided output tensors
-        ncclNDTensor_t* recv_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOKENS);
+        ncclNDTensor_t* recv_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
         if (recv_x != nullptr) {
             assert(recv_x->ndim == 2 && tensor_is_contiguous(recv_x));
             size_t copy_size = static_cast<size_t>(recv_x->sizes[0]) * recv_x->sizes[1] * ncclTypeSize(recv_x->datatype);
@@ -2182,7 +2182,7 @@ ncclResult_t ncclEpDispatch(
 
         // Copy FP8 scales output
         if (use_fp8) {
-            ncclNDTensor_t* recv_scales = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_SCALES);
+            ncclNDTensor_t* recv_scales = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_SCALES);
             if (recv_scales != nullptr) {
                 assert(recv_scales->ndim == 2 && tensor_is_contiguous(recv_scales));
                 size_t copy_size = static_cast<size_t>(recv_scales->sizes[0]) * recv_scales->sizes[1] * ncclTypeSize(recv_scales->datatype);
@@ -2213,7 +2213,7 @@ ncclResult_t ncclEpCombine(
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         // Find and validate input tensors
         const ncclNDTensor_t* x = find_tensor_by_tag(
-            inputs, num_inputs, NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOKENS
+            inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOKENS
         );
             assert(x != nullptr);
 
@@ -2223,7 +2223,7 @@ ncclResult_t ncclEpCombine(
 
         // Find and validate local tensors
         const ncclNDTensor_t* topk_weights = find_tensor_by_tag(
-            local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOPK_WEIGHTS
+            local_tensors, num_local_tensors, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS
         );
             assert(topk_weights != nullptr);
 
@@ -2275,7 +2275,7 @@ ncclResult_t ncclEpCombine(
 
         // Find and validate output tensor
         const ncclNDTensor_t* out = find_tensor_by_tag(
-            outputs, num_outputs, NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOKENS
+            outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS
         );
 
         assert(out != nullptr);
@@ -2353,7 +2353,7 @@ ncclResult_t ncclEpCombine(
              //assert(is_single_node && "HT mode only supports single-node");
 
         /* ===== Inputs validation ===== */
-        const ncclNDTensor_t* x = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOKENS);
+        const ncclNDTensor_t* x = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOKENS);
         assert(x != nullptr);
         assert(x->ndim == 2 && tensor_is_contiguous(x));
         assert(x->datatype == ncclBfloat16); // HT combine only supports BF16
@@ -2370,8 +2370,8 @@ ncclResult_t ncclEpCombine(
 
         // Top-k checks (for backward mode)
         int num_topk = 0;
-        const ncclNDTensor_t* topk_weights = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOPK_WEIGHTS);
-        ncclNDTensor_t* combined_topk_weights = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOPK_WEIGHTS);
+        const ncclNDTensor_t* topk_weights = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+        ncclNDTensor_t* combined_topk_weights = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
 
         // Determine if this is backward mode (topk_weights provided = backward combine)
         bool backward_combine = (topk_weights != nullptr);
@@ -2390,7 +2390,7 @@ ncclResult_t ncclEpCombine(
         assert(num_local_tensors == 0);
 
         /* ===== Output tensors ===== */
-        ncclNDTensor_t* combined_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOKENS);
+        ncclNDTensor_t* combined_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
         assert(combined_x != nullptr);
         assert(combined_x->ndim == 2 && tensor_is_contiguous(combined_x));
         assert(combined_x->sizes[0] == num_combined_tokens); // Output should match original token count

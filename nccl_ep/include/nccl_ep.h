@@ -20,38 +20,20 @@ typedef enum {
 // Tensor tags required to identify the type of tensors in `ncclEpDispatch` and `ncclEpCombine`
 typedef enum {
     NCCL_EP_TENSOR_TAG_NONE = 0,
-    // Input 2D: [num_tokens x top_k] - top-k expert indices for handle init
-    NCCL_EP_TENSOR_TAG_TOPK_IDX_HANDLE = 1,        
-    // Input 2D: [num_tokens x top_k] - top-k expert indices for dispatch
-    NCCL_EP_TENSOR_TAG_TOPK_IDX_DISPATCH = 2,      
-    // Input 2D: [num_tokens x hidden] - input tokens for dispatch
-    NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS = 3,  
-    // Input 2D: [num_tokens x hidden] - input scales for dispatch
-    NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_SCALES = 4,
-    // Input 2D: [num_tokens x top_k] - top-k weights for dispatch
-    NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOPK_WEIGHTS = 5, 
-    // Output 3D: [num_experts x max_tokens x hidden] - received tokens
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOKENS = 6,
-    // Output 2D: [tokens x top_k] - received top-k weights
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_WEIGHTS = 7, 
-    // Output 2D: [tokens x top_k] - received top-k indices
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_IDX = 8,
-    // Output 3D: [num_experts x max_tokens x scales] - received scales
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_SCALES = 9,       
-    // Input: expert outputs (after MLP)
-    NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOKENS = 10,
-    // Input 2D: [num_tokens x top_k] - top-k weights for combine (HT)
-    NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOPK_WEIGHTS = 11,  
-    // Output 2D: [num_tokens x hidden] - combined output
-    NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOKENS = 12,       
-    // Output 2D: [num_tokens x top_k] - combined top-k weights (HT)
-    NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOPK_WEIGHTS = 13, 
-    // Output 1D: [num_local_experts] - tokens received per expert (device memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 14, 
-    // Output 1D: [num_local_experts] - tokens received per expert (pinned host memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 15,  
-    // Output 1D: [num_local_experts] - per-expert token counts
-    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 16,      
+    // Tensor containing tokens
+    NCCL_EP_TENSOR_TAG_TOKENS = 1,
+    // Tensor containing top-k expert indices
+    NCCL_EP_TENSOR_TAG_TOPK_IDX = 2,
+    // Tensor containing top-k weights
+    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS = 3,
+    // Tensor containing scales
+    NCCL_EP_TENSOR_TAG_SCALES = 4,
+    // Tensor containing tokens received per expert (device memory)
+    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 5, 
+    // Tensor containing tokens received per expert (pinned host memory)
+    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 6,  
+    // Tensor containing per-expert token counts
+    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 7,      
 } ncclEpTensorTag_t;
 
 
@@ -253,14 +235,15 @@ typedef struct {
 //                            all must be 2D [num_tokens x data_size].
 //                            The number of tokens must be equal across all tensors, but data_size may vary.
 //                            Tensors are used to describe distinct pieces of data exchanged with experts.
-//                            Must include token tensor (NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS) and 
+//                            Must include token tensor (NCCL_EP_TENSOR_TAG_TOKENS) and 
 //                            (depending on the algorithm) may optionally be extended with metadata tensors
 //                            (i.e., topK indices, weights, scales, etc.).
 //   num_inputs    - [IN]     Number of input tensors
 //   outputs       - [IN,OUT] Array of pointers to preallocated output tensors, provided in the same order
 //                            as input tensors;
 //                            If the datatypes of input and output token tensors are diffent,
-//                            then the additional output tensor for scaling factors must be supplied.
+//                            then the additional output tensor with tag (NCCL_EP_TENSOR_TAG_SCALES) for scaling
+//                            factors must be supplied.
 //                            Scaling will be applied during the collective and the output tensor will be scaled.
 //                            For HT: the dimensions of output tensors are [num_recv_tokens x data_size] (2D),
 //                                    where num_recv_tokens = num_ranks * max_tokens_per_rank.

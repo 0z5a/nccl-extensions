@@ -95,22 +95,13 @@ class ncclEpTensorFlags_t:
 class ncclEpTensorTag_t:
     """Tensor tags for NCCL EP operations."""
     NCCL_EP_TENSOR_TAG_NONE = 0
-    NCCL_EP_TENSOR_TAG_TOPK_IDX_HANDLE = 1           # Input 2D: [num_tokens x top_k] - for handle init
-    NCCL_EP_TENSOR_TAG_TOPK_IDX_DISPATCH = 2         # Input 2D: [num_tokens x top_k] - for dispatch
-    NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOKENS = 3     # Input 2D: [num_tokens x hidden]
-    NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_SCALES = 4     # Input 2D: [num_tokens x hidden] - scales
-    NCCL_EP_TENSOR_TAG_DISPATCH_INPUT_TOPK_WEIGHTS = 5  # Input 2D: [num_tokens x top_k]
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOKENS = 6    # Output: received tokens
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_WEIGHTS = 7  # Output 2D: [tokens x top_k]
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_TOPK_IDX = 8  # Output 2D: [tokens x top_k]
-    NCCL_EP_TENSOR_TAG_DISPATCH_OUTPUT_SCALES = 9    # Output: received scales
-    NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOKENS = 10     # Input: expert outputs (after MLP)
-    NCCL_EP_TENSOR_TAG_COMBINE_INPUT_TOPK_WEIGHTS = 11   # Input 2D: [num_tokens x top_k] (HT)
-    NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOKENS = 12    # Output 2D: [num_tokens x hidden]
-    NCCL_EP_TENSOR_TAG_COMBINE_OUTPUT_TOPK_WEIGHTS = 13  # Output 2D: [num_tokens x top_k] (HT)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 14   # Output 1D: [num_local_experts] - tokens received per expert (device memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 15     # Output 1D: [num_local_experts] - tokens received per expert (pinned host memory)
-    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 16       # Output 1D: [num_local_experts] - per-expert token counts
+    NCCL_EP_TENSOR_TAG_TOKENS = 1
+    NCCL_EP_TENSOR_TAG_TOPK_IDX = 2
+    NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS = 3
+    NCCL_EP_TENSOR_TAG_SCALES = 4
+    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 5
+    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 6
+    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 7
 
 
 class ncclEpAlgorithm_t:
