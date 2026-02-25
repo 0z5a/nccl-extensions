@@ -69,6 +69,89 @@ nccl_lib = NCCLLibrary()
 # Use nccl_lib.ncclEpDispatch, ncclEpCombine, etc.
 ```
 
+### Common scenarios
+
+This section provides a high-level overview of the input, output, and local tensors expected by the API for common expected scenarios.
+
+#### Used notation
+
+**Dimensions:**
+* B = batch size 
+* H = hidden dimension
+* S = scales dimension
+* L = number of local experts
+* K = top K
+* N(r) = number of tokens targeting rank r
+
+**Tags:**
+* TOKENS = NCCL_EP_TENSOR_TAG_TOKENS 
+* WEIGHT = NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS
+* INDEX = NCCL_EP_TENSOR_TAG_TOPK_IDX
+* SCALES = NCCL_EP_TENSOR_TAG_SCALES
+* CNTR_D = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE
+* CNTR_D = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST
+
+
+#### LL mode (same data type)
+
+| Operation | Tensor Index | Input tag | Input dims  | Output tag | Output dims | Local tags | Local dims |
+|:---------:|:------------:|:---------:|:-----------:|:----------:|:-----------:|:----------:|:----------:|
+| Dispatch  | 0            | TOKEN     | [B x H]     | TOKENS     | [L x B x H] | CNTR_D     | [L]        |
+| Combine   | 0            | TOKEN     | [L x B x H] | TOKENS     | [B x H]     |            |            |
+|           | 1            | WEIGHTS   | [B x K]     |            |             |            |            |
+
+
+#### HT mode (same data type)
+
+**Handle creation**
+
+| Operation | Local tags    | Local dims |
+|-----------|:-------------:|:----------:|
+| Create    | CNTR_D/CNTR_H | [L]        |
+
+
+**Forward pass**
+
+| Operation | Tensor Index | Input tag | Input dims  | Output tag | Output dims | Local tags | Local dims |
+|:---------:|:------------:|:---------:|:-----------:|:----------:|:-----------:|:----------:|:----------:|
+| Dispatch  | 0            | TOKEN     | [B x H]     | TOKENS     | [N(r) x H]  |            |            |
+|           | 1            | WEIGHTS   | [B x K]     | WEIGHTS    | [N(r) x K]  |            |            |
+|           | 2            | INDEX     | [B x K]     | INDEX      | [N(r) x K]  |            |            |
+| Combine   | 0            | TOKEN     | [[N(r) x H] | TOKENS     | [B x H]     |            |            |
+|           | 1            | WEIGHTS   | [N(r) x H]  |            |             |            |            |
+
+**Backward pass**
+
+| Operation | Tensor Index | Input tag | Input dims  | Output tag | Output dims | Local tags | Local dims |
+|:---------:|:------------:|:---------:|:-----------:|:----------:|:-----------:|:----------:|:----------:|
+| Dispatch  | 0            | TOKEN     | [B x H]     | TOKENS     | [N(r) x H]  |            |            |
+|           | 1            | WEIGHTS   | [B x K]     | WEIGHTS    | [N(r) x K]  |            |            |
+|           | 2            | INDEX     | [B x K]     | INDEX      | [N(r) x K]  |            |            |
+| Combine   | 0            | TOKEN     | [[N(r) x H] | TOKENS     | [B x H]     |            |            |
+|           | 1            | WEIGHTS   | [N(r) x H]  | **WEIGHTS**| [B x K]     |            |            |
+
+#### LL mode (FP16 -> FP8 conversion - NOT SUPPORTED)
+
+| Operation | Tensor Index | Input tag | Input dims  | Output tag | Output dims | Local tags | Local dims |
+|:---------:|:------------:|:---------:|:-----------:|:----------:|:-----------:|:----------:|:----------:|
+| Dispatch  | 0            | TOKEN     | [B x H]     | TOKENS     | [L x B x H] | CNTR_D     | [L]        |
+|           | 1            |           |             | **SCALES** | [L x B x S] |            |            |
+| Combine   | 0            | TOKEN     | [L x B x H] | TOKENS     | [B x H]     |            |            |
+|           | 1            | WEIGHTS   | [B x K]     |            |             |            |            |
+
+#### HT mode (FP16 -> FP8 conversion - NOT SUPPORTED)
+
+**Forward pass**
+
+| Operation | Tensor Index | Input tag | Input dims  | Output tag | Output dims | Local tags | Local dims |
+|:---------:|:------------:|:---------:|:-----------:|:----------:|:-----------:|:----------:|:----------:|
+| Dispatch  | 0            | TOKEN     | [B x H]     | TOKENS     | [N(r) x H]  |            |            |
+|           | 1            | WEIGHTS   | [B x K]     | WEIGHTS    | [N(r) x K]  |            |            |
+|           | 2            | INDEX     | [B x K]     | INDEX      | [N(r) x K]  |            |            |
+|           | 3            | **SCALES**| [B x S]     | **SCALES** | [N(r) x S]  |            |            |
+| Combine   | 0            | TOKEN     | [[N(r) x H] | TOKENS     | [B x H]     |            |            |
+|           | 1            | WEIGHTS   | [N(r) x H]  |            |             |            |            |
+
 # Usage
 
 ## Prerequisites
