@@ -69,6 +69,32 @@ nccl_lib = NCCLLibrary()
 # Use nccl_lib.ncclEpDispatch, ncclEpCombine, etc.
 ```
 
+### Reference performance numbers
+
+For microbenchmarking, NCCL EP provides the performance evaluation tool [`ep_bench`](ep_bench.cu).
+
+Below, the reference performance numbers collected 
+on NVIDIA H100 platform for Low-Latency mode
+using **BF16 dispatch and combine** (same data type) are presented.
+Note, the data was obtained for NCCL v2.29u1 release.
+
+#### Test Configuration
+- Hidden: 7168
+- Top-k: 8
+- Experts: 256
+- Tokens: 128 per rank
+- 8 GPUs per node
+- Up to 8 nodes
+
+#### Performance
+
+| Number Of GPUs | Node Count | Dispatch BW (GB/s) | Combine BW (GB/s)  |
+|:--------------:|:----------:|:------------------:|:------------------:|
+| 8              | 1          | 224.3              | 185.2              |
+| 16             | 2          | 76.7               | 73.0               |
+| 32             | 4          | 53.6               | 50.0               |
+| 64             | 8          | 48.8               | 43.8               |
+
 ### Common scenarios
 
 This section provides a high-level overview of the input, output, and local tensors expected by the API for common expected scenarios.
@@ -89,7 +115,7 @@ This section provides a high-level overview of the input, output, and local tens
 * INDEX = NCCL_EP_TENSOR_TAG_TOPK_IDX
 * SCALES = NCCL_EP_TENSOR_TAG_SCALES
 * CNTR_D = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE
-* CNTR_D = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST
+* CNTR_H = NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST
 
 
 #### LL mode (same data type)
