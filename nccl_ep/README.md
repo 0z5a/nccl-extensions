@@ -96,7 +96,7 @@ compute_cap
 
 ### Set the environment
 
-The following paths are required for building and running the 
+The following paths are required for building and running the
 
 ```
 export COMPUTE_CAP=<discovered compute_cap>
@@ -385,7 +385,7 @@ ncclResult_t ncclEpTensorDestroy(
 #### `ncclEpCreateHandle()`
 
 ```c
-// Create and initialize an EP handle. 
+// Create and initialize an EP handle.
 //   Performs dispatch setup and (in HT mode only) metadata exchange.
 //   This call is collective and must be invoked by all ranks in the group.
 //
@@ -404,7 +404,7 @@ ncclResult_t ncclEpTensorDestroy(
 //   use_fp8             - [IN]  Enable FP8 for dispatch (default: false)
 //
 // Notes:
-//   - If max_tokens_per_rank in ncclEpGroupConfig_t was set to NCCL_EP_AUTO, 
+//   - If max_tokens_per_rank in ncclEpGroupConfig_t was set to NCCL_EP_AUTO,
 //     this call may block as the host allocates memory for the actual number
 //     of received tokens.
 //   - The config argument is reserved; must be set to NULL for now.
@@ -478,7 +478,7 @@ Perform EP dispatch: send tokens to experts according to routing decisions.
 //                            all must be 2D [num_tokens x data_size].
 //                            The number of tokens must be equal across all tensors, but data_size may vary.
 //                            Tensors are used to describe distinct pieces of data exchanged with experts.
-//                            Must include token tensor (NCCL_EP_TENSOR_TAG_TOKENS) and 
+//                            Must include token tensor (NCCL_EP_TENSOR_TAG_TOKENS) and
 //                            (depending on the algorithm) may optionally be extended with metadata tensors
 //                            (i.e., topK indices, weights, scales, etc.).
 //   num_inputs    - [IN]     Number of input tensors
@@ -486,11 +486,11 @@ Perform EP dispatch: send tokens to experts according to routing decisions.
 //                            as input tensors;
 //                            If the datatypes of input and output token tensors are diffent,
 //                            then the additional output tensor for scaling factors must be supplied (NCCL_EP_TENSOR_TAG_SCALES).
-//                    
+//
 //                            Scaling will be applied during the collective and the output tensor will be scaled.
 //                            For HT: the dimensions of output tensors are [num_recv_tokens x data_size] (2D),
 //                                    where num_recv_tokens = num_ranks * max_tokens_per_rank.
-//                            For LL: the dimensions of output tensors are 
+//                            For LL: the dimensions of output tensors are
 //                                    [local_experts x num_recv_tokens x data_size] (3D, expert-major).
 //                                    The dimensions of the scaling factors tensor are:
 //                                    [local_experts x num_recv_tokens x (hidden / 128)] (3D, ncclFloat32)
@@ -501,7 +501,7 @@ Perform EP dispatch: send tokens to experts according to routing decisions.
 //                                    NUM_TOKENS_PER_EXPERTS: [OUT] a 1D tensor of unsigned int [num_experts]
 //                                    that contains the number of tokens received by each expert on this rank.
 //   num_local_tensors - [IN] Number of local tensors.
-//   send_only     - [IN]     If true, the dispatch kernel will only initiate data transfers and 
+//   send_only     - [IN]     If true, the dispatch kernel will only initiate data transfers and
 //                            release GPU resources before the data is received.
 //                            When set, a blocking `ncclEpComplete` call must be used to complete the operation.
 //                            Not supported in HT mode.
@@ -559,12 +559,12 @@ Perform EP combine: gather expert outputs and return in original token order.
 //   send_only        - [IN]     If true, the combine will only initiate data transfers and immediately
 //                               release GPU resources (without waiting for the data to be received).
 //                               When set, a blocking `ncclEpComplete()` must be used to complete the operation.
-//                               Note: 
+//                               Note:
 //                                 - Supported for LL mode only.
 //                                 - The output tensors must still be preallocated even when send_only is set.
 //   config           - [IN]     Reserved for future options (must be NULL).
-//   stream           - [IN]     CUDA stream. If `ncclEpCombine()` is called on a different stream than the stream 
-//                               used in `ncclEpCreateHandle()`, it is the responsibility of the user to synchronize 
+//   stream           - [IN]     CUDA stream. If `ncclEpCombine()` is called on a different stream than the stream
+//                               used in `ncclEpCreateHandle()`, it is the responsibility of the user to synchronize
 //                               between streams to ensure correctness.
 //
 // Returns:
@@ -618,7 +618,7 @@ Both `ncclEpDispatch()` and `ncclEpCombine()` operations support synchronous and
 ## Synchronous Mode (Default)
 
 Corresponds to a synchronous version of an operation where GPU resources are allocated during the whole operation execution
-including the time to wait for the data to be received. This mode doesn't allow for 
+including the time to wait for the data to be received. This mode doesn't allow for
 computation/communication overlap.
 
 ```c

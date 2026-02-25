@@ -29,11 +29,11 @@ typedef enum {
     // Tensor containing scales
     NCCL_EP_TENSOR_TAG_SCALES = 4,
     // Tensor containing tokens received per expert (device memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 5, 
+    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_DEVICE = 5,
     // Tensor containing tokens received per expert (pinned host memory)
-    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 6,  
+    NCCL_EP_TENSOR_TAG_RECV_EXPERT_COUNTER_HOST = 6,
     // Tensor containing per-expert token counts
-    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 7,      
+    NCCL_EP_TENSOR_TAG_TOKENS_PER_EXPERTS = 7,
 } ncclEpTensorTag_t;
 
 
@@ -170,7 +170,7 @@ ncclResult_t ncclEpTensorDestroy(
 typedef struct ncclEpHandle* ncclEpHandle_t;
 typedef struct ncclEpHandleConfig* ncclEpHandleConfig_t;  // Reserved for future use
 
-// Create and initialize an EP handle. 
+// Create and initialize an EP handle.
 //   * Performs dispatch setup and (in HT mode only) metadata exchange.
 //   * This call is collective and must be invoked by all ranks in the group.
 //
@@ -189,7 +189,7 @@ typedef struct ncclEpHandleConfig* ncclEpHandleConfig_t;  // Reserved for future
 //   use_fp8             - [IN]  Enable FP8 for dispatch (default: false)
 //
 // Notes:
-//   - If max_tokens_per_rank in ncclEpGroupConfig_t was set to NCCL_EP_AUTO, 
+//   - If max_tokens_per_rank in ncclEpGroupConfig_t was set to NCCL_EP_AUTO,
 //     this call may block as the host allocates memory for the actual number
 //     of received tokens.
 //   - The config argument is reserved; must be set to NULL for now.
@@ -235,7 +235,7 @@ typedef struct {
 //                            all must be 2D [num_tokens x data_size].
 //                            The number of tokens must be equal across all tensors, but data_size may vary.
 //                            Tensors are used to describe distinct pieces of data exchanged with experts.
-//                            Must include token tensor (NCCL_EP_TENSOR_TAG_TOKENS) and 
+//                            Must include token tensor (NCCL_EP_TENSOR_TAG_TOKENS) and
 //                            (depending on the algorithm) may optionally be extended with metadata tensors
 //                            (i.e., topK indices, weights, scales, etc.).
 //   num_inputs    - [IN]     Number of input tensors
@@ -247,7 +247,7 @@ typedef struct {
 //                            Scaling will be applied during the collective and the output tensor will be scaled.
 //                            For HT: the dimensions of output tensors are [num_recv_tokens x data_size] (2D),
 //                                    where num_recv_tokens = num_ranks * max_tokens_per_rank.
-//                            For LL: the dimensions of output tensors are 
+//                            For LL: the dimensions of output tensors are
 //                                    [local_experts x num_recv_tokens x data_size] (3D, expert-major).
 //                                    The dimensions of the scaling factors tensor are:
 //                                    [local_experts x num_recv_tokens x (hidden / 128)] (3D, ncclFloat32)
@@ -261,7 +261,7 @@ typedef struct {
 //   send_only     - [IN]     If true, the dispatch will only initiate data transfers and immediately
 //                            release GPU resources (without waiting for the data to be received).
 //                            When set, a blocking `ncclEpComplete()` must be used to complete the operation.
-//                            Note: 
+//                            Note:
 //                              - Supported for LL mode only.
 //                              - The output tensors must still be preallocated even when send_only is set.
 //   config        - [IN]     Dispatch configuration.
@@ -314,12 +314,12 @@ typedef struct ncclEpCombineConfig ncclEpCombineConfig_t;
 //   send_only        - [IN]     If true, the combine will only initiate data transfers and immediately
 //                               release GPU resources (without waiting for the data to be received).
 //                               When set, a blocking `ncclEpComplete()` must be used to complete the operation.
-//                               Note: 
+//                               Note:
 //                                 - Supported for LL mode only.
 //                                 - The output tensors must still be preallocated even when send_only is set.
 //   config           - [IN]     Reserved for future options (must be NULL).
-//   stream           - [IN]     CUDA stream. If `ncclEpCombine()` is called on a different stream than the stream 
-//                               used in `ncclEpCreateHandle()`, it is the responsibility of the user to synchronize 
+//   stream           - [IN]     CUDA stream. If `ncclEpCombine()` is called on a different stream than the stream
+//                               used in `ncclEpCreateHandle()`, it is the responsibility of the user to synchronize
 //                               between streams to ensure correctness.
 //
 // Returns:
