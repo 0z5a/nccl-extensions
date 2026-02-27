@@ -73,7 +73,7 @@ nccl_lib = NCCLLibrary()
 
 For microbenchmarking, NCCL EP provides the performance evaluation tool [`ep_bench`](ep_bench.cu).
 
-Below, the reference performance numbers collected 
+Below, the reference performance numbers collected
 on NVIDIA H100 platform for Low-Latency mode
 using **BF16 dispatch and combine** (same data type) are presented.
 Note, the data was obtained for NCCL v2.29u1 release.
@@ -102,7 +102,7 @@ This section provides a high-level overview of the input, output, and local tens
 #### Used notation
 
 **Dimensions:**
-* B = batch size 
+* B = batch size
 * H = hidden dimension
 * S = scales dimension
 * L = number of local experts
@@ -110,7 +110,7 @@ This section provides a high-level overview of the input, output, and local tens
 * N(r) = number of tokens targeting rank r
 
 **Tags:**
-* TOKENS = NCCL_EP_TENSOR_TAG_TOKENS 
+* TOKENS = NCCL_EP_TENSOR_TAG_TOKENS
 * WEIGHT = NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS
 * INDEX = NCCL_EP_TENSOR_TAG_TOPK_IDX
 * SCALES = NCCL_EP_TENSOR_TAG_SCALES
