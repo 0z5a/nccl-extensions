@@ -101,18 +101,18 @@ struct dispatch_kernel_args_t {
     float* outRecvTopkWeights;
     int32_t* outRecvTopkIdx;
     // INTERMEDIATE
-    void* sendBuf;
-    void* recvBuf;
-    int* recvCntBuf;
+    void* rdmaBuf;
     size_t sendOff;
     size_t recvOff;
     size_t recvCntOff;
     int* rankCountersBase;
     int* rankDone;
-    int* nextRecvCntBuf;
     int nextRecvCntBufSize;
     int* recvStats;
     int64_t* waitStats;
+    LowLatencyEpochState* epochState;
+    size_t payloadSlotStride;
+    size_t signalSlotStride;
     // CONFIG
     int numTokens;
     // Derived from validated inputs->scales->sizes[1].
@@ -152,16 +152,16 @@ struct combine_kernel_args_t {
     // OUTPUT
     void* outData;
     // INTERMEDIATE
-    void* sendBuf;
-    void* recvBuf;
-    int* recvFlagBuf;
+    void* rdmaBuf;
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
     int* atomicCleanFlag;
-    int* nextRecvCntBuf;
     int nextRecvCntBufSize;
     int64_t* waitStats;
+    LowLatencyEpochState* epochState;
+    size_t payloadSlotStride;
+    size_t signalSlotStride;
     // CONFIG
     int numCombinedTokens;
     int hidden;
@@ -224,16 +224,17 @@ struct DispatchParams {
     int32_t* outRecvTopkIdx;       // rank-major only; nullptr otherwise
 
     // Intermediate RDMA buffers + window-relative offsets
-    void* sendBuf;
-    void* recvBuf;
-    int* recvCntBuf;
+    void* rdmaBuf;
     size_t sendOff;
     size_t recvOff;
     size_t recvCntOff;
-    int* nextRecvCntBuf;
     int nextRecvCntBufSize;
     int* recvStats;
     int64_t* waitStats;
+
+    LowLatencyEpochState* epochState = nullptr;
+    size_t payloadSlotStride = 0;
+    size_t signalSlotStride = 0;
 
     // Sizes / identifiers
     int numTokens;
@@ -292,15 +293,16 @@ struct CombineParams {
     void* outData;
 
     // Intermediate RDMA buffers + window-relative offsets
-    void* sendBuf;
-    void* recvBuf;
-    int* recvFlagBuf;
+    void* rdmaBuf;
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
-    int* nextRecvCntBuf;
     int nextRecvCntBufSize;
     int64_t* waitStats;
+
+    LowLatencyEpochState* epochState = nullptr;
+    size_t payloadSlotStride = 0;
+    size_t signalSlotStride = 0;
 
     // Sizes / identifiers
     int numCombinedTokens;
