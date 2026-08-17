@@ -1,22 +1,30 @@
-# Bounded staging-buffer buckets
+# Bounded PACKWINDOW staging buffers
 
 Status: implemented. The main implementation is
-[`reshard_transpose.cc`](../src/reshard_transpose.cc); configuration is parsed
+[`packwindow_staging.cc`](../src/packwindow_staging.cc); configuration is parsed
 in [`m2n_config.cc`](../src/m2n_config.cc), and PACKWINDOW host-RMA ordering is
 implemented in [`reshard_user_window.cu`](../src/reshard_user_window.cu).
 
 ## Scope
 
-`NCCL_RESHARD_STAGING_BUCKETS` replaces PACKWINDOW's fixed per-communicator
-transpose allocation with configured size classes:
+PACKWINDOW always uses a bounded pool of configured size classes. The built-in
+profile is `2147483648:4` (one 2-GiB bucket with four slots). Override it with:
 
 ```text
-NCCL_RESHARD_STAGING_BUCKETS="268435456:4,1853358080:2"
+NCCL_RESHARD_PACK_BUFFSIZES="256m:4,1853358080:2"
 ```
 
-Each item is `bytes:slots`. The variable is opt-in; when it is unset, the
-existing per-communicator allocation remains unchanged. Bucketed staging does
-not control the separate channelized staging pipeline in `staging_buffer.cc`.
+Each item is `size[:slots]`. Sizes accept bytes or binary `k`/`m` suffixes and
+omitted slots default to one. Invalid values—including `off`—retain the built-in
+profile. The old `NCCL_RESHARD_STAGING_BUCKETS` and
+`NCCL_RESHARD_STAGING_WATERMARK_BYTES` variables are no longer read. This pool
+does not control the separate DIRECT channelized pipeline in `staging_buffer.cc`.
+
+PACKWINDOW requires `max(srcLocalBytes, dstLocalBytes, 2048)` bytes for a call.
+Source packing and destination receive offsets share the same offset-zero
+region because multi-rank resharding requires disjoint source and destination
+rank intervals. A selected physical slot is allocated lazily; unused slots in
+a profile consume no device memory.
 
 ## Assignment contract
 
@@ -94,7 +102,8 @@ cycle, for example rank X submitting A then B while rank Y submits B then A.
 
 ## Validation
 
-`staging_slot_reuse_test.cc` covers stable round-robin mapping, local
+`packwindow_staging_pool_test.cc` covers configuration parsing, lazy allocation,
+stable round-robin mapping, local
 cross-stream ordering, shared-lane overlap rejection, communicator-owned warmup
 state, and healthy-lane selection after poisoning.
 
