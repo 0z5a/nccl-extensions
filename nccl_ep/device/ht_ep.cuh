@@ -11,10 +11,27 @@
 
 #pragma once
 
+// Largest NUM_ACC the RED accumulator loops can keep fully register-resident.
+// Each thread holds float2 acc_token_fp32[NUM_ACC], i.e. 2*NUM_ACC 32-bit registers,
+// against a 255-register-per-thread budget; 64 leaves 128 for accumulators and the
+// rest for addresses, barriers and dequant temporaries.
+//
+// NUM_ACC = ceil((H/2) / THRDS_PER_PIPELINE), THRDS_PER_PIPELINE = (RED_WARPS/P)*32.
+// H=7168 1-node P=2 → 56 (fits). H=16384 1-node P=2 → 128 (would spill to local memory).
+//
+// Enforced on the host in ht_ep_adapter.cu, which lowers the default pipeline count
+// until NUM_ACC fits (H=16384: P=2 → P=1 → NUM_ACC=64). Pinning
+// NCCL_EP_COMBINE_NUM_PIPELINES bypasses that and may spill.
+#ifndef NCCL_EP_COMBINE_MAX_ACC
+#define NCCL_EP_COMBINE_MAX_ACC 64
+#endif
+
 #include "nccl_ep.h"
 #include "common.hpp"
 #include "device_primitives.cuh"
 #include "ht_ep_configs.cuh"
+#include "mxfp8_quant.cuh"
+#include "quant_recipe.cuh"
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -326,6 +343,10 @@ struct combine_smem_layout_t {
     bool* lsa_flag_G2S_buffer;
     bool* cross_lsa_flag_G2S_buffer;
 
+    // No separate scale staging: MXFP8 E8M0 rows always ride in the token stage tail, so a
+    // stage base plus HIDDEN_DIM locates them.
+    // Shared by the intra-LSA and cross-LSA G2S rings, which carry the same row:
+    // packed [FP8 H | E8M0 H/32] for MXFP8, dtype width for NONE.
     int token_G2S_stage_stride; // elements (not bytes)
     int token_S2G_stage_stride; // elements (not bytes)
     int prob_G2S_stage_stride; // elements (not bytes)
@@ -714,7 +735,8 @@ inline disp_smem_cost_t calc_disp_smem_cost(
 
 // kTokenSize drives the per-stage token-buffer stride; everything else
 // (probabilities, mbarriers, scales) is element-width-invariant.
-template <ncclDataType_t kTokenDtype>
+template <ncclDataType_t kTokenDtype,
+          ncclEpCombQuant_t kCombineRecipe>
 __device__ combine_smem_layout_t create_combine_smem_layout(
     combine_smem_layout_t& layout,
     void* smem_base,
@@ -739,11 +761,20 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 
     // Per-token wire size: bytes for buffer offsets, uint16_t units for stage strides (the
     // token buffer base is uint16_t*). FP32 doubles both vs BF16/FP16.
+    // S2G output stays at the caller's output dtype width (2H for BF16).
     const int token_bytes = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
     const int token_stride_u16 = model.hidden_dim * nccl_ep::size_u16<kTokenDtype>();
-
-    // Stage strides in uint16_t units, so FP32 stages advance 2× and don't overlap.
-    layout.token_G2S_stage_stride = token_stride_u16;
+    // G2S stages carry the recipe's packed row: MXFP8 [FP8 H | E8M0 H/32], NONE = dtype
+    // width. Scales live in the token stage tail — no separate scale SMEM.
+    using Recipe = nccl_ep::combine_recipe_traits<kCombineRecipe>;
+    const int g2s_stage_bytes_raw =
+        Recipe::template packed_bytes<kTokenDtype>(model.hidden_dim);
+    // Match calc_comb_per_g2s_stage_smem: round stage stride up to 128B for TMA alignment
+    // (H+H/32 is not always 128B-aligned, e.g. H=7168 → 7392).
+    const int g2s_stage_bytes = (g2s_stage_bytes_raw + 127) & ~127;
+    const int g2s_stage_stride_u16 = g2s_stage_bytes / (int)sizeof(uint16_t);
+    // Both G2S rings carry the same packed row, so they share one stage stride.
+    layout.token_G2S_stage_stride = g2s_stage_stride_u16;
     layout.token_S2G_stage_stride = token_stride_u16;
     layout.prob_G2S_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
     layout.prob_S2G_stage_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team;
@@ -755,7 +786,7 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         align_offset(128);
         layout.lsa_token_G2S_buffer =
             reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-        offset += num_of_stages_g2s * token_bytes;
+        offset += num_of_stages_g2s * g2s_stage_bytes;
 
         align_offset(128);
         layout.lsa_token_S2G_buffer =
@@ -766,10 +797,11 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
         layout.lsa_token_S2G_buffer = nullptr;
     }
 
-    // cross_lsa_token_G2S_buffer (128B aligned)
+    // cross_lsa_token_G2S_buffer (128B aligned). Must advance by the same packed stage stride
+    // the accessor indexes with, or stage k>0 would overrun the buffers that follow.
     align_offset(128);
     layout.cross_lsa_token_G2S_buffer = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(smem_base) + offset);
-    offset += num_of_stages_g2s * token_bytes;
+    offset += num_of_stages_g2s * g2s_stage_bytes;
 
     // cross_lsa_token_S2G_buffer (128B aligned)
     align_offset(128);
@@ -880,18 +912,24 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
 // alignment exactly when the raw strides already meet it (the case in practice,
 // since hidden_dim * elem_width is a multiple of 128) and over-estimates safely
 // otherwise. kTokenDtype selects the wire element width (2 B BF16/FP16, 4 B FP32).
-template <ncclDataType_t kTokenDtype = ncclBfloat16>
+// kCombineRecipe: MXFP8 G2S token stages use packed_bytes (FP8+E8M0);
+// separate per-stage scale buffers are not allocated.
+// For MXFP8, both G2S token buffers hold the packed record; S2G stays output-dtype width.
+template <ncclDataType_t kTokenDtype,
+          ncclEpCombQuant_t kCombineRecipe>
 static size_t calc_comb_per_g2s_stage_smem(
     int num_lsa_teams, const combine_config_t& config, const model_config_t& model) {
     const bool multi_lsa = (num_lsa_teams > 1);
-    int token_stride = model.hidden_dim * nccl_ep::size_u8<kTokenDtype>();
-    token_stride = (token_stride + 127) & ~127;
+    using Recipe = nccl_ep::combine_recipe_traits<kCombineRecipe>;
+    // Both G2S rings carry the recipe's packed row, so one stride sizes both.
+    int g2s_stage_bytes = Recipe::template packed_bytes<kTokenDtype>(model.hidden_dim);
+    g2s_stage_bytes = (g2s_stage_bytes + 127) & ~127;
     int prob_stride = model.num_of_experts_per_rank * model.ranks_per_lsa_team * sizeof(float);
     prob_stride = (prob_stride + 15) & ~15;
     size_t stage_size = 0;
     // Token buffers (128B aligned): cross_lsa always, lsa_* only when multi-team.
-    stage_size += token_stride;
-    if (multi_lsa) stage_size += token_stride;
+    stage_size += g2s_stage_bytes;
+    if (multi_lsa) stage_size += g2s_stage_bytes;
     // Prob buffers (16B aligned, backward combine only).
     if (config.backward_combine) {
         stage_size += prob_stride;
@@ -974,7 +1012,8 @@ inline size_t calc_comb_smem(
     return (total_size + 127) & ~127;
 }
 
-template <ncclDataType_t kTokenDtype = ncclBfloat16>
+template <ncclDataType_t kTokenDtype,
+          ncclEpCombQuant_t kCombineRecipe>
 static comb_smem_cost_t calc_comb_smem_cost(
     int max_num_of_tokens_per_rank,
     int num_lsa_teams,
@@ -982,7 +1021,7 @@ static comb_smem_cost_t calc_comb_smem_cost(
     const model_config_t& model) {
     return comb_smem_cost_t{
         calc_comb_fixed_smem(max_num_of_tokens_per_rank, num_lsa_teams, config),
-        calc_comb_per_g2s_stage_smem<kTokenDtype>(num_lsa_teams, config, model),
+        calc_comb_per_g2s_stage_smem<kTokenDtype, kCombineRecipe>(num_lsa_teams, config, model),
         calc_comb_per_s2g_stage_smem<kTokenDtype>(num_lsa_teams, config, model),
     };
 }
@@ -2142,7 +2181,8 @@ __forceinline__ __device__ void dispatch_G2S_warp(
 // combine smem layout, so one helper covers both tiers).
 //   - derive stage_idx + parity from (global_offset + rank_in_batch)
 //   - wait for consumer to free the stage (mbarrier_try_wait_parity)
-//   - cp_async_bulk the token (and the prob under BACKWARD_COMBINE)
+//   - cp_async_bulk the token (and the prob under BACKWARD_COMBINE). MXFP8 E8M0 rows
+//     ride in the token copy: every source is packed [FP8 H | E8M0 H/32].
 //   - optionally write <tier>_flag_G2S_buffer[stage_idx]
 //   - mbarrier_arrive_expect_tx with the cumulative tx size
 //
@@ -2155,7 +2195,7 @@ __forceinline__ __device__ void issue_g2s_entry(
     int rank_in_batch,
     int starting_G2S_index,
     int ring_len,
-    const uint16_t* token_src,
+    const void* token_src,
     uint32_t token_bytes,
     const float* prob_src,
     uint32_t prob_bytes,
@@ -2185,7 +2225,7 @@ __forceinline__ __device__ void issue_g2s_entry(
         cuda::ptx::space_shared,
         cuda::ptx::space_global,
         token_dst,
-        reinterpret_cast<const void*>(token_src),
+        token_src,
         token_bytes,
         producer_mbar);
     total_tx_size += token_bytes;
@@ -2248,7 +2288,7 @@ __forceinline__ __device__ void issue_local_g2s_row(
     int starting_G2S_index,
     int ring_len,
     int lane_id,
-    uint16_t* const* remote_expert_input_token,
+    const void* const* remote_expert_input_token,
     float* const* remote_expert_input_prob,
     uint32_t token_bytes,
     uint32_t prob_bytes,
@@ -2275,8 +2315,10 @@ __forceinline__ __device__ void issue_local_g2s_row(
         }
         // Avoid int32-overflow issue by casting slot to size_t
         const size_t slot_st = static_cast<size_t>(slot);
-        const uint16_t* token_src =
-            remote_expert_input_token[rank_id] + (slot_st * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>());
+        // Byte-addressed offset: token_bytes already encodes the per-slot byte count
+        // for all dtypes (BF16=2*H, FP8=H, FP32=4*H), so no per-recipe branching needed.
+        const void* token_src =
+            static_cast<const uint8_t*>(remote_expert_input_token[rank_id]) + slot_st * token_bytes;
         const float* prob_src = nullptr;
         if constexpr (BACKWARD_COMBINE) {
             prob_src = remote_expert_input_prob[rank_id] + (slot_st * (experts_per_rank * ranks_per_lsa_team));
@@ -2366,12 +2408,13 @@ template <
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     ncclEpLayout_t kLayout,
-    ncclDataType_t kTokenDtype>
+    ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ void combine_G2S_intra_warp(
     // INPUT
     const bool* rdma_to_attn_map,
     const int32_t* sparse_to_dense_map,
-    uint16_t* const* remote_expert_input_token,
+    const void* const* remote_expert_input_token,
     float* const* remote_expert_input_prob,
     // CONFIG
     const int my_lteam,
@@ -2392,8 +2435,10 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     constexpr int WARP_SIZE = 32;
     const int lane_id = (int)(threadIdx.x & (WARP_SIZE - 1));
     constexpr int ring_len = STAGES_G2S;
-    // Wire token width: 2 B for BF16/FP16 (default), 4 B for FP32 NONE.
-    const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>()));
+    // Every MXFP8 source is packed [FP8 H | E8M0 H/32]: the prologue emits it that way and
+    // the RDMA leg carries BF16, so one TMA per token covers values and scales alike.
+    using Recipe = nccl_ep::combine_recipe_traits<kCombineRecipe>;
+    const uint32_t token_bytes = (uint32_t)Recipe::template packed_bytes<kTokenDtype>(HIDDEN_DIM);
     const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SZ) * sizeof(float));
 
     // EM unfused-combine dedup uses __shfl_up_sync(1); requires s2d_inner_dim <= WARP_SIZE.
@@ -2444,6 +2489,72 @@ __forceinline__ __device__ void combine_G2S_intra_warp(
     }
 }
 
+// MXFP8 element<->accumulator mapping for the RED groups.
+//
+// Strided ownership (element = n*THRDS + tid) gives each thread one FP8 pair per accumulator,
+// so MXFP8 pays the same trip count as BF16 plus a per-iteration E8M0 load/broadcast. Contiguous
+// ownership below makes one vector (= kPairs pairs) share a single E8M0 block: one wide SMEM
+// load, one scale read, no __shfl. Load and store must use the same map.
+template <int NUM_ACC>
+struct mxfp8_red_map {
+    // Widest power-of-two vector that tiles NUM_ACC. 8 pairs = one 16B load; must also divide
+    // the 16-pair E8M0 group so a vector never straddles two scale blocks.
+    static constexpr int kPairs =
+        (NUM_ACC % 8 == 0) ? 8 : ((NUM_ACC % 4 == 0) ? 4 : ((NUM_ACC % 2 == 0) ? 2 : 1));
+    static_assert(16 % kPairs == 0, "vector must tile the 16-pair E8M0 group");
+    static constexpr int kLanesPerScale = 16 / kPairs;
+
+    __device__ static constexpr int vec_base(int n, int thrds, int tid) {
+        return (n / kPairs) * (kPairs * thrds) + tid * kPairs;
+    }
+    __device__ static constexpr int pair_id(int n, int thrds, int tid) {
+        return vec_base(n, thrds, tid) + (n % kPairs);
+    }
+};
+
+// Wide shared load of kPairs FP8 pairs. Alignment: stage bases are 128B-aligned and vec_base
+// is a multiple of kPairs, so the byte address is a multiple of 2*kPairs (16B when kPairs==8).
+// Copied via a local POD so we do not type-pun the uint16_t array itself.
+template <int kPairs>
+__device__ __forceinline__ void ld_fp8_pairs_shared(uint16_t (&dst)[kPairs], const uint16_t* src) {
+    static_assert(kPairs > 0 && kPairs <= 8 && (kPairs & (kPairs - 1)) == 0,
+                  "kPairs must be a power of two up to 8, so the run is one machine load");
+    using vec_t = typename nccl_ep::VecInt<kPairs * static_cast<int>(sizeof(uint16_t))>::vec_t;
+    const vec_t v = *reinterpret_cast<const vec_t*>(src);
+    __builtin_memcpy(dst, &v, sizeof(v));
+}
+
+// Wide shared store of kPairs consecutive token pairs: the store-side mirror of
+// ld_fp8_pairs_shared. vec_base hands each thread kPairs consecutive pair ids per group, so a
+// group is one contiguous run and leaves as 16B stores instead of kPairs narrow ones.
+// Alignment: the byte offset is first_pair * pair_bytes with first_pair a multiple of kPairs,
+// hence a multiple of the run width, and stage bases are 128B aligned.
+template <int kPairs, ncclDataType_t kTokenDtype>
+__device__ __forceinline__ void st_token_pairs_shared(void* base, int first_pair, const float2* src) {
+    constexpr int kPairBytes = 2 * nccl_ep::size_u8<kTokenDtype>();
+    constexpr int kRunBytes = kPairs * kPairBytes;
+    // Encode into a local POD first so the wide move is a plain copy of the run.
+    alignas(16) uint8_t staging[kRunBytes];
+#pragma unroll
+    for (int t = 0; t < kPairs; t++) {
+        nccl_ep::st_token_pair<kTokenDtype>(staging, t, src[t]);
+    }
+
+    // 16 B is the widest machine store, so a run wider than that leaves as a short loop of
+    // them and a narrower one as a single store of its own width.
+    constexpr int kChunkBytes = kRunBytes < 16 ? kRunBytes : 16;
+    static_assert(kRunBytes % kChunkBytes == 0, "unexpected token pair run width");
+    using chunk_t = typename nccl_ep::VecInt<kChunkBytes>::vec_t;
+
+    uint8_t* dst = static_cast<uint8_t*>(base) + static_cast<size_t>(first_pair) * kPairBytes;
+#pragma unroll
+    for (int b = 0; b < kRunBytes; b += kChunkBytes) {
+        chunk_t v;
+        __builtin_memcpy(&v, staging + b, sizeof(v));
+        *reinterpret_cast<chunk_t*>(dst + b) = v;
+    }
+}
+
 // Reduce all G2S source-token contributions for one destination token into FP32 registers
 // (+prob into SMEM for backward). Advances the G2S stage cursor/parity to the next dst token.
 template <
@@ -2452,6 +2563,7 @@ template <
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe,
     typename SMEM_TYPE,
     int NUM_ACC>
 __forceinline__ __device__ void combine_reduce_dst_token(
@@ -2498,13 +2610,55 @@ __forceinline__ __device__ void combine_reduce_dst_token(
 
 // Accumulate the register-resident token. NONE-FP16 reads __half2, NONE-FP32 reads float2 and
 // skips precision conversion; predicates are launch-uniform so branching is free.
+// MXFP8 stages FP8 pairs plus one E8M0 byte per 32 elements and dequantizes here.
+        if constexpr (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) {
+            using Map = mxfp8_red_map<NUM_ACC>;
+            constexpr int kPairs = Map::kPairs;
+            const int tid = (int)RED_GROUP::thread_rank();
+            const int thrds = (int)RED_GROUP::size();
+            const uint16_t* fp8_data = reinterpret_cast<const uint16_t*>(load_token_base_ptr);
+            const uint8_t* scale_data =
+                reinterpret_cast<const uint8_t*>(load_token_base_ptr) + HIDDEN_DIM;
 #pragma unroll
-        for (int n = 0; n < NUM_ACC; n++) {
-            int element_id = (n * RED_GROUP::size()) + RED_GROUP::thread_rank();
-            if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
-                float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
-                acc_token_fp32[n].x += src_data_fp32.x;
-                acc_token_fp32[n].y += src_data_fp32.y;
+            for (int base = 0; base < NUM_ACC; base += kPairs) {
+                const int pair0 = Map::vec_base(base, thrds, tid);
+                if (pair0 + kPairs <= NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+                    // Full vector: one wide load, one scale, no shuffle.
+                    const float scale_f = nccl_ep::mxfp8::e8m0_to_scale(scale_data[pair0 / 16]);
+                    uint16_t fp8x2[kPairs];
+                    ld_fp8_pairs_shared<kPairs>(fp8x2, fp8_data + pair0);
+#pragma unroll
+                    for (int t = 0; t < kPairs; t++) {
+                        const float2 src_data_fp32 =
+                            nccl_ep::mxfp8::dequant_x2_scaled(fp8x2[t], scale_f);
+                        acc_token_fp32[base + t].x += src_data_fp32.x;
+                        acc_token_fp32[base + t].y += src_data_fp32.y;
+                    }
+                } else {
+                    // Tail: never wide-load past the FP8 payload into the E8M0 tail.
+#pragma unroll
+                    for (int t = 0; t < kPairs; t++) {
+                        const int pair = pair0 + t;
+                        if (pair < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+                            const float scale_f =
+                                nccl_ep::mxfp8::e8m0_to_scale(scale_data[pair / 16]);
+                            const float2 src_data_fp32 =
+                                nccl_ep::mxfp8::dequant_x2_scaled(fp8_data[pair], scale_f);
+                            acc_token_fp32[base + t].x += src_data_fp32.x;
+                            acc_token_fp32[base + t].y += src_data_fp32.y;
+                        }
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < NUM_ACC; n++) {
+                int element_id = (n * RED_GROUP::size()) + RED_GROUP::thread_rank();
+                if (element_id < NUM_OF_BF16X2_ELEMENTS_PER_TOKEN) {
+                    float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
+                    acc_token_fp32[n].x += src_data_fp32.x;
+                    acc_token_fp32[n].y += src_data_fp32.y;
+                }
             }
         }
         if constexpr (BACKWARD_COMBINE) {
@@ -2537,12 +2691,18 @@ __forceinline__ __device__ void combine_reduce_dst_token(
 
 // Store one reduced destination token (+prob) from FP32 registers into an S2G SMEM stage and
 // TMA-copy it to the per-destination intra-LSA red buffer. Advances the S2G stage cursor.
+// MXFP8 stores the same 2H-byte BF16 row as NONE and emits no scales; only the
+// element->accumulator map differs (contiguous vs strided).
+// kCombineRecipe placed before deducible SMEM_TYPE/NUM_ACC so callers can specify:
+//   combine_store_reduced_token<RED_GROUP,S2G,BWD,H,Dt,kRecipe,SMEM_TYPE,ACC_N>(...)
+// SMEM_TYPE and NUM_ACC are also deducible from the function arguments.
 template <
     typename RED_GROUP,
     int STAGES_S2G,
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe,
     typename SMEM_TYPE,
     int NUM_ACC>
 __forceinline__ __device__ void combine_store_reduced_token(
@@ -2557,9 +2717,6 @@ __forceinline__ __device__ void combine_store_reduced_token(
     int cur_tokid) {
     constexpr int BF16X2_ELEMENTS_PER_TOKEN = HIDDEN_DIM / 2;
 
-    __nv_bfloat162* store_token_base_ptr =
-        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_lsa_token_S2G(dst_token_stage));
-
     // Ensure any earlier TMA read from this S2G stage has completed before we overwrite it.
     if (RED_GROUP::warp_rank() == 0) {
         if (cuda::ptx::elect_sync(~0)) {
@@ -2568,10 +2725,21 @@ __forceinline__ __device__ void combine_store_reduced_token(
     }
     arrive_and_wait(RED_GROUP::size(), 1);
 
-// Store the register-resident token (NONE-FP16 packs __half2, NONE-FP32 writes float2 verbatim).
+    __nv_bfloat162* store_token_base_ptr =
+        reinterpret_cast<__nv_bfloat162*>(smem_buffer_ptr->get_lsa_token_S2G(dst_token_stage));
+
+    // Store the register-resident token (NONE-FP16 packs __half2, NONE-FP32 writes float2 verbatim).
+    // Must mirror combine_reduce_dst_token: MXFP8 fills the accumulators via the contiguous
+    // mxfp8_red_map, so a strided store here would permute the token.
+    using Map = mxfp8_red_map<NUM_ACC>;
 #pragma unroll
     for (int n = 0; n < NUM_ACC; n++) {
-        int element_id = (n * RED_GROUP::size()) + RED_GROUP::thread_rank();
+        int element_id;
+        if constexpr (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) {
+            element_id = Map::pair_id(n, (int)RED_GROUP::size(), (int)RED_GROUP::thread_rank());
+        } else {
+            element_id = (n * RED_GROUP::size()) + RED_GROUP::thread_rank();
+        }
         if (element_id < BF16X2_ELEMENTS_PER_TOKEN) {
             nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
         }
@@ -2595,7 +2763,8 @@ __forceinline__ __device__ void combine_store_reduced_token(
         if (cuda::ptx::elect_sync(~0)) {
             // Wire token width scaled into uint16_t units (4 B FP32, 2 B BF16/FP16).
             const size_t red_token_bytes = HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>());
-            uint16_t* current_token_addr = red_token_base + cur_tokid * red_token_bytes / sizeof(uint16_t);
+            uint16_t* current_token_addr =
+                red_token_base + cur_tokid * red_token_bytes / sizeof(uint16_t);
             cuda::ptx::cp_async_bulk(
                 cuda::ptx::space_global,
                 cuda::ptx::space_shared,
@@ -2615,7 +2784,6 @@ __forceinline__ __device__ void combine_store_reduced_token(
             cuda::ptx::cp_async_bulk_commit_group();
         }
     }
-
     dst_token_stage += 1;
     if (dst_token_stage == STAGES_S2G) {
         dst_token_stage = 0;
@@ -2649,6 +2817,9 @@ __forceinline__ __device__ void combine_streaming_drain(
 }
 
 // Intra-LSA reduction warp group for the combine kernel.
+// Reads the packed [FP8 H | E8M0 H/32] intra-LSA wire for MXFP8 and writes a BF16 row to
+// combine_gin_RED_tokens. Only reached for multi-LSA-team groups, which MXFP8 does not
+// support -- it is rejected at the API, so this warp is never instantiated with it.
 template <
     typename RED_GROUP,
     typename SMEM_TYPE,
@@ -2661,7 +2832,8 @@ template <
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     int LSA_TEAM_SZ,
-    ncclDataType_t kTokenDtype>
+    ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ void combine_RED_intra_warp(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -2725,15 +2897,18 @@ __forceinline__ __device__ void combine_RED_intra_warp(
         const routing_loads_t* rdma_map_base = reinterpret_cast<const routing_loads_t*>(
             rdma_to_attn_map + (meta.lteam_id * rdma_per_lsa_sz + meta.chunk_id * TOKENS_PER_CHUNK));
 
-        // Per-token stride scaled into uint16_t units (HIDDEN_DIM for BF16/FP16, 2*HIDDEN_DIM for FP32).
-        uint16_t* red_token_base =
-            combine_gin_RED_tokens
-            + static_cast<size_t>(gin_RED_slot) * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+        // Per-token stride in gin_RED: Recipe::rdma_bytes, the inter-node row width
+        // (dtype-width for NONE), matching the previous
+        // HIDDEN_DIM * size_u16<kTokenDtype>() form for every unquantized case.
+        const int red_stride =
+            nccl_ep::combine_recipe_traits<kCombineRecipe>::template rdma_bytes<kTokenDtype>(HIDDEN_DIM);
+        uint16_t* red_token_base = reinterpret_cast<uint16_t*>(
+            reinterpret_cast<uint8_t*>(combine_gin_RED_tokens) +
+            static_cast<size_t>(gin_RED_slot) * red_stride);
         float* red_prob_base = nullptr;
         if constexpr (BACKWARD_COMBINE) {
             red_prob_base = combine_gin_RED_prob + gin_RED_slot * prob_dim;
         }
-
         streaming_pending = 0;
         int additional_in_flight_s2g = 0;
         for (int load_idx = 0; load_idx < routing_loads_for_chunk; load_idx++) {
@@ -2765,7 +2940,8 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                     STAGES_G2S,
                     BACKWARD_COMBINE,
                     HIDDEN_DIM,
-                    kTokenDtype>(
+                    kTokenDtype,
+                    kCombineRecipe>(
                     smem_buffer_ptr,
                     token_stage,
                     token_producer_parity,
@@ -2779,7 +2955,10 @@ __forceinline__ __device__ void combine_RED_intra_warp(
                     STAGES_S2G,
                     BACKWARD_COMBINE,
                     HIDDEN_DIM,
-                    kTokenDtype>(
+                    kTokenDtype,
+                    kCombineRecipe,
+                    SMEM_TYPE,
+                    ACC_ELEM_PER_THRD>(
                     smem_buffer_ptr,
                     dst_token_stage,
                     acc_token_fp32,
@@ -2826,9 +3005,9 @@ __forceinline__ __device__ void combine_RED_intra_warp(
 }
 
 // RDMA-put the active tokens (per rdma_to_attn_map) of one chunk to the remote LSA team, coalescing
-// contiguous runs into batches of at most MAX_BATCH (token + optional prob). Under STREAMING each flush
-// first waits for the intra-LSA reduction warp to publish enough produced tokens (streaming_counter)
-// and advances cumulative_sent; otherwise the whole chunk is assumed reduced. Lane 0 only.
+// contiguous runs into batches of at most MAX_BATCH (token + optional prob).
+// TOKEN_BYTES = Recipe::rdma_bytes. Every recipe that reaches here has a scale-free
+// inter-node wire, so one put per batch always suffices.
 template <
     bool STREAMING,
     bool BACKWARD_COMBINE,
@@ -2942,6 +3121,7 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
 
 // Cross-LSA-team N2N (RDMA) warp group for the combine kernel. Exactly one such warp per block;
 // uses the ncclGin API (net.put / net.signal).
+// The put width is Recipe::rdma_bytes<kTokenDtype>(H); the hop carries no scale tail.
 template <
     typename GIN_GROUP,
     typename SMEM_TYPE,
@@ -2952,7 +3132,8 @@ template <
     int LSA_TEAM_SZ,
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
-    ncclDataType_t kTokenDtype>
+    ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ void combine_N2N_inter_warp(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -3029,8 +3210,13 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
         const int token_range = is_residue ? 0 : meta.csize;
         constexpr int STREAMING_BATCH = NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH;
-        // Per-token wire bytes (compile-time): hidden x element width.
-        constexpr size_t token_bytes = static_cast<size_t>(HIDDEN_DIM) * nccl_ep::size_u8<kTokenDtype>();
+        // Multi-node RDMA wire width (dtype-width for NONE). Must be a compile-time constant:
+        // combine_n2n_put_active_tokens takes TOKEN_BYTES as a template argument.  The hop
+        // carries no scale tail, so there is only ever one put per token batch.
+        constexpr size_t token_bytes = static_cast<size_t>(
+            nccl_ep::combine_recipe_traits<kCombineRecipe>::template rdma_bytes<kTokenDtype>(HIDDEN_DIM));
+        static_assert(nccl_ep::combine_recipe_traits<kCombineRecipe>::template rdma_scale_bytes<kTokenDtype>(HIDDEN_DIM) == 0,
+                      "combine RDMA wire must be scale-free");
         if constexpr (STREAMING_BATCH > 0) {
             // ---- STREAMING PATH: process tokens as reduction warp produces them ----
             // cumulative_sent tracks total active tokens across all chunks (no reset).
@@ -3116,12 +3302,15 @@ combine_g2s_resolve_rdma_lane(int lane_id, int my_lteam, const bool* attn_to_rdm
 }
 
 // Token (+prob) source pointers for one remote token in the RDMA cross-LSA-team group buffers.
+// No scale pointer: the RDMA hop is scale-free for every recipe.
 struct g2s_src_t {
     const uint16_t* token_src;
     const float* prob_src;
 };
 
-template <bool BACKWARD_COMBINE, int HIDDEN_DIM, ncclDataType_t kTokenDtype, int MAX_NUM_OF_TOKENS_PER_RANK>
+template <bool BACKWARD_COMBINE, int HIDDEN_DIM, ncclDataType_t kTokenDtype,
+          int MAX_NUM_OF_TOKENS_PER_RANK,
+          ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     const uint16_t* combine_gin_G2S_tokens,
     const float* combine_gin_G2S_prob,
@@ -3130,9 +3319,13 @@ __forceinline__ __device__ g2s_src_t combine_g2s_resolve_rdma_source(
     int experts_per_rank,
     int lteam_sz) {
     const int rdma_row = tile_id * MAX_NUM_OF_TOKENS_PER_RANK + flat_token_id;
-    const uint16_t* token_src =
-        combine_gin_G2S_tokens
-        + static_cast<size_t>(rdma_row) * HIDDEN_DIM * nccl_ep::size_u16<kTokenDtype>();
+    // rdma_bytes is the inter-node row width (dtype-width for NONE), matching the previous
+    // HIDDEN_DIM * size_u16<kTokenDtype>() form for every unquantized case.
+    const int rdma_wire_stride =
+        nccl_ep::combine_recipe_traits<kCombineRecipe>::template rdma_bytes<kTokenDtype>(HIDDEN_DIM);
+    const uint16_t* token_src = reinterpret_cast<const uint16_t*>(
+        reinterpret_cast<const uint8_t*>(combine_gin_G2S_tokens) +
+        static_cast<size_t>(rdma_row) * rdma_wire_stride);
     const float* prob_src = nullptr;
     if constexpr (BACKWARD_COMBINE) {
         prob_src = combine_gin_G2S_prob + rdma_row * (experts_per_rank * lteam_sz);
@@ -3151,6 +3344,7 @@ template <
     ncclDataType_t kTokenDtype,
     int MAX_TOKENS_PER_RANK,
     int LSA_TEAMS,
+    ncclEpCombQuant_t kCombineRecipe,
     typename SMEM_TYPE>
 __forceinline__ __device__ void issue_rdma_g2s_row(
     SMEM_TYPE* smem_buffer_ptr,
@@ -3191,7 +3385,8 @@ __forceinline__ __device__ void issue_rdma_g2s_row(
         if (in_batch) {
             const int rank_in_batch = rdma_local_rank - rdma_ranks_issued;
             const g2s_src_t src =
-                combine_g2s_resolve_rdma_source<BACKWARD_COMBINE, HIDDEN_DIM, kTokenDtype, MAX_TOKENS_PER_RANK>(
+                combine_g2s_resolve_rdma_source<BACKWARD_COMBINE, HIDDEN_DIM, kTokenDtype,
+                                                MAX_TOKENS_PER_RANK, kCombineRecipe>(
                     combine_gin_G2S_tokens,
                     combine_gin_G2S_prob,
                     lane.tile_id,
@@ -3234,13 +3429,14 @@ template <
     int HIDDEN_DIM,
     int LSA_TEAM_SZ,
     ncclEpLayout_t kLayout,
-    ncclDataType_t kTokenDtype>
+    ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ void combine_G2S_inter_warp(
     // INPUT
     const bool* rdma_to_attn_map,
     const bool* attn_to_rdma_map,
     const int32_t* sparse_to_dense_map,
-    uint16_t* const* remote_expert_input_token,
+    const void* const* remote_expert_input_token,
     float* const* remote_expert_input_prob,
     const uint16_t* combine_gin_G2S_tokens,
     const float* combine_gin_G2S_prob,
@@ -3293,7 +3489,11 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     constexpr int WARP_SIZE = 32;
     const int lane_id = (int)(threadIdx.x & (WARP_SIZE - 1));
     const int ring_len = ending_G2S_index - starting_G2S_index;
-    const uint32_t token_bytes = (uint32_t)(HIDDEN_DIM * (nccl_ep::size_u8<kTokenDtype>()));
+    using Recipe = nccl_ep::combine_recipe_traits<kCombineRecipe>;
+    // Intra-leg (local NVLink) rows are always packed [FP8 H | E8M0 H/32] for MXFP8: the
+    // prologue emits that layout, so one TMA per token carries values and scales together.
+    const uint32_t local_token_bytes =
+        (uint32_t)Recipe::template packed_bytes<kTokenDtype>(HIDDEN_DIM);
     const uint32_t prob_bytes = (uint32_t)((experts_per_rank * LSA_TEAM_SZ) * sizeof(float));
 
     // EM unfused-combine dedup uses __shfl_up_sync(1), requiring s2d_inner_dim <= WARP_SIZE.
@@ -3373,7 +3573,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         lane_id,
                         remote_expert_input_token,
                         remote_expert_input_prob,
-                        token_bytes,
+                        local_token_bytes,
                         prob_bytes,
                         experts_per_rank,
                         LSA_TEAM_SZ,
@@ -3383,6 +3583,12 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                 // RDMA tier: each lane maps to a remote LSA team; valid lanes issue TMAs in parallel to
                 // distinct stages, batched by ring_len so parity resolves cleanly.
                 if constexpr (LSA_TEAMS > 1) {
+                    // Inter-node RDMA leg width (dtype-width for NONE); scale-free, so
+                    // issue_rdma_g2s_row takes no scale width. Declared inside the gate:
+                    // this warp is instantiated for LSA_TEAMS == 1 as well, and a recipe
+                    // with no RDMA leg (MXFP8) defines no rdma_bytes to call.
+                    const uint32_t rdma_token_bytes =
+                        (uint32_t)Recipe::template rdma_bytes<kTokenDtype>(HIDDEN_DIM);
                     const int flat_token_id =
                         cidx * TOKENS_PER_CHUNK + group_idx * TOKENS_PER_GROUP + token_in_group;
                     const bool* attn_to_rdma_addr =
@@ -3392,7 +3598,8 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         HIDDEN_DIM,
                         kTokenDtype,
                         MAX_TOKENS_PER_RANK,
-                        LSA_TEAMS>(
+                        LSA_TEAMS,
+                        kCombineRecipe>(
                         smem_buffer_ptr,
                         attn_to_rdma_addr,
                         combine_gin_G2S_tokens,
@@ -3403,7 +3610,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         ring_len,
                         lane_id,
                         my_lteam,
-                        token_bytes,
+                        rdma_token_bytes,
                         prob_bytes,
                         experts_per_rank,
                         LSA_TEAM_SZ);
@@ -3435,6 +3642,7 @@ template <
     bool READ_LAST_FLAG,
     bool ACCUMULATE_PROB,
     ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe,
     typename SMEM_TYPE,
     int NUM_ACC>
 __forceinline__ __device__ bool combine_inter_consume_src(
@@ -3470,13 +3678,62 @@ __forceinline__ __device__ bool combine_inter_consume_src(
     }
     arrive_and_wait(THRDS_PER_PIPELINE, 2 + pipeline_rank);
 
+    // MXFP8 stages are always the packed NVLink row: the recipe is single-LSA-team only, and
+    // the RDMA consumer below is instantiated only for LSA_TEAMS > 1. BF16/NONE takes the
+    // strided load_pair path at the end of this function.
+    static_assert(kCombineRecipe != NCCL_EP_COMB_QUANT_MXFP8 || READ_LAST_FLAG,
+                  "MXFP8 is NVLink-only; it must never consume an RDMA-staged row");
+    if constexpr (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) {
+        using Map = mxfp8_red_map<NUM_ACC>;
+        // One 16B FP8 load feeds kPairs accumulators and shares a single E8M0 read.
+        constexpr int kPairs = Map::kPairs;
+        const uint16_t* fp8_data = reinterpret_cast<const uint16_t*>(
+            smem_buffer_ptr->get_cross_lsa_token_G2S(token_stage));
+        const uint8_t* scale_data =
+            reinterpret_cast<const uint8_t*>(smem_buffer_ptr->get_cross_lsa_token_G2S(token_stage)) +
+            HIDDEN_DIM;
 #pragma unroll
-    for (int n = 0; n < NUM_ACC; n++) {
-        int element_id = (n * THRDS_PER_PIPELINE) + thread_rank_within_pipeline;
-        if (element_id < BF16X2_ELEMENTS_PER_TOKEN) {
-            float2 src_data_fp32 = nccl_ep::ld_token_pair<kTokenDtype>(load_token_base_ptr, element_id);
-            acc_token_fp32[n].x += src_data_fp32.x;
-            acc_token_fp32[n].y += src_data_fp32.y;
+        for (int base = 0; base < NUM_ACC; base += kPairs) {
+            const int pair0 =
+                Map::vec_base(base, THRDS_PER_PIPELINE, thread_rank_within_pipeline);
+            if (pair0 + kPairs <= BF16X2_ELEMENTS_PER_TOKEN) {
+                uint16_t fp8x2[kPairs];
+                ld_fp8_pairs_shared<kPairs>(fp8x2, fp8_data + pair0);
+                const float scale_f = nccl_ep::mxfp8::e8m0_to_scale(scale_data[pair0 / 16]);
+#pragma unroll
+                for (int t = 0; t < kPairs; t++) {
+                    const float2 src_data_fp32 =
+                        nccl_ep::mxfp8::dequant_x2_scaled(fp8x2[t], scale_f);
+                    acc_token_fp32[base + t].x += src_data_fp32.x;
+                    acc_token_fp32[base + t].y += src_data_fp32.y;
+                }
+            } else {
+                // Tail: fewer than kPairs pairs left, so fall back to scalar decode.
+#pragma unroll
+                for (int t = 0; t < kPairs; t++) {
+                    const int pair = pair0 + t;
+                    if (pair < BF16X2_ELEMENTS_PER_TOKEN) {
+                        const float scale_f =
+                            nccl_ep::mxfp8::e8m0_to_scale(scale_data[pair / 16]);
+                        const float2 src_data_fp32 =
+                            nccl_ep::mxfp8::dequant_x2_scaled(fp8_data[pair], scale_f);
+                        acc_token_fp32[base + t].x += src_data_fp32.x;
+                        acc_token_fp32[base + t].y += src_data_fp32.y;
+                    }
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int n = 0; n < NUM_ACC; n++) {
+            int element_id = (n * THRDS_PER_PIPELINE) + thread_rank_within_pipeline;
+            if (element_id < BF16X2_ELEMENTS_PER_TOKEN) {
+                float2 src_data_fp32 =
+                    nccl_ep::combine_recipe_traits<kCombineRecipe>::template load_pair<kTokenDtype>(
+                        load_token_base_ptr, element_id);
+                acc_token_fp32[n].x += src_data_fp32.x;
+                acc_token_fp32[n].y += src_data_fp32.y;
+            }
         }
     }
     if constexpr (BACKWARD_COMBINE) {
@@ -3524,6 +3781,7 @@ template <
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe,
     typename SMEM_TYPE,
     int NUM_ACC>
 __forceinline__ __device__ void combine_inter_store_token(
@@ -3558,11 +3816,38 @@ __forceinline__ __device__ void combine_inter_store_token(
     }
     arrive_and_wait(THRDS_PER_PIPELINE, 2 + pipeline_rank);
 
+    if constexpr (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) {
+        // Must mirror combine_inter_consume_src: MXFP8 owns contiguous vectors, else strided.
+        // Contiguity means a group of kPairs accumulators is one run, so it goes out as 16B
+        // stores rather than kPairs 4B ones.
+        using Map = mxfp8_red_map<NUM_ACC>;
+        constexpr int kPairs = Map::kPairs;
+        static_assert(NUM_ACC % kPairs == 0, "mxfp8_red_map picks kPairs to tile NUM_ACC");
 #pragma unroll
-    for (int n = 0; n < NUM_ACC; n++) {
-        int element_id = (n * THRDS_PER_PIPELINE) + thread_rank_within_pipeline;
-        if (element_id < BF16X2_ELEMENTS_PER_TOKEN) {
-            nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
+        for (int acc_base = 0; acc_base < NUM_ACC; acc_base += kPairs) {
+            const int first = Map::vec_base(acc_base, THRDS_PER_PIPELINE, thread_rank_within_pipeline);
+            if (first + kPairs <= BF16X2_ELEMENTS_PER_TOKEN) {
+                st_token_pairs_shared<kPairs, kTokenDtype>(
+                    store_token_base_ptr, first, &acc_token_fp32[acc_base]);
+            } else {
+                // Tail: fewer than kPairs pairs left, so store them one at a time.
+#pragma unroll
+                for (int t = 0; t < kPairs; t++) {
+                    if (first + t < BF16X2_ELEMENTS_PER_TOKEN) {
+                        nccl_ep::st_token_pair<kTokenDtype>(
+                            store_token_base_ptr, first + t, acc_token_fp32[acc_base + t]);
+                    }
+                }
+            }
+        }
+
+    } else {
+#pragma unroll
+        for (int n = 0; n < NUM_ACC; n++) {
+            const int element_id = (n * THRDS_PER_PIPELINE) + thread_rank_within_pipeline;
+            if (element_id < BF16X2_ELEMENTS_PER_TOKEN) {
+                nccl_ep::st_token_pair<kTokenDtype>(store_token_base_ptr, element_id, acc_token_fp32[n]);
+            }
         }
     }
     if constexpr (BACKWARD_COMBINE) {
@@ -3629,7 +3914,8 @@ template <
     bool BACKWARD_COMBINE,
     int HIDDEN_DIM,
     int LSA_TEAM_SZ,
-    ncclDataType_t kTokenDtype>
+    ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe>
 __forceinline__ __device__ void combine_RED_inter_warp(
     // INPUT
     const bool* rdma_to_attn_map,
@@ -3761,7 +4047,8 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                             HIDDEN_DIM,
                             /*READ_LAST_FLAG=*/true,
                             /*ACCUMULATE_PROB=*/true,
-                            kTokenDtype>(
+                            kTokenDtype,
+                            kCombineRecipe>(
                             smem_buffer_ptr,
                             token_stage,
                             token_producer_parity,
@@ -3792,7 +4079,8 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                                 HIDDEN_DIM,
                                 /*READ_LAST_FLAG=*/false,
                                 /*ACCUMULATE_PROB=*/false,
-                                kTokenDtype>(
+                                kTokenDtype,
+                                kCombineRecipe>(
                                 smem_buffer_ptr,
                                 token_stage,
                                 token_producer_parity,
@@ -3817,7 +4105,8 @@ __forceinline__ __device__ void combine_RED_inter_warp(
                     LSA_TEAMS,
                     BACKWARD_COMBINE,
                     HIDDEN_DIM,
-                    kTokenDtype>(
+                    kTokenDtype,
+                    kCombineRecipe>(
                     smem_buffer_ptr,
                     dst_token_stage,
                     starting_S2G_index,
@@ -4270,9 +4559,10 @@ template < // This type represent intra-LSA reduction warp group.
   int NBLOCKS,
   // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
   bool BACKWARD_COMBINE, int HIDDEN_DIM, int LSA_TEAM_SZ, ncclEpLayout_t kLayout,
-  // NONE output dtype, resolved at compile time (JIT literal) so the per-element
+  // Output dtype, resolved at compile time (JIT literal) so the per-element
   // reduction branches fold away.
-  ncclDataType_t kTokenDtype>
+  ncclDataType_t kTokenDtype,
+  ncclEpCombQuant_t kCombineRecipe>
 // Each CUDA block of combine kernel has named warp groups:
 // intra/inter reduction, intra/inter G2S, and cross-LSA-team N2N RDMA. Group sizes are
 // set by the HT combine warp-count constants and the selected pipeline count.
@@ -4320,7 +4610,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     c_model.num_lsa_teams = LSA_TEAMS;
     // Layout derives the element width from kTokenDtype (FP32 doubles the per-stage
     // token-buffer bytes vs BF16/FP16).
-    create_combine_smem_layout<kTokenDtype>(
+    create_combine_smem_layout<kTokenDtype, kCombineRecipe>(
         smem_layout,
         smem_bytes,
         STAGES_G2S,
@@ -4406,7 +4696,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             combine_RED_intra_warp<LSA_RED_GROUP, cur_smem_t, STAGES_G2S, STAGES_S2G, \
                                    TOKENS_PER_CHUNK, MAX_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, \
                                    BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SZ, \
-                                   kTokenDtype>
+                                   kTokenDtype, kCombineRecipe>
             COMBINE_RED_INTRA_TEMPLATE(
                 // INPUT
                 param.rdma_to_attn_map,
@@ -4425,7 +4715,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #define COMBINE_RED_INTER_TEMPLATE \
         combine_RED_inter_warp<cur_smem_t, CROSS_LSA_RED_GROUP, PIPELINES_PER_BLOCK, STAGES_G2S, \
                                 STAGES_S2G, TOKENS_PER_CHUNK, LSA_TEAMS, NBLOCKS, TOKENS_PER_GROUP, \
-                                BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SZ, kTokenDtype>
+                                BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SZ, kTokenDtype, kCombineRecipe>
         COMBINE_RED_INTER_TEMPLATE(
             // INPUT
             param.rdma_to_attn_map,
@@ -4446,11 +4736,12 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
         if constexpr (LSA_TEAMS != 1) {
 #define COMBINE_G2S_INTRA_TEMPLATE \
             combine_G2S_intra_warp<cur_smem_t, STAGES_G2S, TOKENS_PER_CHUNK, LSA_TEAMS, \
-                                   LSA_TEAM_SZ, NBLOCKS, BACKWARD_COMBINE, HIDDEN_DIM, kLayout, kTokenDtype>
+                                   LSA_TEAM_SZ, NBLOCKS, BACKWARD_COMBINE, HIDDEN_DIM, kLayout, kTokenDtype, \
+                                   kCombineRecipe>
             COMBINE_G2S_INTRA_TEMPLATE(
                 param.rdma_to_attn_map,
                 param.sparse_to_dense_map,
-                param.expert_input_token,
+                reinterpret_cast<const void* const*>(param.expert_input_token),
                 param.expert_input_prob,
                 my_lteam,
                 param.num_of_tokens_per_rank,
@@ -4466,13 +4757,13 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #define COMBINE_G2S_INTER_TEMPLATE \
         combine_G2S_inter_warp<cur_smem_t, CROSS_LSA_G2S_GROUP, STAGES_G2S, TOKENS_PER_CHUNK, \
                                 MAX_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, TOKENS_PER_GROUP, \
-                                BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SZ, kLayout, kTokenDtype>
+                                BACKWARD_COMBINE, HIDDEN_DIM, LSA_TEAM_SZ, kLayout, kTokenDtype, kCombineRecipe>
         COMBINE_G2S_INTER_TEMPLATE(
             // INPUT
             param.rdma_to_attn_map,
             param.attn_to_rdma_map,
             param.sparse_to_dense_map,
-            param.expert_input_token,
+            reinterpret_cast<const void* const*>(param.expert_input_token),
             param.expert_input_prob,
             param.combine_gin_G2S_tokens,
             param.combine_gin_G2S_prob,
@@ -4500,7 +4791,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #define COMBINE_N2N_INTER_TEMPLATE \
             combine_N2N_inter_warp<GIN_GROUP, cur_smem_t, TOKENS_PER_CHUNK, \
                                    MAX_TOKENS_PER_RANK, LSA_TEAMS, NBLOCKS, LSA_TEAM_SZ, BACKWARD_COMBINE, \
-                                   HIDDEN_DIM, kTokenDtype>
+                                   HIDDEN_DIM, kTokenDtype, kCombineRecipe>
             COMBINE_N2N_INTER_TEMPLATE(
                 // INPUT
                 param.rdma_to_attn_map,
@@ -4706,7 +4997,9 @@ __device__ __forceinline__ void local_dup_kernel_impl(const local_dup_kernel_par
     const int block_id = blockIdx.x;
     const int n_blocks = gridDim.x;
     const int group_stride = p.emuf_group_stride;
-    const uint32_t total_tx = static_cast<uint32_t>(kTokenBytes + prob_bytes + p.scale_row_bytes);
+    uint32_t total_tx = static_cast<uint32_t>(kTokenBytes + prob_bytes);
+    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD)
+        total_tx += static_cast<uint32_t>(p.scale_row_bytes);
 
     if (warp_id == 0) {
         // Producer (G2S): 1 TMA load of the primary token per group.
@@ -5338,7 +5631,7 @@ __device__ __forceinline__ void local_permute_dup(
             if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
                 const int scale_row_int4 = scale_row_bytes >> 4;
                 const int4* ssrc =
-                    reinterpret_cast<const int4*>(scale_src + static_cast<size_t>(token) * scale_row_bytes);
+                    reinterpret_cast<const int4*>(static_cast<const uint8_t*>(scale_src) + static_cast<size_t>(token) * scale_row_bytes);
                 for (int a = 0; a < cnt; ++a) {
                     int4* sdst = reinterpret_cast<int4*>(
                         scale_dst + static_cast<size_t>(s_active[warp_id][a]) * scale_row_bytes);
@@ -5695,8 +5988,8 @@ __device__ __forceinline__ void dispatch_pull(
 }
 
 // Local EM reduce kernel (inverse of local_permute_dup). Sums the top_k EM
-// rows that share a FLAT recv slot and writes the bf16 result back into FLAT
-// staging.
+// rows that share a FLAT recv slot and writes the result back into FLAT staging:
+// the caller's dtype for NONE, packed [FP8 H | E8M0 H/32] for MXFP8.
 struct local_permute_reduce_param_t {
     void* flat_staging;
     const void* recv_x_em;
@@ -5706,17 +5999,26 @@ struct local_permute_reduce_param_t {
     const float* em_weights_in;
     float* flat_weights_out;
     int top_k;
+    // Row width is a template parameter on the device side (HiddenInt4); the host keeps
+    // it here because it derives that parameter and the JIT cache key from it.
     int row_bytes;
     int caller_num_recv_tokens;   // caller EM buffer row capacity (slot backstop)
 };
 
-// Direct-load reduce: each slot's row is reduced by a 128-thread sub-warp;
-// with kSlotsPerBlock=8 a block computes 8 slots in parallel. For each int4
-// lane the sub-warp's 128 threads accumulate across top_k contributors via
-// direct cached global loads, then write the packed bf16 result back to
-// flat_staging. HiddenInt4 = row_bytes / 16 is templated so the per-thread
-// strided element loop is a compile-time bound.
-template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype>
+// Direct-load reduce: each slot's row is reduced by a 128-thread sub-warp; with
+// kSlotsPerBlock=8 a block computes 8 slots in parallel. The 128 threads walk the row in
+// strided int4 chunks, accumulating every contributor in FP32 via direct cached global
+// loads, then write the row out.
+//
+// HiddenInt4 counts int4s in the EM *input* row, which both recipes read as kTokenDtype.
+// It is a template parameter so the per-thread strided loop gets a compile-time bound.
+// The accumulation is therefore recipe-independent; only the epilogue differs, because
+// NONE writes the input width back while MXFP8 writes a narrower packed row.
+template <
+    int MaxTopK,
+    int HiddenInt4,
+    ncclDataType_t kTokenDtype,
+    ncclEpCombQuant_t kCombineRecipe>
 __device__ __forceinline__ void local_permute_reduce(
     uint8_t* __restrict__ flat_staging,
     const uint8_t* __restrict__ recv_x_em,
@@ -5727,12 +6029,39 @@ __device__ __forceinline__ void local_permute_reduce(
     int top_k,
     int /*row_bytes*/,
     int caller_num_recv_tokens) {
-    constexpr int kRowBytes = HiddenInt4 * 16;
+    static_assert(kCombineRecipe != NCCL_EP_COMB_QUANT_MXFP8 || kTokenDtype == ncclBfloat16,
+                  "MXFP8 local reduce must output BF16");
+    constexpr int kInRowBytes = HiddenInt4 * 16;
 
     constexpr int kThreadsPerSlot = 128;
     constexpr int kSlotsPerBlock = kLocalPermuteReduceSlotsPerBlock;
-    constexpr int kBlockDim = kThreadsPerSlot * kSlotsPerBlock;
+    // int4s this thread covers across the row (ceil for partial tails), and how many it
+    // keeps in flight per iteration. The cap of 4 bounds the accumulator set at
+    // float2 acc[4][kPairs] (~32 registers), which is what keeps this kernel off the
+    // spill path at the 64-register budget of blocks_per_sm==1.
     constexpr int kElemsPerThread = (HiddenInt4 + kThreadsPerSlot - 1) / kThreadsPerSlot;
+    constexpr int kHiddenVec = (kElemsPerThread < 4) ? kElemsPerThread : 4;
+    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+
+    // MXFP8 emits the packed [FP8 H | E8M0 H/32] row; the E8M0 tail starts at out_row + H.
+    using Mxfp8Traits = nccl_ep::combine_recipe_traits<NCCL_EP_COMB_QUANT_MXFP8>;
+    constexpr int kElemsPerInt4 = kPairs * 2;
+    constexpr int kHidden = HiddenInt4 * kElemsPerInt4;
+    constexpr int kPackedRowBytes = Mxfp8Traits::template packed_bytes<ncclBfloat16>(kHidden);
+    // Preconditions the epilogue hardcodes, stated through the traits so a format change
+    // fails here rather than silently miscomputing.
+    static_assert(kCombineRecipe != NCCL_EP_COMB_QUANT_MXFP8 || Mxfp8Traits::kWireBytesPerElem == 1,
+                  "MXFP8 epilogue assumes one wire byte per element");
+    static_assert(kCombineRecipe != NCCL_EP_COMB_QUANT_MXFP8 ||
+                      kElemsPerInt4 * Mxfp8Traits::kWireBytesPerElem == (int)sizeof(uint2),
+                  "MXFP8 epilogue narrows one input int4 into a uint2");
+    static_assert(kCombineRecipe != NCCL_EP_COMB_QUANT_MXFP8 ||
+                      Mxfp8Traits::kScaleBlock == 4 * kElemsPerInt4,
+                  "MXFP8 amax reduction assumes a scale block spans 4 int4 lanes");
+    static_assert(kCombineRecipe != NCCL_EP_COMB_QUANT_MXFP8 || kPackedRowBytes % 16 == 0,
+                  "packed row must be 16B-aligned");
+    constexpr int kOutRowBytes =
+        (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) ? kPackedRowBytes : kInRowBytes;
 
     // Per-slot packed em_slot ids in smem: only valid contributors (the rest
     // of top_k are -1 from non-local experts). Lets the inner loop iterate
@@ -5773,16 +6102,8 @@ __device__ __forceinline__ void local_permute_reduce(
 
         if (slot_valid) {
             const int n = s_nvalid[slot_in_block];
+            uint8_t* out_row = flat_staging + static_cast<size_t>(slot) * kOutRowBytes;
 
-            int4* dst_int4 = reinterpret_cast<int4*>(flat_staging + static_cast<size_t>(slot) * kRowBytes);
-
-            // Process the per-thread hidden-dim int4 indices in groups of
-            // kHiddenVec so each iter has kHiddenVec * n LDGs in flight per
-            // thread, hiding per-LDG latency. Cap kHiddenVec at
-            // kElemsPerThread (JIT-known from HiddenInt4) so at small hidden
-            // the dead u-lanes and their float2 accumulators disappear:
-            // H=2048 -> kHiddenVec=2 (vs 4) frees 16 float regs per thread.
-            constexpr int kHiddenVec = (kElemsPerThread < 4) ? kElemsPerThread : 4;
             for (int nn_base = 0; nn_base < kElemsPerThread; nn_base += kHiddenVec) {
                 int js[kHiddenVec];
                 bool valid_u[kHiddenVec];
@@ -5793,31 +6114,19 @@ __device__ __forceinline__ void local_permute_reduce(
                     valid_u[u] = (nn < kElemsPerThread) && (js[u] < HiddenInt4);
                 }
 
-                float2 acc[kHiddenVec][4];
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-#pragma unroll
-                    for (int p = 0; p < 4; p++) {
-                        acc[u][p].x = 0.0f;
-                        acc[u][p].y = 0.0f;
-                    }
-                }
+                float2 acc[kHiddenVec][kPairs] = {};
 
                 for (int k = 0; k < n; k++) {
                     const int32_t em_slot = smem_flat2em_slot_map[slot_in_block][k];
-                    const int4* src =
-                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em_slot) * kRowBytes);
+                    const int4* src = reinterpret_cast<const int4*>(
+                        recv_x_em + static_cast<size_t>(em_slot) * kInRowBytes);
                     int4 buf[kHiddenVec];
 #pragma unroll
-                    for (int u = 0; u < kHiddenVec; u++) {
+                    for (int u = 0; u < kHiddenVec; u++)
                         if (valid_u[u]) buf[u] = src[js[u]];
-                    }
 #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
                         if (!valid_u[u]) continue;
-                        // int4 holds 2 FP32 pairs or 4 packed 16-bit pairs; decode
-                        // each pair to FP32 and accumulate.
-                        constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
 #pragma unroll
                         for (int p = 0; p < kPairs; p++) {
                             float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[u], p);
@@ -5827,18 +6136,53 @@ __device__ __forceinline__ void local_permute_reduce(
                     }
                 }
 
+                if constexpr (kCombineRecipe == NCCL_EP_COMB_QUANT_MXFP8) {
+                    // One MXFP8 block spans 32 elements = 4 consecutive BF16 int4s, and
+                    // consecutive j land on consecutive lanes, so amax reduces over the lane
+                    // pair distances 1 and 2. Scale index is j>>2; the FP8 payload for one
+                    // int4 is 8 B at byte offset j*8.
+                    //
+                    // Quantize one u at a time so the e8m0/out temporaries do not multiply by
+                    // kHiddenVec. Every lane runs the shuffles to keep the warp converged.
+                    uint8_t* dst_scale = out_row + kHidden;
 #pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (!valid_u[u]) continue;
-                    int4 out;
-                    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+                    for (int u = 0; u < kHiddenVec; u++) {
+                        float amax = 0.0f;
+                        if (valid_u[u]) {
 #pragma unroll
-                    for (int p = 0; p < kPairs; p++) {
-                        nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                            for (int p = 0; p < kPairs; p++) {
+                                amax = fmaxf(
+                                    amax, fmaxf(fabsf(acc[u][p].x), fabsf(acc[u][p].y)));
+                            }
+                        }
+                        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+                        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+
+                        if (valid_u[u]) {
+                            const int j = js[u];
+                            const uint8_t e8m0 = nccl_ep::mxfp8::float_to_e8m0(amax);
+                            if ((j & 3) == 0) dst_scale[j >> 2] = e8m0;
+                            const float scale_inv = nccl_ep::mxfp8::e8m0_to_scale_inv(e8m0);
+                            uint2 out;
+                            uint16_t* out_pairs = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+                            for (int p = 0; p < kPairs; p++)
+                                out_pairs[p] =
+                                    nccl_ep::mxfp8::pack_e4m3x2_scaled(acc[u][p], scale_inv);
+                            *reinterpret_cast<uint2*>(out_row + static_cast<size_t>(j) * 8) = out;
+                        }
                     }
-                    // Keep the FLAT recv row in L2 for the host-side D2D
-                    // that reads it next.
-                    nccl_ep::st_cg_global(&dst_int4[js[u]], out);
+                } else {
+                    int4* dst_int4 = reinterpret_cast<int4*>(out_row);
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++) {
+                        if (!valid_u[u]) continue;
+                        int4 out;
+#pragma unroll
+                        for (int p = 0; p < kPairs; p++)
+                            nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        nccl_ep::st_cg_global(&dst_int4[js[u]], out);
+                    }
                 }
             }
         }

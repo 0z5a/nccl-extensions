@@ -1356,6 +1356,44 @@ TEST_F(QuantizationRecipeTest, CombineNoneRejectsDispatchWireDtype) {
 TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsUnsupportedDeviceBeforeJit) {
     SKIP_IF_PULL_PUSH();
     if (nvfp4_supported()) GTEST_SKIP() << "requires a GPU without E2M1 FP4 support";
+    // The device gate is only reachable through an otherwise-valid NVFP4 call, so this needs
+    // an LL handle: NVFP4 combine is LL-only, and on the fixture's HT group the algorithm
+    // check rejects the call first (with ncclInvalidArgument) and the device gate never runs.
+    ncclEpGroupConfig_t group_config = NCCL_EP_GROUP_CONFIG_INIT;
+    group_config.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    group_config.num_experts = kNumExperts;
+    group_config.max_dispatch_tokens_per_rank = kNumTokens;
+    // Same token geometry as the NVFP4 functional LL tests; nothing is launched here, so the
+    // tensor descriptors below are never read.
+    group_config.max_token_bytes = 4096 * sizeof(nv_bfloat16);
+    group_config.rdma_buffer_size = NCCL_EP_AUTO;
+    group_config.num_qp_per_rank = kNumExperts / g_nranks;
+    group_config.num_channels = NCCL_EP_AUTO;
+    group_config.max_recv_tokens_per_rank = kNumTokens;
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &group_config));
+
+    RecipeTensor tokens(ncclBfloat16);
+    RecipeTensor output_tokens(ncclBfloat16);
+    ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t config = NCCL_EP_COMBINE_CONFIG_INIT;
+    inputs.tokens = &tokens.tensor;
+    outputs.tokens = &output_tokens.tensor;
+    config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &handle, group, NCCL_EP_LAYOUT_RANK_MAJOR, topk_idx_, nullptr, nullptr, g_stream));
+    ASSERT_NE(handle, nullptr);
+    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclInvalidUsage);
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+}
+
+TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsHighThroughput) {
+    SKIP_IF_PULL_PUSH();
+    // NVFP4 has no HT combine_recipe_traits specialization, so HT must be rejected up front
+    // rather than at JIT time -- on every GPU, FP4-capable or not.
     RecipeTensor tokens(ncclBfloat16);
     RecipeTensor output_tokens(ncclBfloat16);
     ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
@@ -1366,7 +1404,7 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsUnsupportedDeviceBeforeJit) {
     config.quant_recipe = NCCL_EP_COMB_QUANT_NVFP4;
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
-    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclInvalidUsage);
+    EXPECT_EQ(ncclEpCombine(handle, &inputs, &outputs, &config, g_stream), ncclInvalidArgument);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 

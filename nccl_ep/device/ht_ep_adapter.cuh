@@ -380,7 +380,7 @@ ncclResult_t launch_combine_reduce_stage(
 // FLAT staging by summing the top_k EM rows per FLAT recv slot. Optional
 // em_weights_in / flat_weights_out pair fuses a 1D EM to [num_flat, top_k]
 // FLAT weight gather (BWD combine); pass nullptr for both on FWD.
-void launch_combine_reduce(
+ncclResult_t launch_combine_reduce(
     void* flat_staging,
     const void* recv_x_em,
     const int32_t* flat2em_slot_map,
@@ -388,12 +388,14 @@ void launch_combine_reduce(
     const float* em_weights_in,
     float* flat_weights_out,
     int top_k,
-    int row_bytes,
+    int hidden,
+    int input_row_bytes,
     int caller_num_recv_tokens,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16);
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_recipe);
 
 // ============================================================================
 // Memory region info structs for GIN
@@ -577,6 +579,8 @@ struct CombineParams {
     ncclDataType_t token_dtype = ncclBfloat16;  // Actual token wire dtype
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
+
+    ncclEpCombQuant_t combine_recipe = NCCL_EP_COMB_QUANT_NONE;
 };
 
 // Call combine kernel with runtime template parameter resolution

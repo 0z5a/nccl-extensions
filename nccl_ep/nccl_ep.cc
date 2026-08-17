@@ -510,7 +510,9 @@ static ncclResult_t validateCombineRecipe(
     const ncclEpCombineInputs_t* inputs,
     const ncclEpCombineOutputs_t* outputs,
     const ncclEpCombineConfig_t* config,
-    unsigned int device_sm) {
+    ncclEpAlgorithm_t algorithm,
+    unsigned int device_sm,
+    bool internode) {
     const auto recipe = config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
     const ncclEpTensor_t* tokens = tensor_required(inputs->tokens);
     const ncclEpTensor_t* scales = tensor_ptr(inputs->scales);
@@ -531,6 +533,11 @@ static ncclResult_t validateCombineRecipe(
             return validate_dtype(tokens->datatype)
                 ? ncclSuccess : fail("tokens has unsupported dtype");
         case NCCL_EP_COMB_QUANT_NVFP4:
+            // LL-only, as the enum documents: the HT combine kernels have no NVFP4
+            // combine_recipe_traits specialization, so an HT call would fail JIT
+            // compilation. Reject before the HT path is entered.
+            if (algorithm != NCCL_EP_ALGO_LOW_LATENCY)
+                return fail("NVFP4 combine is supported only in LL mode");
             if (!nccl_ep::host_build_supports_fp4()) {
                 fprintf(stderr, "NCCL EP warning: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h\n");
                 return ncclInvalidUsage;
@@ -549,6 +556,42 @@ static ncclResult_t validateCombineRecipe(
                 return fail("NVFP4 requires FP32 3D inputs->scales global scales");
             }
             return ncclSuccess;
+        case NCCL_EP_COMB_QUANT_MXFP8: {
+            // HT-only: LL has no MXFP8 CombineRecipeTraits specialization, so an LL call
+            // would fail JIT compilation. Reject before the LL path is entered.
+            if (algorithm == NCCL_EP_ALGO_LOW_LATENCY)
+                return fail("MXFP8 combine is supported only in HT mode");
+            // NVLink-only. The packed [FP8 H | E8M0 H/32] row is an intra-node wire format and
+            // there is no quantized inter-node transport, so reject a multi-LSA-team group here
+            // rather than accounting for an RDMA leg everywhere downstream.
+            if (internode)
+                return fail("MXFP8 combine is single-LSA-team (NVLink) only; "
+                            "this group spans multiple LSA teams");
+            if (!nccl_ep::host_build_supports_mxfp8()) {
+                fprintf(stderr, "NCCL EP warning: MXFP8 combine requires CUDA 12.8+ (__nv_fp8_e8m0)\n");
+                return ncclInvalidUsage;
+            }
+            // Quantization is internal and fused into local_permute_reduce, so the caller
+            // always hands over BF16 rows and never a scale tensor. The layout requirement
+            // that follows from that is checked in ncclEpCombine, where the layout is known.
+            // Packed row is H + H/32 bytes; 16-byte alignment requires
+            // H % NCCL_EP_MXFP8_HIDDEN_ALIGN == 0, which also implies scale row
+            // H/32 >= 16 B for TMA when H > 0. Hidden 0 (empty-rank [0, 0]) is a
+            // valid no-op (0 is a multiple of the align).
+            const ncclEpTensor_t* out = tensor_required(outputs->tokens);
+            if (tokens->ndim != 2)
+                return fail("MXFP8 combine tokens must be 2D [recv_tokens, hidden]");
+            if (tokens->sizes[1] % NCCL_EP_MXFP8_HIDDEN_ALIGN != 0)
+                return fail("MXFP8 combine hidden dim must be a multiple of 512 "
+                            "(packed row H+H/32 must be 16-byte aligned)");
+            if (out->datatype != ncclBfloat16)
+                return fail("MXFP8 combine output tokens must be BF16");
+            if (inputs->scales != nullptr)
+                return fail("MXFP8 combine generates scales internally; inputs->scales must be null");
+            if (tokens->datatype != ncclBfloat16)
+                return fail("MXFP8 combine tokens must be BF16");
+            return ncclSuccess;
+        }
         default:
             return fail("recipe is not implemented");
     }
@@ -3702,8 +3745,7 @@ ncclResult_t ncclEpDispatch(
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
             auto* expert_recv_source_indices_data = static_cast<int*>(handle->ll.expert_recv_source_indices.data);
-            auto* src_rank_counter_data =
-                src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
+            auto* src_rank_counter_data = src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
             auto* expert_dispatch_layout_data = static_cast<int64_t*>(handle->ll.expert_dispatch_layout.data);
             auto* recv_count_data = recv_count ? static_cast<int*>(recv_count->data) : nullptr;
             auto* x_data = x->data;
@@ -4645,7 +4687,9 @@ ncclResult_t ncclEpCombine(
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     const ncclEpCombQuant_t quantization_recipe =
         config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
-    NCCLCHECK(validateCombineRecipe(inputs, outputs, config, handle->group->device_sm));
+    NCCLCHECK(validateCombineRecipe(
+        inputs, outputs, config, handle->group->config.algorithm, handle->group->device_sm,
+        is_internode_available(handle->group)));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
@@ -4664,11 +4708,15 @@ ncclResult_t ncclEpCombine(
         handle->num_tokens_set = true;
     }
 
-    // Consolidated token-dtype gate for all combine paths (LL/HT): NONE-mode
-    // (bf16/fp16/fp32). There is no FP8 combine. Checked once here.
+    // Consolidated token-dtype gate for the NONE recipe on all combine paths (LL/HT):
+    // bf16/fp16/fp32. Quantized recipes state their own, stricter dtype contract in
+    // validateCombineRecipe above -- MXFP8 requires BF16 tokens and a null scales tensor --
+    // so they skip this check rather than repeat it. Checked once here.
     {
+        const ncclEpCombQuant_t gate_recipe =
+            config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
         const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
-        if (!validate_dtype(xt->datatype)) {
+        if (gate_recipe == NCCL_EP_COMB_QUANT_NONE && !validate_dtype(xt->datatype)) {
             fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n", static_cast<int>(xt->datatype));
             return ncclInvalidArgument;
         }
@@ -4911,6 +4959,10 @@ ncclResult_t ncclEpCombine(
         auto num_tokens = static_cast<int>(x->sizes[0]);
         auto hidden = static_cast<int>(x->sizes[1]);
 
+        const ncclEpCombQuant_t combine_recipe =
+            config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
+        const bool mxfp8_combine = (combine_recipe == NCCL_EP_COMB_QUANT_MXFP8);
+
         // Validate int4 alignment for TMA
         assert((hidden * ncclTypeSize(x->datatype)) % sizeof(int4) == 0);
 
@@ -5048,6 +5100,22 @@ ncclResult_t ncclEpCombine(
             fprintf(stderr, "ncclEpCombine: NCCL_EP_HT_EM_PULL_PUSH push combine is single-LSA-team only\n");
             return ncclInvalidUsage;
         }
+        // MXFP8 quantization is fused into local_permute_reduce, which only runs in
+        // expert-major local-permute mode. Any other layout or EM mode has no kernel that
+        // could produce FP8+E8M0, so reject instead of silently transporting BF16.
+        // kPullPush satisfies em_permute_combine but routes through combine_push /
+        // combine_reduce_stage, neither of which quantizes, so reject it here too --
+        // before the branch split, so both paths are covered.
+        if (mxfp8_combine && (!em_permute_combine || comb_push)) {
+            fprintf(
+                stderr,
+                "NCCL EP error: MXFP8 combine requires the expert-major local-permute path "
+                "(layout=%d, em_permute=%d, push_combine=%d)\n",
+                static_cast<int>(handle->layout),
+                static_cast<int>(em_permute_combine),
+                static_cast<int>(comb_push));
+            return ncclInvalidArgument;
+        }
         if (comb_push) {
             // Push EM combine (FWD, NONE, single LSA team): each expert rank locally
             // reduces its K em copies and pushes the row into the destination attn
@@ -5119,13 +5187,17 @@ ncclResult_t ncclEpCombine(
                 backward_combine));
         } else {
             if (em_permute_combine) {
-                // x dtype already validated as NONE-mode at the combine entry gate;
-                // local_permute_reduce handles bf16/fp16/fp32.
-                const int row_bytes = hidden * ncclTypeSize(x->datatype);
-                if (row_bytes <= 0 || (row_bytes % 16) != 0) {
-                    return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
+                // MXFP8: app provides BF16; local_permute_reduce accumulates and quantizes to
+                // packed [FP8 H | E8M0 H/32] (same layout as the RDMA wire) in expert_input,
+                // and the combine kernel dequantizes in the RED warp.
+                // NONE: output row matches the caller's dtype (bf16/fp16/fp32).
+                // Bytes of the row the reduce kernel reads. What it writes is the recipe's
+                // packed width, derived in the adapter where the device geometry lives.
+                const int input_row_bytes = hidden * static_cast<int>(ncclTypeSize(x->datatype));
+                if (input_row_bytes <= 0 || (input_row_bytes % 16) != 0) {
+                    return ncclInvalidArgument;
                 }
-                nccl_ep::ht::launch_combine_reduce(
+                NCCLCHECK(nccl_ep::ht::launch_combine_reduce(
                     group->ht_buffers.expert_input_token,
                     x->data,
                     handle->ht.flat2em_slot_map,
@@ -5133,12 +5205,14 @@ ncclResult_t ncclEpCombine(
                     em_permute_bwd_weights ? static_cast<const float*>(topk_weights->data) : nullptr,
                     em_permute_bwd_weights ? handle->ht.recv_topk_weights_flat : nullptr,
                     handle->num_topk,
-                    row_bytes,
+                    hidden,
+                    input_row_bytes,
                     num_tokens,  // caller EM buffer rows: slot backstop in the kernel
                     static_cast<int>(group->device_sm_count),
                     group->shuffle_sms,
                     stream,
-                    x->datatype);
+                    x->datatype,
+                    mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE));
             } else if (!combine_x_uses_external_window) {
                 // Clamp to staging capacity (nvlink_dup/local_dup EM only).
                 const size_t clamped_tokens =
@@ -5150,6 +5224,8 @@ ncclResult_t ncclEpCombine(
                     token_copy_size,
                     cudaMemcpyDeviceToDevice,
                     stream));
+                // No scale copy: MXFP8 is rejected above unless em_permute_combine, and its
+                // E8M0 scales ride in the packed token row, not a separate buffer.
             }
 
             /* ===== Convert sparse topk_weights to dense prob for backward combine ===== */
@@ -5216,6 +5292,7 @@ ncclResult_t ncclEpCombine(
             }
             params.expert_input_prob_ptrs =
                 backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
+            params.combine_recipe = mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE;
             params.attn_output_token = combined_x->data;
             params.attn_output_prob = backward_combine ? dense_output_prob : nullptr;
             params.combine_gin_RED_tokens = is_lsa_only ? nullptr : group->ht_buffers.combine_gin_RED_tokens;
@@ -5303,7 +5380,9 @@ ncclResult_t ncclEpCombine(
             }
 
             /* ===== Call combine kernel ===== */
-            params.token_dtype = x->datatype;
+            // MXFP8: kTokenDtype drives the BF16 output path; the FP8 wire format is
+            // driven by params.combine_recipe, not x->datatype.
+            params.token_dtype = mxfp8_combine ? ncclBfloat16 : x->datatype;
             NCCLCHECK(
                 nccl_ep::ht::call_combine(
                     params,

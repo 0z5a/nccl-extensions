@@ -66,6 +66,8 @@ JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 # NVCC JIT support is required for HT and LL modes.
 NCCL_EP_JIT_HEADERS := \
     device/ht_ep.cuh \
+    device/mxfp8_quant.cuh \
+    device/quant_recipe.cuh \
     device/device_primitives.cuh \
     device/ht_ep_configs.cuh \
     device/cuda_compat_shims.cuh \
@@ -74,7 +76,7 @@ NCCL_EP_JIT_HEADERS := \
     device/ll_ep.cuh \
     device/ll_ep_adapter.cuh \
     device/ll_ep_smem.cuh
-NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h
+NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h include/cuda_fp_features.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)
 NCCL_EP_JIT_DEFS := -include $(abspath $(JIT_CONFIG_HEADER))
@@ -107,6 +109,11 @@ ifeq ($(WARP_TIMING),1)
 NVCUFLAGS += -DNCCL_EP_HT_ENABLE_WARP_TIMING
 CXXFLAGS  += -DNCCL_EP_HT_ENABLE_WARP_TIMING
 endif
+
+# Default for COMBINE_MAX_ACC; the single authoritative -D block is near the end of
+# this file (after EP_TEST_NVCUFLAGS and EP_BENCH_NVCUFLAGS are defined) so that all
+# four flag variables are populated exactly once.
+COMBINE_MAX_ACC ?= 64
 
 # Dependency generation flags for automatic header tracking
 DEPFLAGS = -MMD -MP
@@ -214,7 +221,7 @@ $(JIT_CONFIG_HEADER):
 	@printf '#define NCCL_EP_JIT_BUILD_INCLUDE_DIR "%s"\n' "$(abspath $(NCCL_INCDIR))" >> $@
 	@printf '#define NCCL_EP_JIT_CUDA_INCLUDE_DIR "%s"\n' "$(abspath $(CUDA_INC))" >> $@
 
-# Staged top-level headers (common.hpp, ep_enums.h) from include/
+# Staged top-level headers (common.hpp, ep_enums.h, cuda_fp_features.h) from include/
 $(JIT_DIR)/%: include/%
 	@echo "Installing JIT header $<"
 	@mkdir -p $(dir $@)
@@ -316,6 +323,23 @@ ep_test ep_bench:
 	@echo "Skipping ep_test/ep_bench (MPI not enabled). Use MPI=1 to build."
 endif
 endif
+
+# Largest NUM_ACC kept register-resident by the RED loops (default 64; override with
+# COMBINE_MAX_ACC=N on the make command line).  Propagated to all four flag sets here
+# — after EP_TEST_NVCUFLAGS and EP_BENCH_NVCUFLAGS are fully defined above — so each
+# variable receives exactly one -D.
+#   - CXXFLAGS            : nvcc_compiler.cc bakes value into JIT -D flags at runtime
+#   - NVCUFLAGS           : static .cu instantiations in the library
+#   - EP_TEST_NVCUFLAGS   : ep_test host JIT path
+#   - EP_BENCH_NVCUFLAGS  : ep_bench host JIT path
+# Sweep example: make -C nccl_ep COMBINE_MAX_ACC=32 lib ep_bench
+# Build-time only. The pipeline-count heuristic that consumes MAX_ACC runs in the
+# compiled host adapter, so passing -DNCCL_EP_COMBINE_MAX_ACC through NVCC_EXTRA_FLAGS
+# changes only the JIT'd device code and not the launch configuration it picks.
+CXXFLAGS           += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
+NVCUFLAGS          += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
+EP_TEST_NVCUFLAGS  += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
+EP_BENCH_NVCUFLAGS += -DNCCL_EP_COMBINE_MAX_ACC=$(COMBINE_MAX_ACC)
 
 clean:
 	rm -rf $(OBJDIR) $(LIBTARGET) $(SOLIBTARGET) $(SOLIBLINKS) $(HEADER_TARGETS) $(JIT_DIR) $(DST_DIR)

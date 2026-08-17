@@ -136,7 +136,7 @@ inline ncclResult_t launch_ll_combine(
              << (useLogFmt ? "_logfmt" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
-             << (qrecipe == NCCL_EP_COMB_QUANT_NVFP4 ? "_nvfp4" : "");
+             << ::nccl_ep::jit::combine_recipe_name_tag(qrecipe);
         variant_name = name.str();
         const std::string source =
             ll_combine_jit_source(useLogFmt, recipe_literal, hidden, num_topk, layout, topkIdxIsInt64, tokenDtype);

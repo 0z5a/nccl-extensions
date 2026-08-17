@@ -1343,10 +1343,14 @@ std::vector<uint8_t> build_combine_arg_buffer(
     using ParamBase = ::ht_ep::combine_kernel_param_base_t;
     static_assert(sizeof(ParamBase) % alignof(void*) == 0);
 
+    // Must match combine_kernel_param_t<LSA_TEAM_SIZE> exactly: base, then the
+    // expert_input_token[LSA] and expert_input_prob[LSA] pointer arrays. MXFP8 needs no
+    // scale fields: E8M0 rows ride in the packed token row emitted by the prologue.
     const size_t base_size = sizeof(ParamBase);
     const size_t token_offset = base_size;
     const size_t prob_offset = token_offset + params.lsa_team_size * sizeof(uint16_t*);
-    const size_t total_size = prob_offset + params.lsa_team_size * sizeof(float*);
+    size_t total_size = prob_offset + params.lsa_team_size * sizeof(float*);
+    total_size = (total_size + alignof(void*) - 1) & ~(alignof(void*) - 1);
 
     std::vector<uint8_t> arg(total_size);
     std::memcpy(arg.data(), &kp, sizeof(kp));
@@ -1394,6 +1398,48 @@ ncclResult_t combine_impl(
         &env->combine_num_pipelines,
         multi_lsa ? NCCL_EP_HT_COMBINE_CROSS_LSA_PIPELINES :
                     NCCL_EP_HT_COMBINE_LSA_PIPELINES);
+
+    // Mechanism A: auto-reduce pipelines to keep NUM_ACC within MAX_ACC.
+    //
+    // NUM_ACC = ceil(H/2 / THRDS_PER_PIPELINE) where THRDS = (RED_WARPS/P)*32.
+    // 1-node default P=2: H=7168 → NUM_ACC=56 ≤ 64 (safe, no change).
+    //                     H=16384 → NUM_ACC=128 > 64 → NVCC partial-unroll spills
+    //                     acc_token_fp32[] to local memory → +15% vs BF16.
+    // Auto-reducing to P=1: THRDS=128, NUM_ACC=64 ≤ 64 → fully register-resident.
+    // Multi-node already uses P=1 (CROSS_LSA default); this path does nothing.
+    // Override: NCCL_EP_COMBINE_NUM_PIPELINES=<P> pins the count and disables this.
+    if (!env->combine_num_pipelines.is_set) {
+        const int red_warps = NCCL_EP_HT_COMBINE_RED_WARPS;
+        const int orig_auto_p = c_config.num_pipelines;
+        while (c_config.num_pipelines > 1) {
+            const int thrds = (red_warps / c_config.num_pipelines) * 32;
+            const int num_acc = nccl_ep::ceil_div(kp.hidden_dim / 2, thrds);
+            if (num_acc <= NCCL_EP_COMBINE_MAX_ACC) break;
+            int new_p = c_config.num_pipelines - 1;
+            while (new_p > 1 && red_warps % new_p != 0) --new_p;
+            c_config.num_pipelines = new_p;
+        }
+        // Diagnostics only: keep the ostringstream and the announce_once mutex off the
+        // launch path when verbose logging is disabled.
+        if (c_config.num_pipelines != orig_auto_p && nccl_ep_env_verbose(*env)) {
+            const int thrds_old = (NCCL_EP_HT_COMBINE_RED_WARPS / orig_auto_p) * 32;
+            const int num_acc_old = nccl_ep::ceil_div(kp.hidden_dim / 2, thrds_old);
+            const int thrds_new = (NCCL_EP_HT_COMBINE_RED_WARPS / c_config.num_pipelines) * 32;
+            const int num_acc_new = nccl_ep::ceil_div(kp.hidden_dim / 2, thrds_new);
+            std::ostringstream auto_key;
+            auto_key << "auto_reduce_pipelines:" << kp.hidden_dim << ':'
+                     << orig_auto_p << ':' << c_config.num_pipelines;
+            if (::nccl_ep::jit::announce_once(auto_key.str())) {
+                std::fprintf(stderr,
+                    "[nccl_ep][auto] H=%d: reduced combine pipelines %d→%d "
+                    "(NUM_ACC %d→%d fits MAX_ACC=%d; fully register-resident). "
+                    "Set NCCL_EP_COMBINE_NUM_PIPELINES=%d to pin the original count.\n",
+                    kp.hidden_dim, orig_auto_p, c_config.num_pipelines,
+                    num_acc_old, num_acc_new, NCCL_EP_COMBINE_MAX_ACC, orig_auto_p);
+            }
+        }
+    }
+
     c_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
     c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_TOK_PER_GROUP;
     c_config.num_of_blocks = num_blocks;
@@ -1438,11 +1484,19 @@ ncclResult_t combine_impl(
     // Bilinear SMEM coefficients: size = fixed + G2S*per_g2s + S2G*per_s2g.
     // Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
-    const ::ht_ep::comb_smem_cost_t cost = (params.token_dtype == ncclFloat32) ?
-        ::ht_ep::calc_comb_smem_cost<ncclFloat32>(
-            max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
-        ::ht_ep::calc_comb_smem_cost<ncclBfloat16>(
-            max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
+    // MXFP8 sizes both G2S token rings to the packed row (H + H/32 bytes, vs 2H for BF16);
+    // the E8M0 scales ride in the token stage tail, so there is no separate scale region.
+    // S2G output buffers stay at the output dtype width. Size with the recipe on the BF16
+    // instantiation to pick up the reduced G2S cost.
+    const ::ht_ep::comb_smem_cost_t cost =
+        (params.token_dtype == ncclFloat32) ?
+            ::ht_ep::calc_comb_smem_cost<ncclFloat32, NCCL_EP_COMB_QUANT_NONE>(
+                max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
+        (params.combine_recipe == NCCL_EP_COMB_QUANT_MXFP8) ?
+            ::ht_ep::calc_comb_smem_cost<ncclBfloat16, NCCL_EP_COMB_QUANT_MXFP8>(
+                max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
+            ::ht_ep::calc_comb_smem_cost<ncclBfloat16, NCCL_EP_COMB_QUANT_NONE>(
+                max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
 
     const int max_smem = max_dynamic_smem;
     const combine_smem_fit_t fit = choose_combine_smem_config(
@@ -1506,7 +1560,9 @@ ncclResult_t combine_impl(
 #endif
 
     std::vector<uint8_t> kernel_arg = build_combine_arg_buffer(kp, params);
-    jit::launch_combine(
+    // Captured rather than NCCLCHECK'd inline so the warp-timing buffers below are still
+    // freed on the failure path.
+    const ncclResult_t combine_res = jit::launch_combine(
         c_config,
         max_dispatch_tokens_per_rank,
         num_lsa_teams,
@@ -1518,13 +1574,15 @@ ncclResult_t combine_impl(
         kernel_arg.size(),
         static_cast<int>(smem_size),
         stream,
-        params.token_dtype);
+        params.token_dtype,
+        params.combine_recipe);
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     jit::combine_dump_warp_timing(combine_layout, num_blocks, d_wt, d_bt, stream);
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
 #endif
+    NCCLCHECK(combine_res);
     return ncclSuccess;
 }
 
@@ -1810,7 +1868,7 @@ size_t comb_stage_stride_bytes(int row_bytes, bool reserve_prob) {
     return static_cast<size_t>(::ht_ep::comb_stage_stride_bytes(row_bytes, reserve_prob));
 }
 
-void launch_combine_reduce(
+ncclResult_t launch_combine_reduce(
     void* flat_staging,
     const void* recv_x_em,
     const int32_t* flat2em_slot_map,
@@ -1818,16 +1876,30 @@ void launch_combine_reduce(
     const float* em_weights_in,
     float* flat_weights_out,
     int top_k,
-    int row_bytes,
+    int hidden,
+    int input_row_bytes,
     int caller_num_recv_tokens,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
-    ncclDataType_t token_dtype) {
-    assert(row_bytes > 0 && (row_bytes % 16) == 0);
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_recipe) {
+    assert(input_row_bytes > 0 && (input_row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
     assert((em_weights_in == nullptr) == (flat_weights_out == nullptr));
+    // The row the kernel writes: the caller's row for NONE, the packed
+    // [FP8 H | E8M0 H/32] row for MXFP8. Derived forwards from hidden.
+    const int packed_row_bytes =
+        ::nccl_ep::combine_recipe_packed_row_bytes(combine_recipe, hidden, input_row_bytes);
+    // MXFP8 needs hidden a multiple of NCCL_EP_MXFP8_HIDDEN_ALIGN so the scale row is
+    // 16B-aligned for TMA; validateCombineRecipe enforces it at the API boundary.
+    if (combine_recipe == NCCL_EP_COMB_QUANT_MXFP8 && (hidden % NCCL_EP_MXFP8_HIDDEN_ALIGN) != 0) {
+        fprintf(stderr,
+                "NCCL EP error: MXFP8 combine reduce hidden=%d is not a multiple of %d\n",
+                hidden, NCCL_EP_MXFP8_HIDDEN_ALIGN);
+        return ncclInternalError;
+    }
 
     const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
@@ -1839,16 +1911,17 @@ void launch_combine_reduce(
     p.em_weights_in = em_weights_in;
     p.flat_weights_out = flat_weights_out;
     p.top_k = top_k;
-    p.row_bytes = row_bytes;
+    p.row_bytes = packed_row_bytes;
     p.caller_num_recv_tokens = caller_num_recv_tokens;
 
-    ::nccl_ep::ht::jit::launch_local_permute_reduce(
+    return ::nccl_ep::ht::jit::launch_local_permute_reduce(
         top_k,
-        row_bytes,
+        input_row_bytes,
         static_cast<int>(grid),
         p,
         stream,
-        token_dtype);
+        token_dtype,
+        combine_recipe);
 }
 
 ncclResult_t launch_combine_push(
@@ -1961,3 +2034,4 @@ ncclResult_t launch_combine_reduce_stage(
 
 } // namespace ht
 } // namespace nccl_ep
+

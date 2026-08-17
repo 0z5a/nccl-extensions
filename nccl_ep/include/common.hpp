@@ -99,6 +99,21 @@ static constexpr uint16_t kTopkIdxInvalid = 0xFFFFu;
 #include "nccl_device.h"
 #include "device/macros.cuh"
 #include "ep_enums.h"
+#include "cuda_fp_features.h"
+
+// Library-side NCCLCHECK: for ncclResult_t-returning functions. The
+// app/exit-on-error flavor used by ep_bench/ep_test is defined locally in
+// those TUs (they exit rather than return).
+#ifndef NCCLCHECK
+#define NCCLCHECK(cmd) \
+    do { \
+        ncclResult_t _ncclcheck_res = (cmd); \
+        if (_ncclcheck_res != ncclSuccess) { \
+            fprintf(stderr, "NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(_ncclcheck_res)); \
+            return _ncclcheck_res; \
+        } \
+    } while (0)
+#endif
 
 namespace nccl_ep {
 
@@ -121,6 +136,14 @@ inline constexpr bool host_device_supports_fp4(unsigned int sm) {
 // cuda_fp4.h first ships in CUDA 12.8, but NVFP4 family targets require CUDA 12.9.
 inline constexpr bool host_build_supports_fp4() {
     return NCCL_EP_HAS_CUDA_FP4_TYPES && CUDART_VERSION >= 12090;
+}
+
+// cuda_fp8.h ships E4M3 from CUDA 11.8; __nv_fp8_e8m0 (and therefore the
+// preferred MXFP8 reciprocal-scale path) requires CUDA 12.8. Device headers
+// still compile on older toolkits via a software fallback; the API rejects
+// MXFP8 there so the fallback is compile-only.
+inline constexpr bool host_build_supports_mxfp8() {
+    return NCCL_EP_HAS_CUDA_E8M0_TYPE;
 }
 
 constexpr int kDsFp8E3M4ElementsPerScale = 128;

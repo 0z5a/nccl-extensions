@@ -490,9 +490,12 @@ typedef struct {
     ncclEpTensor_t* tokens; // required; post-expert activation tensor
     ncclEpTensor_t* topk_weights; // optional; HT backward combine only:
   //   2D [num_recv_tokens, top_k], ncclFloat32
-    // Experimental NVFP4 combine only: FP32 per-expert-token global quantization scales.
-    // For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when amax is 0.
-    // This scale is computed from the post-expert activation before ncclEpCombine.
+    // Optional; recipe-dependent:
+    // - NCCL_EP_COMB_QUANT_NONE / NCCL_EP_COMB_QUANT_MXFP8: must be NULL
+    //   (MXFP8 generates its E8M0 block scales internally).
+    // - NCCL_EP_COMB_QUANT_NVFP4 (experimental): FP32 per-expert-token global quantization
+    //   scales. For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when
+    //   amax is 0. Computed from the post-expert activation before ncclEpCombine.
     ncclEpTensor_t* scales;
 } ncclEpCombineInputs_t;
 
@@ -789,6 +792,17 @@ typedef enum {
     // The caller supplies FP32 global scales through combine inputs->scales;
     // the kernel follows the DeepEP-LL NVFP4 pack/dequantize contract.
     NCCL_EP_COMB_QUANT_NVFP4 = 1,
+    // MXFP8: inputs->tokens are BF16 and inputs->scales must be NULL. The library
+    // quantizes to FP8 E4M3 + per-block E8M0 block scales (block 32) internally,
+    // transports the packed row, and de-quantizes in the FP32 weighted reduction;
+    // combine output is BF16. Requires expert-major local-permute path (HT only)
+    // and a single LSA team: the packed row is an intra-node NVLink wire format,
+    // so a group spanning multiple LSA teams (inter-node) is rejected.
+    // Hidden must be a multiple of 512: the packed [FP8 H | E8M0 H/32] row is
+    // 16-byte aligned iff H % 512 == 0 (and the scale row is then >= 16 B for TMA).
+    // Requires a CUDA 12.8 or newer toolkit: the E8M0 reciprocal-scale conversion
+    // uses __nv_fp8_e8m0. The call is rejected on builds made with older toolkits.
+    NCCL_EP_COMB_QUANT_MXFP8 = 2,
 } ncclEpCombQuant_t;
 
 // EP dispatch configuration structure
