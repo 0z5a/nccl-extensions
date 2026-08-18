@@ -2382,6 +2382,8 @@ LOW_LATENCY_COMBINE_RECV:
                             topkWeight);
                     }
 
+                    // Order generic-proxy reads before releasing the stage to the async TMA producer.
+                    fence_view_async_shared();
                     if (elect_one_sync()) mbarrier_arrive(emptyBarriers[stageIdx]);
                     stageIdx = (stageIdx + 1) % kNumStages;
                 }
