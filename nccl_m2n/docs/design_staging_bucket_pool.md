@@ -1,13 +1,13 @@
-# Bounded PACKWINDOW staging buffers
+# Bounded PACK staging buffers
 
 Status: implemented. The main implementation is
-[`packwindow_staging.cc`](../src/packwindow_staging.cc); configuration is parsed
-in [`m2n_config.cc`](../src/m2n_config.cc), and PACKWINDOW host-RMA ordering is
+[`pack_staging.cc`](../src/pack_staging.cc); configuration is parsed
+in [`m2n_config.cc`](../src/m2n_config.cc), and PACK host-RMA ordering is
 implemented in [`reshard_user_window.cu`](../src/reshard_user_window.cu).
 
 ## Scope
 
-PACKWINDOW always uses a bounded pool of configured size classes. The built-in
+PACK always uses a bounded pool of configured size classes. The built-in
 profile is `2147483648:4` (one 2-GiB bucket with four slots). Override it with:
 
 ```text
@@ -20,7 +20,7 @@ profile. The old `NCCL_RESHARD_STAGING_BUCKETS` and
 `NCCL_RESHARD_STAGING_WATERMARK_BYTES` variables are no longer read. This pool
 does not control the separate DIRECT channelized pipeline in `staging_buffer.cc`.
 
-PACKWINDOW requires `max(srcLocalBytes, dstLocalBytes, 2048)` bytes for a call.
+PACK requires `max(srcLocalBytes, dstLocalBytes, 2048)` bytes for a call.
 Source packing and destination receive offsets share the same offset-zero
 region because multi-rank resharding requires disjoint source and destination
 rank intervals. A selected physical slot is allocated lazily; unused slots in
@@ -102,7 +102,7 @@ cycle, for example rank X submitting A then B while rank Y submits B then A.
 
 ## Validation
 
-`packwindow_staging_pool_test.cc` covers configuration parsing, lazy allocation,
+`pack_staging_pool_test.cc` covers configuration parsing, lazy allocation,
 stable round-robin mapping, local
 cross-stream ordering, shared-lane overlap rejection, communicator-owned warmup
 state, and healthy-lane selection after poisoning.
@@ -111,5 +111,5 @@ state, and healthy-lane selection after poisoning.
 communicators share one destination GPU and one physical slot; one case delays
 the previous destination consumer, and the other submits repeated A/B waves
 without transfer-phase barriers. Cluster validation must also verify the
-`packwindow-lsa-hput` activation log so kernel fallback cannot accidentally
+`pack-lsa-hput` activation log so kernel fallback cannot accidentally
 certify the host-RMA lease.
