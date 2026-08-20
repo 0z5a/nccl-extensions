@@ -17,7 +17,7 @@ internal.
 
 ## Why not public?
 
-Generation relies on [cybind](https://gitlab-master.nvidia.com/leof/cybind), an
+Generation relies on [cybind](https://gitlab-master.nvidia.com/xiakunl/cybind), an
 internal NVIDIA tool. To keep the package buildable without access to it, we:
 
 1. Run `generate_cython.py` when a bound library's headers change
@@ -32,67 +32,33 @@ API headers) has no nccl-extensions equivalent and was not ported.
 
 - CUDA installation, with `CUDA_HOME` or `CUDA_PATH` set (cybind needs `cuda.h`)
 - [`uv`](https://docs.astral.sh/uv/) on `PATH`
-- SSH access to the cybind repository (unless `--cybind-path` points at a local
-  checkout)
+
+The script declares its Python dependencies using PEP 723, so no separate
+Python environment setup is required.
 
 ## Usage
 
-Re-run whenever `nccl_ep/include/nccl_ep.h`, `nccl_m2n/src/nccl_m2n.h`, their
-templates/configs, or the pinned NCCL header changes:
+Select exactly the libraries whose bindings should be regenerated. Add
+`@VERSION` to generate from that library's release tag, or omit it to use the
+current checkout:
 
 ```bash
-python3 build_assets/generate_cython.py --verbose
+uv run python/build_assets/generate_cython.py nccl_ep@0.2.0 nccl_m2n@0.1.0
+uv run python/build_assets/generate_cython.py nccl_ep
 ```
 
-The script clones cybind at the pinned `CYBIND_COMMIT`, stages our configs,
-headers and templates into its `assets/`, then regenerates the
-complete shared `python/nccl/_extensions/bindings/` package transactionally.
-Commit the resulting diff.
+For a versioned target, the conventional tag rule maps the version to a tag
+(`nccl_ep@0.2.0` becomes `nccl-ep-v0.2.0`). The script creates a detached
+worktree for that tag; an unversioned target uses the current checkout. Only
+the selected targets are regenerated. Output is written under
+`python/nccl/_extensions/bindings/`.
 
-See `generate_cython.py --help` for all options; `--cybind-path` reuses a local
-cybind checkout instead of cloning.
+See `generate_cython.py --help` for all options.
 
-## Headers
+## Adding a library
 
-Two different policies, on purpose:
+Add its target definition to `TARGETS` in `generate_cython.py`, then add the
+matching cybind config and any required templates under `cybind/`.
 
-- **`nccl_ep` headers are not checked in here.** They live in this repo at
-  `nccl_ep/include/`, and are staged straight from there. The bound version is
-  read from `NCCL_EP_{MAJOR,MINOR,PATCH}` in `nccl_ep.h` and stamped into
-  `cybind/configs/nccl_ep.cybind.yaml`, so bindings can never drift from the
-  header they were generated against.
-- **Headers this repo does not own are pinned** under
-  `cybind/headers/<libname>/<version>/`, matching cybind's own layout.
-  Currently just `nccl.h`, at the version in `NCCL_PIN`; it fixes the NCCL core
-  ABI the generated bindings were built against. Bumping it means dropping the
-  new `nccl.h` in place, updating `NCCL_PIN`, and regenerating.
-
-## Contents
-
-- `generate_cython.py` — driver: stages assets, runs cybind, installs output
-- `cybind/configs/{nccl_ep,nccl_m2n}.cybind.yaml` — cybind configs for the
-  bound libraries (including `AUTO_LOWPP_CLASS` struct overrides)
-- `cybind/templates/nccl/_extensions/bindings/` — Cython templates, plus the
-  static files (`_internal/utils.{pxd,pyx}`, `__init__.py`) that cybind does not
-  process and `generate_cython.py` copies verbatim
-- `cybind/headers/` — pinned third-party headers (see above)
-
-## Generated binding conventions
-
-All bound libraries share `nccl/_extensions/bindings/`, so common generated
-support such as `_internal/utils.pyx` and `_binding_helpers.py` is built and
-shipped once.
-
-A library may provide dedicated templates when its ABI or native-loader
-contract differs from the common case. Keep those differences inside the
-generated binding layer:
-
-- add the library configuration under `cybind/configs/`;
-- add any library-specific templates under
-  `cybind/templates/nccl/_extensions/bindings/`;
-- keep public, framework-facing APIs in that library's facade package;
-- preserve actionable loader errors and ensure native symbols resolve from the
-  intended library handle.
-
-After changing a bound header, configuration, or template, regenerate the
-complete bindings package and commit the generated diff.
+After changing a bound header, config, or template, regenerate the affected
+targets and review the generated diff.

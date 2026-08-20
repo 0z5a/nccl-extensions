@@ -1,13 +1,12 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. ALL RIGHTS RESERVED.
+#
 # SPDX-License-Identifier: Apache-2.0
-
+#
 # This code was automatically generated $version_span. Do not modify it directly.
-
-$external_imports
 
 
 ###############################################################################
-# Types and constants
+# Types (structs, enums, ...)
 ###############################################################################
 
 # The generated declarations encode the M2N ABI, including these public
@@ -35,6 +34,7 @@ cdef extern from *:
 # enums
 $enum_decls
 
+
 # types
 cdef extern from *:
     """
@@ -43,7 +43,7 @@ cdef extern from *:
     #include <cuComplex.h>
     """
     ctypedef void* cudaStream_t 'cudaStream_t'
-    ctypedef int cudaError_t 'cudaError_t'
+
 
 $type_decls
 
@@ -53,6 +53,3 @@ $type_decls
 ###############################################################################
 
 $func_decls
-
-# Keep the error-detail query on the original no-throw Cython contract.
-cdef const char* ncclM2nGetLastError() noexcept nogil

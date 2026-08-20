@@ -1,6 +1,7 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. ALL RIGHTS RESERVED.
+#
 # SPDX-License-Identifier: Apache-2.0
-
+#
 # This code was automatically generated $version_span. Do not modify it directly.
 
 from libc.stdint cimport intptr_t
@@ -20,13 +21,15 @@ ctypedef cudaStream_t Stream
 
 
 ###############################################################################
+# Enum
+###############################################################################
+
+$enum_decls
+
+
+###############################################################################
 # Functions
 ###############################################################################
 
-cpdef intptr_t init(intptr_t config) except? 0
-cpdef finalize(intptr_t handle)
-cpdef group_start()
-cpdef group_end()
-cpdef group_abort()
-cpdef reshard_with_window(intptr_t handle, intptr_t comm, intptr_t window, intptr_t src, intptr_t dst, intptr_t stream)
-cpdef reshard(intptr_t handle, intptr_t comm, intptr_t src, intptr_t dst, intptr_t stream)
+$func_decls
+cpdef object get_library_path()

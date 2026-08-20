@@ -4,7 +4,6 @@
 #
 # This code was automatically generated $version_span. Do not modify it directly.
 
-from libc.stdint cimport intptr_t
 
 from .cy${libname} cimport *
 

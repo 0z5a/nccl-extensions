@@ -6,18 +6,29 @@
 # See LICENSE.txt for more license information
 #
 
-"""
-Generate Cython bindings for the nccl-extensions libraries using cybind.
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "cybind==0.3.1.dev2125+gfd8ec2066",
+#   "packaging",
+#   "pyyaml",
+# ]
+#
+# [[tool.uv.index]]
+# name = "cybind"
+# url = "https://gitlab-master.nvidia.com/api/v4/projects/xiakunl%2Fcybind/packages/pypi/simple"
+# explicit = true
+# authenticate = "never"
+#
+# [tool.uv.sources]
+# cybind = { index = "cybind" }
+# ///
 
-Ported from nccl4py's ``build_assets/generate_cython.py``, trimmed to the
-generated targets this repo owns (``nccl_ep`` and ``nccl_m2n``). Output goes
-to ``python/nccl/_extensions/bindings/`` as flat sibling modules.
+"""Generate selected nccl-extensions Cython bindings using cybind.
 
-Unlike nccl4py, the bound headers are *not* checked in under
-``cybind/headers/<libname>/``: nccl_ep's public header lives in this repo, so
-it is staged straight from ``nccl_ep/include/`` and the version is read from
-its ``NCCL_EP_{MAJOR,MINOR,PATCH}`` macros. Only headers this repo does not
-own -- currently just ``nccl.h`` -- are pinned under ``cybind/headers/``.
+Targets are selected as ``<library>[@<version>]``. A version selects that
+target's conventional release tag; without a version, headers are read from
+the current checkout. Only explicitly selected targets are generated.
 """
 
 from __future__ import annotations
@@ -30,315 +41,346 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager, nullcontext
+from collections.abc import Generator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
+import cybind.__main__ as cybind_cli
+import yaml
 from packaging.version import Version
 
-
-# cybind repository configuration
-CYBIND_COMMIT = "cde8bae486ff7ff88accf3cfff4e62527fd06199"
-CYBIND_SSH_URL = "ssh://git@gitlab-master.nvidia.com:12051/xiakunl/cybind.git"
-
-# Script directory for resolving default paths
+# Repository layout configuration. These are the main values to adjust when
+# reusing this driver in another repository or Python package.
 SCRIPT_DIR = Path(__file__).resolve().parent
-PYTHON_DIR = SCRIPT_DIR.parent
-REPO_ROOT = PYTHON_DIR.parent
+PYTHON_SOURCE_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = PYTHON_SOURCE_ROOT.parent
+CYBIND_ASSETS_DIR = SCRIPT_DIR / "cybind"
+NCCL_SOURCE_RELPATH = Path("third_party/nccl")
+NCCL_HEADER_RELPATH = Path("build/include/nccl.h")
 
-# Shared paths: one cybind/ assets dir feeds every target; cybind emits into
-# one bindings package (flat sibling layout).
-ASSETS_DIR = SCRIPT_DIR / "cybind"
-BINDINGS_DIR = PYTHON_DIR / "nccl" / "_extensions" / "bindings"
-
-# Pinned copies of headers owned by other repos, laid out the way cybind's own
-# assets/headers/ does: <libname>/<version>/. Bumping NCCL_PIN means dropping
-# the matching nccl.h here and regenerating.
-HEADERS_DIR = ASSETS_DIR / "headers"
-NCCL_PIN = Version("2.30.4")
-
-# Static files in templates/ that cybind doesn't process -- copied verbatim
-# into BINDINGS_DIR after cybind finishes.
-STATIC_FILES = (
-    "__init__.py",
-    "_internal/__init__.py",
-    "_internal/utils.pxd",
-    "_internal/utils.pyx",
+# Headers shared by all targets but owned outside their source directories.
+SHARED_EXTERNAL_HEADERS = (
+    (
+        "nccl.h",
+        str(NCCL_SOURCE_RELPATH / NCCL_HEADER_RELPATH),
+    ),
 )
 
-# Every target emits into ``nccl._extensions.bindings.*``, so cybind looks up
-# their templates under one shared subtree.
-_TEMPLATES_RELPATH = Path("nccl", "_extensions", "bindings")
+# Shared files relative to each target's generated bindings package. Cybind does
+# not emit them, so they are installed whenever that package is generated.
+STATIC_TEMPLATE_FILES = (
+    Path("__init__.py"),
+    Path("_internal/__init__.py"),
+    Path("_internal/utils.pxd"),
+    Path("_internal/utils.pyx"),
+)
 
-# Global logger - will be configured in main()
 logger = logging.getLogger(__name__)
+_CONFIG_VERSION_RE = re.compile(r"(versions:\n\s*- - )\S+")
+_TARGET_VERSION_RE = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
+
+
+class ConfigError(RuntimeError):
+    """A cybind config has invalid syntax or an unsupported structure."""
 
 
 @dataclass(frozen=True)
+class TargetSpec:
+    """Hand-written recipe for one independently generated library."""
+
+    tag_format: str
+    version_header: str
+    version_prefix: str
+    # (path in cybind's per-target header asset, path in the source repo)
+    headers: tuple[tuple[str, str], ...]
+    # (path in the per-target asset, source owned outside this target)
+    external_headers: tuple[tuple[str, str], ...] = SHARED_EXTERNAL_HEADERS
+
+    def tag_for(self, version: Version) -> str:
+        return self.tag_format.format(version=version)
+
+
+# This is the only target registry to edit when adding another library.
+TARGETS: dict[str, TargetSpec] = {
+    "nccl_ep": TargetSpec(
+        tag_format="nccl-ep-v{version}",
+        version_header="nccl_ep/include/nccl_ep.h",
+        version_prefix="NCCL_EP",
+        headers=(
+            ("nccl_ep.h", "nccl_ep/include/nccl_ep.h"),
+            ("nccl_ep/ep_enums.h", "nccl_ep/include/ep_enums.h"),
+        ),
+    ),
+    "nccl_m2n": TargetSpec(
+        tag_format="nccl-m2n-v{version}",
+        version_header="nccl_m2n/src/nccl_m2n.h",
+        version_prefix="NCCL_M2N",
+        headers=(("nccl_m2n.h", "nccl_m2n/src/nccl_m2n.h"),),
+    ),
+}
+
+
 class Target:
-    """Per-binding-target configuration for cybind."""
+    """One selected target and its resolved generation state."""
 
-    name: str  # cybind library name (top-level key in YAML)
-    version: Version
-    # Headers staged into cybind's assets/headers/<name>/<version>/, as
-    # {path relative to that dir: source file}. Must cover the transitive
-    # includes of the config's ``data.headers`` entry, laid out the way
-    # those #include directives spell them.
-    headers: dict[str, Path]
+    name: str
+    spec: TargetSpec
+    requested_version: Version | None
+    staging_assets: Path
+    resolved_version: Version
+    bindings_relpath: Path
 
+    def __init__(self, selection: str, staging_assets: Path) -> None:
+        """Create a target from a validated ``LIB[@VERSION]`` selector."""
+        name, separator, version_text = selection.partition("@")
+        self.name = name
+        self.spec = TARGETS[name]
+        self.requested_version = Version(version_text) if separator else None
+        self.staging_assets = staging_assets.resolve()
 
-def _read_version(header: Path, prefix: str) -> Version:
-    """Read ``<prefix>_{MAJOR,MINOR,PATCH}`` #defines out of a C header."""
-    text = header.read_text()
-    parts = []
-    for component in ("MAJOR", "MINOR", "PATCH"):
-        match = re.search(rf"^#define\s+{prefix}_{component}\s+(\d+)", text, re.MULTILINE)
-        if match is None:
-            raise RuntimeError(f"No {prefix}_{component} #define found in {header}")
-        parts.append(match.group(1))
-    return Version(".".join(parts))
+        try:
+            config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as e:
+            raise ConfigError(f"Invalid YAML in {self.config_path}: {e}") from e
+        if not isinstance(config, dict):
+            raise ConfigError(f"Expected a mapping in {self.config_path}")
+        self._resolve_config(config)
 
-
-def _nccl_ep_target() -> Target:
-    """Bind nccl_ep against this repo's own headers.
-
-    The staged layout mirrors what ``nccl_ep/CMakeLists.txt`` installs (public
-    header at the root, everything else under ``nccl_ep/``), which is how
-    ``nccl_ep.h``'s own #include directives spell them.
-    """
-    include_dir = REPO_ROOT / "nccl_ep" / "include"
-    public_header = include_dir / "nccl_ep.h"
-    if not public_header.is_file():
-        raise RuntimeError(f"nccl_ep public header not found: {public_header}")
-    return Target(
-        name="nccl_ep",
-        version=_read_version(public_header, "NCCL_EP"),
-        headers={
-            "nccl_ep.h": public_header,
-            "nccl_ep/ep_enums.h": include_dir / "ep_enums.h",
-            "nccl.h": HEADERS_DIR / "nccl" / str(NCCL_PIN) / "nccl.h",
-        },
-    )
-
-
-def _nccl_m2n_target() -> Target:
-    """Bind nccl_m2n against its public header.
-
-    The generated declarations encode the public ABI, so downstream wheel
-    builds do not need a separate M2N header installation.  ``nccl.h`` stays
-    pinned with the other third-party headers because M2N imports its NCCL
-    result and datatype definitions.
-    """
-    public_header = REPO_ROOT / "nccl_m2n" / "src" / "nccl_m2n.h"
-    if not public_header.is_file():
-        raise RuntimeError(f"nccl_m2n public header not found: {public_header}")
-    return Target(
-        name="nccl_m2n",
-        version=_read_version(public_header, "NCCL_M2N"),
-        headers={
-            "nccl_m2n.h": public_header,
-            "nccl.h": HEADERS_DIR / "nccl" / str(NCCL_PIN) / "nccl.h",
-        },
-    )
-
-
-def _stamp_asset_yaml(yaml_path: Path, version: Version) -> None:
-    """Stamp ``data.versions: - - X.Y.Z`` in the asset YAML in place.
-
-    Text-level edits (vs. parse -> mutate -> dump) preserve the file's
-    comments, ordering, and formatting that ``yaml.safe_dump`` would strip.
-    The substitution is idempotent: the regex matches any prior value, so
-    reruns at the same version are no-ops.
-    """
-    text = yaml_path.read_text()
-    text, n_versions = re.subn(r"(versions:\n\s*- - )\S+", rf"\g<1>{version}", text)
-    if n_versions != 1:
-        raise RuntimeError(
-            f"Expected exactly one `versions:` block in {yaml_path}, found {n_versions}"
+    def resolve_version(self, root: Path) -> None:
+        """Resolve and validate this target's version from its source header."""
+        header = root / self.spec.version_header
+        text = header.read_text(encoding="utf-8")
+        version_parts = []
+        for part in ("MAJOR", "MINOR", "PATCH"):
+            macro = f"{self.spec.version_prefix}_{part}"
+            match = re.search(
+                rf"^\s*#define\s+{re.escape(macro)}\s+(\d+)(?:\s|$)",
+                text,
+                re.MULTILINE,
+            )
+            if match is None:
+                raise RuntimeError(f"No {macro} #define found in {header}")
+            version_parts.append(match.group(1))
+        header_version = Version(".".join(version_parts))
+        if (
+            self.requested_version is not None
+            and header_version != self.requested_version
+        ):
+            raise RuntimeError(
+                f"{self.tag} contains {self.name} version {header_version}, "
+                f"expected {self.requested_version}"
+            )
+        self.resolved_version = (
+            self.requested_version
+            if self.requested_version is not None
+            else header_version
         )
-    yaml_path.write_text(text)
+
+    def _resolve_config(self, config: dict[str, Any]) -> None:
+        """Resolve generated module paths from this target's cybind config."""
+        try:
+            module = config[self.name]["module"]
+        except (KeyError, TypeError) as e:
+            raise ConfigError(f"No module configured for {self.name!r}") from e
+        if not isinstance(module, str):
+            raise ConfigError(f"Module for {self.name!r} must be a dotted string")
+        module_parts = module.split(".")
+        if len(module_parts) < 2 or any(not part for part in module_parts):
+            raise ConfigError(f"Invalid module for {self.name!r}: {module!r}")
+        self.bindings_relpath = Path(*module_parts[:-1])
+
+    def update_config(self) -> None:
+        """Update this target's staged config version."""
+        text = self.config_path.read_text(encoding="utf-8")
+        updated, count = _CONFIG_VERSION_RE.subn(rf"\g<1>{self.resolved_version}", text)
+        if count != 1:
+            raise ConfigError(
+                f"Expected exactly one `versions:` block in {self.config_path}, "
+                f"found {count}"
+            )
+        self.config_path.write_text(updated, encoding="utf-8")
+
+    def copy_headers(self, root: Path) -> None:
+        """Copy this target's complete header tree into staged assets."""
+        if self.headers_dir.exists():
+            shutil.rmtree(self.headers_dir)
+        headers = (*self.spec.headers, *self.spec.external_headers)
+        for relpath, source_relpath in headers:
+            source = root / source_relpath
+            destination = self.headers_dir / relpath
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+    @property
+    def config_path(self) -> Path:
+        return self.staging_assets / "configs" / f"{self.name}.cybind.yaml"
+
+    @property
+    def headers_dir(self) -> Path:
+        return self.staging_assets / "headers" / self.name / str(self.resolved_version)
+
+    @property
+    def templates_dir(self) -> Path:
+        return self.staging_assets / "templates"
+
+    @property
+    def tag(self) -> str:
+        if self.requested_version is None:
+            raise RuntimeError(f"No version tag requested for {self.name}")
+        return self.spec.tag_for(self.requested_version)
 
 
-def clone_cybind(cybind_dir: Path) -> None:
-    try:
-        subprocess.run(
-            ["git", "clone", CYBIND_SSH_URL, str(cybind_dir)],
-            check=True,
+def _validate_selections(
+    items: list[str],
+) -> None:
+    """Validate all ``LIB[@VERSION]`` target selectors."""
+    seen = set()
+    for item in items:
+        name, separator, version_text = item.partition("@")
+        if name not in TARGETS:
+            raise RuntimeError(f"Unknown library {name!r}; known: {', '.join(TARGETS)}")
+        if name in seen:
+            raise RuntimeError(f"Library specified more than once: {name}")
+        seen.add(name)
+        if not separator:
+            continue
+        if not version_text:
+            raise RuntimeError(f"Missing version after '@' in {item!r}")
+        if _TARGET_VERSION_RE.fullmatch(version_text) is None:
+            raise RuntimeError(
+                f"Invalid version in {item!r}: expected MAJOR.MINOR.PATCH "
+                "without leading zeros"
+            )
+        tag = TARGETS[name].tag_for(Version(version_text))
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+            cwd=REPO_ROOT,
+            check=False,
             capture_output=True,
             text=True,
         )
-        subprocess.run(
-            ["git", "switch", "--detach", CYBIND_COMMIT],
-            cwd=cybind_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        logger.debug(f"Cloned -> {cybind_dir}")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to clone cybind: {e.stderr}") from e
-
-
-def prepare_assets(cybind_dir: Path, targets: list[Target]) -> None:
-    """Stage our targets' configs, headers, and templates into cybind's
-    shared ``assets/`` -- only the slots we own (one ``configs/*.cybind.yaml``
-    per target, per-target ``headers/<name>/<version>/``, and the shared
-    ``templates/nccl/_extensions/bindings/`` subtree). Sibling files for
-    other libs are left untouched."""
-    cybind_assets = cybind_dir / "cybind" / "assets"
-
-    for target in targets:
-        config_filename = f"{target.name}.cybind.yaml"
-        config_src = ASSETS_DIR / "configs" / config_filename
-        if not config_src.exists():
-            raise FileNotFoundError(f"Config file not found: {config_src}")
-        _stamp_asset_yaml(config_src, target.version)
-        config_dst = cybind_assets / "configs" / config_filename
-        config_dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(config_src, config_dst)
-        logger.debug(f"Staged {config_filename} (version={target.version})")
-
-        headers_dst = cybind_assets / "headers" / target.name / str(target.version)
-        if headers_dst.exists():
-            shutil.rmtree(headers_dst)
-        for relpath, src in target.headers.items():
-            if not src.is_file():
-                raise FileNotFoundError(f"Header not found: {src}")
-            dst = headers_dst / relpath
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            logger.debug(f"Staged headers/{target.name}/{target.version}/{relpath} <- {src}")
-
-    templates_src = ASSETS_DIR / "templates" / _TEMPLATES_RELPATH
-    if not templates_src.is_dir():
-        raise FileNotFoundError(f"Templates dir not found: {templates_src}")
-    templates_dst = cybind_assets / "templates" / _TEMPLATES_RELPATH
-    if templates_dst.exists():
-        shutil.rmtree(templates_dst)
-    templates_dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(templates_src, templates_dst)
-    logger.debug(f"Staged templates/{_TEMPLATES_RELPATH}/")
-
-def run_cybind(cybind_dir: Path, libnames: list[str], output_dir: Path) -> None:
-    """Run cybind once for all libraries in libnames.
-
-    Cybind's ``--generate`` is multi-valued; passing all libnames in one
-    invocation amortizes the venv setup. Each library's headers must live at
-    ``cybind/assets/headers/<libname>/<version>/`` (cybind's default lookup
-    when no ``--input-dir`` is passed); ``prepare_assets`` handles that.
-
-    Args:
-        - cybind_dir: Path to cybind repository.
-        - libnames: Library keys to generate (top-level YAML keys).
-        - output_dir: Cybind's ``--output`` value. Cybind emits each library
-          into ``output_dir/<YAML module path with leaf stripped>/``.
-
-    Note:
-        - Requires CUDA_PATH for CUDA header resolution.
-        - Uses uv to create an isolated venv and install cybind.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "uv",
-        "run",
-        "--isolated",
-        "--with",
-        str(cybind_dir),
-        "-m",
-        "cybind",
-        "--generate",
-        *libnames,
-        "--output",
-        str(output_dir),
-    ]
-
-    logger.debug(f"Command: {' '.join(cmd)}")
-    logger.debug(f"Working directory: {cybind_dir}")
-    logger.debug(f"CUDA_PATH: {os.environ.get('CUDA_PATH', 'not set')}")
-
-    try:
-        result = subprocess.run(cmd, cwd=cybind_dir, check=True, capture_output=True, text=True)
-        if result.stdout:
-            logger.debug("cybind execution stdout:")
-            for line in result.stdout.splitlines():
-                logger.debug(f"  {line}")
-        if result.stderr:
-            logger.debug("cybind execution stderr:")
-            for line in result.stderr.splitlines():
-                logger.debug(f"  {line}")
-        logger.debug("Successfully generated bindings")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"cybind failed with exit code {e.returncode}")
-        if e.stdout:
-            logger.error("=== stdout ===")
-            for line in e.stdout.splitlines():
-                logger.error(line)
-        if e.stderr:
-            logger.error("=== stderr ===")
-            for line in e.stderr.splitlines():
-                logger.error(line)
-        raise RuntimeError("cybind execution failed") from e
+        if result.returncode != 0:
+            raise RuntimeError(f"Tag not found: {tag}")
 
 
 @contextmanager
-def backup_and_restore_on_failure(path: Path):
-    """Restore the prior binding package if generation does not complete."""
-    backup = path.with_name(path.name + ".bak")
-    if backup.exists():
-        shutil.rmtree(backup)
-    if path.exists():
-        logger.info(f">>> Backing up {path} -> {backup}")
-        path.rename(backup)
+def git_worktree(tag: str, path: Path) -> Generator[Path, None, None]:
+    """Check ``tag`` out into a detached worktree at ``path``."""
+    logger.info(f">>> Creating worktree for {tag} at {path}")
     try:
-        yield
-    except BaseException:
-        if path.exists():
-            shutil.rmtree(path)
-        if backup.exists():
-            logger.error(f"Bindings generation failed; restoring {path}")
-            backup.rename(path)
-        raise
-    else:
-        if backup.exists():
-            logger.info(f">>> Removing backup {backup}")
-            shutil.rmtree(backup)
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(path), tag],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Failed to create worktree for {tag}: {e.stderr}") from e
+    try:
+        yield path
+    finally:
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(path)],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Failed to remove temporary worktree {path}: {result.stderr}"
+            )
 
 
-def verify_generated_m2n_loader_contract() -> None:
-    """Check the generated M2N loader's atomic loading diagnostics contract."""
-    loader = BINDINGS_DIR / "_internal" / "nccl_m2n_linux.pyx"
-    text = loader.read_text()
-    required = (
-        'errors.append(f"{path}: not found")',
-        'missing.append("ncclM2nGetLastError")',
+def prepare_nccl_headers(root: Path) -> None:
+    """Initialize NCCL when needed and generate its public headers."""
+    nccl_root = root / NCCL_SOURCE_RELPATH
+    if not (nccl_root / "Makefile").is_file():
+        subprocess.run(
+            ["git", "submodule", "update", "--init", str(NCCL_SOURCE_RELPATH)],
+            cwd=root,
+            check=True,
+        )
+    build_dir = nccl_root / "build"
+    subprocess.run(
+        [
+            "make",
+            "-C",
+            "src",
+            str(nccl_root / NCCL_HEADER_RELPATH),
+            f"BUILDDIR={build_dir}",
+        ],
+        cwd=nccl_root,
+        check=True,
     )
-    missing = [snippet for snippet in required if snippet not in text]
-    if missing:
-        raise RuntimeError(
-            f"Generated {loader} does not preserve the M2N loader contract: {missing}"
+
+
+def run_cybind(targets: list[Target], output_dir: Path) -> None:
+    """Run cybind's Python entry point once for all selected libraries."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    args = [
+        "--generate",
+        *(target.name for target in targets),
+        "--output-dir",
+        str(output_dir),
+    ]
+    logger.debug(f"cybind arguments: {' '.join(args)}")
+    with patch.object(
+        cybind_cli,
+        "_get_assets_dir",
+        return_value=str(targets[0].staging_assets),
+    ):
+        result = cybind_cli.main(args)
+    if result != 0:
+        raise RuntimeError(f"cybind exited with status {result}")
+
+
+def generate_bindings(
+    targets: list[Target],
+    staging_dir: Path,
+) -> None:
+    """Generate and install the resolved targets."""
+    for target in targets:
+        target.update_config()
+
+    output_dir = staging_dir / "generated"
+    run_cybind(targets, output_dir)
+    static_templates = {
+        target.bindings_relpath / filename: (
+            target.templates_dir / target.bindings_relpath / filename
         )
+        for target in targets
+        for filename in STATIC_TEMPLATE_FILES
+    }
+    for relpath, source in static_templates.items():
+        destination = output_dir / relpath
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
 
-
-def verify_generated_m2n_import_layering() -> None:
-    """Keep low-level bindings independent from the public M2N facade."""
-    binding = BINDINGS_DIR / "nccl_m2n.pyx"
-    text = binding.read_text()
-    required = "from nccl._extensions._runtime import NATIVE_CALL_LOCK as _NATIVE_CALL_LOCK"
-    if required not in text or "nccl.m2n" in text:
-        raise RuntimeError(
-            f"Generated {binding} imports public nccl.m2n state and can create an import cycle"
-        )
-
-
-# One entry per bound library. Each is a zero-arg factory so a missing header
-# for one target raises with that target's own error message.
-TARGETS = (_nccl_ep_target, _nccl_m2n_target)
+    shutil.copytree(output_dir, PYTHON_SOURCE_ROOT, dirs_exist_ok=True)
+    for target in targets:
+        destination = CYBIND_ASSETS_DIR / "configs" / target.config_path.name
+        shutil.copy2(target.config_path, destination)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate Cython bindings for nccl-extensions using cybind"
+        description="Generate selected nccl-extensions Cython bindings using cybind"
+    )
+    parser.add_argument(
+        "targets",
+        nargs="+",
+        metavar="LIB[@VERSION]",
+        help=(
+            "Libraries to generate, optionally from a release version, e.g. "
+            "'nccl_ep@0.2.0 nccl_m2n@0.1.0'. A version selects the library's "
+            "release tag; without one, use the current checkout. "
+            f"Known libraries: {', '.join(TARGETS)}."
+        ),
     )
     parser.add_argument(
         "--cuda-home",
@@ -346,105 +388,69 @@ def main() -> int:
         default=None,
         help="Path to CUDA installation (default: $CUDA_PATH or $CUDA_HOME)",
     )
-    parser.add_argument(
-        "--cybind-path",
-        type=Path,
-        default=None,
-        help=(
-            "Use a local cybind checkout at this path instead of cloning. "
-            "Note: our targets' slots under the checkout's assets/ "
-            "(configs/<name>.cybind.yaml, headers/<name>/<version>/, "
-            "templates/nccl/_extensions/bindings/) are overwritten; sibling "
-            "files for other libs are left alone. Default: clone "
-            "CYBIND_SSH_URL at the pinned CYBIND_COMMIT into a temp dir."
-        ),
-    )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose (debug) output")
+    parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level, format="%(message)s")
-
-    # Fail fast on missing tools rather than after the cybind clone.
-    required_tools = ["uv"]
-    if args.cybind_path is None:
-        required_tools.append("git")
-    for tool in required_tools:
-        if shutil.which(tool) is None:
-            logger.error(f"{tool} not found on PATH")
-            return 1
-
-    if args.cybind_path is not None and not args.cybind_path.is_dir():
-        logger.error(f"--cybind-path is not a directory: {args.cybind_path}")
-        return 1
-
-    # CUDA_PATH (cybind uses it to find cuda.h)
-    if args.cuda_home:
-        if not args.cuda_home.exists():
-            logger.error(f"CUDA home not found at {args.cuda_home}")
-            return 1
-        cuda_path = str(args.cuda_home)
-    else:
-        cuda_path = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
-        if not cuda_path:
-            logger.error("Provide --cuda-home or set CUDA_PATH or CUDA_HOME")
-            return 1
-        if not Path(cuda_path).is_dir():
-            logger.error(f"CUDA path is not a directory: {cuda_path}")
-            return 1
-
-    os.environ["CUDA_PATH"] = cuda_path
-    logger.debug(f"CUDA: {cuda_path}")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s"
+    )
 
     try:
-        targets = [make_target() for make_target in TARGETS]
-    except (RuntimeError, FileNotFoundError) as e:
-        logger.error(str(e))
-        return 1
+        _validate_selections(args.targets)
+    except RuntimeError as e:
+        parser.error(str(e))
 
-    # cybind tree: use --cybind-path in place, or clone into a temp dir.
-    if args.cybind_path is not None:
-        logger.info(f">>> Using local cybind from {args.cybind_path} (in place)")
-        cybind_ctx = nullcontext(args.cybind_path)
-    else:
-        cybind_ctx = tempfile.TemporaryDirectory(prefix="nccl_extensions_cybind_")
+    cuda_home_value = (
+        args.cuda_home or os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
+    )
+    if cuda_home_value is None:
+        raise RuntimeError(
+            "Provide --cuda-home or set CUDA_PATH or CUDA_HOME to a directory"
+        )
+    cuda_home = Path(cuda_home_value).expanduser().resolve()
+    if not cuda_home.is_dir():
+        raise RuntimeError(
+            "Provide --cuda-home or set CUDA_PATH or CUDA_HOME to a directory"
+        )
+    os.environ["CUDA_PATH"] = str(cuda_home)
+    os.environ["CUDA_HOME"] = str(cuda_home)
 
-    with cybind_ctx as cybind_dir_:
-        cybind_dir = Path(cybind_dir_)
-        if args.cybind_path is None:
-            logger.info(">>> Cloning cybind...")
-            clone_cybind(cybind_dir)
+    targets: list[Target] = []
+    prepared_source_roots: set[Path] = set()
+    with tempfile.TemporaryDirectory(prefix="nccl_extensions_generate_") as tmp:
+        staging_dir = Path(tmp)
+        staging_assets = staging_dir / "assets"
+        shutil.copytree(CYBIND_ASSETS_DIR, staging_assets)
 
-        logger.info(">>> Preparing cybind assets")
-        prepare_assets(cybind_dir, targets)
+        for selection in args.targets:
+            target = Target(selection, staging_assets)
+            if target.requested_version is None:
+                logger.info(f">>> [{target.name}] using current checkout")
+                source: AbstractContextManager[Path] = nullcontext(REPO_ROOT)
+            else:
+                logger.info(
+                    f">>> [{target.name}] version "
+                    f"{target.requested_version} -> {target.tag}"
+                )
+                source = git_worktree(target.tag, staging_dir / f"{target.name}_source")
 
-        # Back up the real bindings dir, then run cybind with --output pointing
-        # at PYTHON_DIR so the emitted <output>/<YAML module path with leaf
-        # stripped>/ path lands directly on BINDINGS_DIR. The context manager
-        # removes the backup on success and restores it on failure.
-        with backup_and_restore_on_failure(BINDINGS_DIR):
-            logger.info(">>> Running cybind for all targets")
-            run_cybind(cybind_dir, [t.name for t in targets], PYTHON_DIR)
+            with source as source_root:
+                source_root = source_root.resolve()
+                if source_root not in prepared_source_roots:
+                    prepare_nccl_headers(source_root)
+                    prepared_source_roots.add(source_root)
+                target.resolve_version(source_root)
+                target.copy_headers(source_root)
+            targets.append(target)
 
-            # Copy shared static template files cybind doesn't process.
-            logger.debug("Copying static files from templates...")
-            templates_root = ASSETS_DIR / "templates" / _TEMPLATES_RELPATH
-            for rel in STATIC_FILES:
-                src = templates_root / rel
-                if not src.exists():
-                    continue
-                dst = BINDINGS_DIR / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"  {rel}")
-                shutil.copy2(src, dst)
+        generate_bindings(targets, staging_dir)
 
-            verify_generated_m2n_loader_contract()
-            verify_generated_m2n_import_layering()
+    logger.info(f"Bindings location: {PYTHON_SOURCE_ROOT}")
+    logger.info(
+        "Generated: "
+        + ", ".join(f"{target.name}@{target.resolved_version}" for target in targets)
+    )
 
-    logger.info("=" * 60)
-    logger.info(f"Bindings location: {BINDINGS_DIR}")
-    logger.info(f"Generated: {', '.join(f'{t.name} {t.version}' for t in targets)}")
-    logger.info("=" * 60)
     return 0
 
 

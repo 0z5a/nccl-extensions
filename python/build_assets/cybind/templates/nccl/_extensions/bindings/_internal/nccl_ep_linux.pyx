@@ -4,18 +4,19 @@
 #
 # This code was automatically generated $version_span. Do not modify it directly.
 
-from libc.stdint cimport intptr_t, uint64_t, uintptr_t
-
-import os
-import threading
-
 from .utils import FunctionNotFoundError, NotSupportedError
 
-from cuda.pathfinder import load_nvidia_dynamic_lib
+import os
 
-${snippet_linux_externs_pxd}
 
 cdef extern from "<dlfcn.h>" nogil:
+    void* dlopen(const char*, int)
+    char* dlerror()
+
+    enum:
+        RTLD_NOW
+        RTLD_GLOBAL
+
     ctypedef struct Dl_info:
         const char* dli_fname
         void* dli_fbase
@@ -25,24 +26,22 @@ cdef extern from "<dlfcn.h>" nogil:
 
 
 ###############################################################################
-# Library resolution (mirrors cuda.pathfinder.load_nvidia_dynamic_lib precedence,
-# adapted for libnccl_ep.so which is not registered as an NVIDIA pip wheel.)
+# Library resolution. libnccl_ep.so is not an NVIDIA wheel library, so it is
+# located here instead of through cuda.pathfinder.
 ###############################################################################
 
-# Resolved at first import via _resolve_library_path() below. Path lookup runs
-# once, then dlopen handle is cached in the lowpp ${libname} init guard.
-#
-# Each library's .so ships under its own facade package -- nccl_ep -> nccl/ep/,
-# nccl_m2n -> nccl/m2n/ -- so derive that directory from the library name rather
-# than hardcoding one library's.
+# The .so ships under this library's facade package (nccl_ep -> nccl/ep/lib),
+# so derive that directory from ${libname} rather than hardcoding it.
+# _resolve_library_path() runs on the first call that needs a symbol, not at
+# import; after that the generated init guard holds the resolved pointers.
 _PACKAGE_LIB_RELPATH = os.path.join(
     "${libname}".removeprefix("nccl_"), "lib", "lib${libname}.so"
 )
 
 
 def _resolve_library_path() -> str:
-    # 1. nccl-extensions package path (replaces cuda.pathfinder's NVIDIA-pip-wheel
-    #    step). lib${libname}.so is at nccl/<lib>/lib/; this file lives in
+    # 1. nccl-extensions package path. lib${libname}.so is at nccl/<lib>/lib/;
+    #    this file lives in
     #    nccl/_extensions/bindings/_internal/, so go up three dirs to reach nccl/.
     pkg_lib = os.path.normpath(os.path.join(
         os.path.dirname(__file__), "..", "..", "..", _PACKAGE_LIB_RELPATH
@@ -77,17 +76,15 @@ def _resolve_library_path() -> str:
 # Wrapper init
 ###############################################################################
 
-cdef object __symbol_lock = threading.Lock()
-cdef bint __py_${libname}_init = False
-
 $wrapper_init
 
 
 cdef void* load_library() except* with gil:
-    # libnccl_ep.so has NEEDED libnccl.so.2. Pre-load it with RTLD_GLOBAL so the
-    # SONAME is already mapped when libnccl_ep.so's NEEDED is resolved,
-    # without depending on filesystem search.
-    load_nvidia_dynamic_lib("nccl")
+    # libnccl_ep.so has NEEDED libnccl.so.2. Forcing nccl4py's loader to run
+    # maps that SONAME RTLD_GLOBAL first, so the NEEDED resolves without a
+    # filesystem search and nccl4py stays the one place that locates libnccl.
+    from nccl.bindings._internal import nccl as _nccl_loader
+    _nccl_loader._inspect_function_pointers()
 
     cdef bytes path_bytes = _resolve_library_path().encode()
     cdef void* handle = dlopen(path_bytes, RTLD_NOW | RTLD_GLOBAL)
@@ -100,52 +97,11 @@ cdef void* load_library() except* with gil:
     return handle
 
 
-cdef int _check_or_init_${libname}() except -1 nogil:
-    global __py_${libname}_init
-    if __py_${libname}_init:
-        return 0
-
-    cdef void* handle = NULL
-
-    with gil, __symbol_lock:
-        # Recheck the flag after obtaining the locks
-        if __py_${libname}_init:
-            return 0
-
-        # Load function
-${set_wrapper}
-        __py_${libname}_init = True
-        return 0
-
-
-cdef dict func_ptrs = None
-
-
-cpdef dict _inspect_function_pointers():
-    global func_ptrs
-    if func_ptrs is not None:
-        return func_ptrs
-
-    _check_or_init_${libname}()
-    cdef dict data = {}
-
-${set_functor}
-
-    func_ptrs = data
-    return data
-
-
-cpdef _inspect_function_pointer(str name):
-    global func_ptrs
-    if func_ptrs is None:
-        func_ptrs = _inspect_function_pointers()
-    return func_ptrs[name]
-
-
 cdef object __${libname}_loaded_so_path = None
 
 
 cpdef object _inspect_loaded_library_path():
+    import os
     # Path of the .so backing the loaded symbols, via dladdr() on a
     # resolved entry point. None if it cannot be determined.
     global __${libname}_loaded_so_path

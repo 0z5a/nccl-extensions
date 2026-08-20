@@ -1,30 +1,29 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. ALL RIGHTS RESERVED.
+#
 # SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE.txt for more license information.
+# This code was automatically generated $version_span. Do not modify it directly.
 
-from libc.stdint cimport intptr_t
+from .utils import FunctionNotFoundError, NotSupportedError
 
 import os
-import threading
 
-from cuda.pathfinder import load_nvidia_dynamic_lib
-from .utils import FunctionNotFoundError
-
-
-###############################################################################
-# Extern
-###############################################################################
 
 cdef extern from "<dlfcn.h>" nogil:
     void* dlopen(const char*, int)
     char* dlerror()
-    void* dlsym(void*, const char*)
-    int dlclose(void*)
 
     enum:
         RTLD_NOW
         RTLD_GLOBAL
+
+    ctypedef struct Dl_info:
+        const char* dli_fname
+        void* dli_fbase
+        const char* dli_sname
+        void* dli_saddr
+    int dladdr(const void*, Dl_info*)
+
 
 ###############################################################################
 # Library resolution
@@ -60,8 +59,19 @@ def _candidate_library_paths() -> list[str]:
     return candidates
 
 
+###############################################################################
+# Wrapper init
+###############################################################################
+
+$wrapper_init
+
+
 cdef void* load_library() except* with gil:
-    load_nvidia_dynamic_lib("nccl")
+    # libnccl_m2n.so has NEEDED libnccl.so.2. Forcing nccl4py's loader to run
+    # maps that SONAME RTLD_GLOBAL first, so the NEEDED resolves without a
+    # filesystem search and nccl4py stays the one place that locates libnccl.
+    from nccl.bindings._internal import nccl as _nccl_loader
+    _nccl_loader._inspect_function_pointers()
 
     cdef void* handle = NULL
     cdef bytes path_bytes
@@ -89,219 +99,36 @@ cdef void* load_library() except* with gil:
     )
 
 
-###############################################################################
-# Wrapper init
-###############################################################################
-
-cdef object __symbol_lock = threading.Lock()
-cdef bint __py_nccl_m2n_init = False
-cdef void* __library_handle = NULL
-
-cdef void* __ncclM2nInit = NULL
-cdef void* __ncclM2nFinalize = NULL
-cdef void* __ncclM2nGroupStart = NULL
-cdef void* __ncclM2nGroupEnd = NULL
-cdef void* __ncclM2nGroupAbort = NULL
-cdef void* __ncclM2nGetLastError = NULL
-cdef void* __ncclReshardWithWindow = NULL
-cdef void* __ncclReshard = NULL
+cdef object __${libname}_loaded_so_path = None
 
 
-cdef int _check_or_init_nccl_m2n() except -1 nogil:
-    global __py_nccl_m2n_init
-    if __py_nccl_m2n_init:
-        return 0
+cpdef object _inspect_loaded_library_path():
+    import os
+    # Path of the .so backing the loaded symbols, via dladdr() on a
+    # resolved entry point. None if it cannot be determined.
+    global __${libname}_loaded_so_path
+    if __${libname}_loaded_so_path is not None:
+        return __${libname}_loaded_so_path
 
-    cdef void* handle = NULL
-    cdef void* init_fn = NULL
-    cdef void* finalize_fn = NULL
-    cdef void* group_start_fn = NULL
-    cdef void* group_end_fn = NULL
-    cdef void* group_abort_fn = NULL
-    cdef void* get_last_error_fn = NULL
-    cdef void* reshard_with_window_fn = NULL
-    cdef void* reshard_fn = NULL
+    cdef dict ptrs = _inspect_function_pointers()
+    # Any resolved symbol maps to the same .so.
+    cdef intptr_t addr = 0
+    for value in ptrs.values():
+        if value:
+            addr = value
+            break
 
-    with gil, __symbol_lock:
-        if __py_nccl_m2n_init:
-            return 0
-
-        global __ncclM2nInit
-        global __ncclM2nFinalize
-        global __ncclM2nGroupStart
-        global __ncclM2nGroupEnd
-        global __ncclM2nGroupAbort
-        global __ncclM2nGetLastError
-        global __ncclReshardWithWindow
-        global __ncclReshard
-
-        handle = load_library()
-        init_fn = dlsym(handle, 'ncclM2nInit')
-        finalize_fn = dlsym(handle, 'ncclM2nFinalize')
-        group_start_fn = dlsym(handle, 'ncclM2nGroupStart')
-        group_end_fn = dlsym(handle, 'ncclM2nGroupEnd')
-        group_abort_fn = dlsym(handle, 'ncclM2nGroupAbort')
-        get_last_error_fn = dlsym(handle, 'ncclM2nGetLastError')
-        reshard_with_window_fn = dlsym(handle, 'ncclReshardWithWindow')
-        reshard_fn = dlsym(handle, 'ncclReshard')
-
-        missing = []
-        if init_fn == NULL:
-            missing.append("ncclM2nInit")
-        if finalize_fn == NULL:
-            missing.append("ncclM2nFinalize")
-        if group_start_fn == NULL:
-            missing.append("ncclM2nGroupStart")
-        if group_end_fn == NULL:
-            missing.append("ncclM2nGroupEnd")
-        if group_abort_fn == NULL:
-            missing.append("ncclM2nGroupAbort")
-        if get_last_error_fn == NULL:
-            missing.append("ncclM2nGetLastError")
-        if reshard_with_window_fn == NULL:
-            missing.append("ncclReshardWithWindow")
-        if reshard_fn == NULL:
-            missing.append("ncclReshard")
-        if missing:
-            dlclose(handle)
-            raise FunctionNotFoundError(
-                "libnccl_m2n.so does not provide the complete M2N v2 API; "
-                "missing: " + ", ".join(missing)
-            )
-
-        global __library_handle
-        __library_handle = handle
-        __ncclM2nInit = init_fn
-        __ncclM2nFinalize = finalize_fn
-        __ncclM2nGroupStart = group_start_fn
-        __ncclM2nGroupEnd = group_end_fn
-        __ncclM2nGroupAbort = group_abort_fn
-        __ncclM2nGetLastError = get_last_error_fn
-        __ncclReshardWithWindow = reshard_with_window_fn
-        __ncclReshard = reshard_fn
-
-        __py_nccl_m2n_init = True
-        return 0
-
-
-cdef dict func_ptrs = None
-
-
-cpdef dict _inspect_function_pointers():
-    global func_ptrs
-    if func_ptrs is not None:
-        return func_ptrs
-
-    _check_or_init_nccl_m2n()
-    cdef dict data = {}
-
-    global __ncclM2nInit
-    data["__ncclM2nInit"] = <intptr_t>__ncclM2nInit
-
-    global __ncclM2nFinalize
-    data["__ncclM2nFinalize"] = <intptr_t>__ncclM2nFinalize
-
-    global __ncclM2nGroupStart
-    data["__ncclM2nGroupStart"] = <intptr_t>__ncclM2nGroupStart
-
-    global __ncclM2nGroupEnd
-    data["__ncclM2nGroupEnd"] = <intptr_t>__ncclM2nGroupEnd
-
-    global __ncclM2nGroupAbort
-    data["__ncclM2nGroupAbort"] = <intptr_t>__ncclM2nGroupAbort
-
-    global __ncclM2nGetLastError
-    data["__ncclM2nGetLastError"] = <intptr_t>__ncclM2nGetLastError
-
-    global __ncclReshardWithWindow
-    data["__ncclReshardWithWindow"] = <intptr_t>__ncclReshardWithWindow
-
-    global __ncclReshard
-    data["__ncclReshard"] = <intptr_t>__ncclReshard
-
-    func_ptrs = data
-    return data
-
-
-cpdef _inspect_function_pointer(str name):
-    global func_ptrs
-    if func_ptrs is None:
-        func_ptrs = _inspect_function_pointers()
-    return func_ptrs[name]
+    cdef Dl_info info
+    if addr == 0:
+        return None
+    if dladdr(<void*>addr, &info) == 0 or info.dli_fname == NULL:
+        return None
+    __${libname}_loaded_so_path = os.fsdecode(<bytes>info.dli_fname)
+    return __${libname}_loaded_so_path
 
 
 ###############################################################################
 # Wrapper functions
 ###############################################################################
 
-cdef ncclResult_t _ncclM2nInit(ncclM2nHandle_t* handle, const ncclM2nConfig_t* config) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclM2nInit
-    _check_or_init_nccl_m2n()
-    if __ncclM2nInit == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclM2nInit is not found")
-    return (<ncclResult_t (*)(ncclM2nHandle_t*, const ncclM2nConfig_t*) noexcept nogil>__ncclM2nInit)(handle, config)
-
-
-cdef ncclResult_t _ncclM2nFinalize(ncclM2nHandle_t handle) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclM2nFinalize
-    _check_or_init_nccl_m2n()
-    if __ncclM2nFinalize == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclM2nFinalize is not found")
-    return (<ncclResult_t (*)(ncclM2nHandle_t) noexcept nogil>__ncclM2nFinalize)(handle)
-
-
-cdef ncclResult_t _ncclM2nGroupStart() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclM2nGroupStart
-    _check_or_init_nccl_m2n()
-    if __ncclM2nGroupStart == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclM2nGroupStart is not found")
-    return (<ncclResult_t (*)() noexcept nogil>__ncclM2nGroupStart)()
-
-
-cdef ncclResult_t _ncclM2nGroupEnd() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclM2nGroupEnd
-    _check_or_init_nccl_m2n()
-    if __ncclM2nGroupEnd == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclM2nGroupEnd is not found")
-    return (<ncclResult_t (*)() noexcept nogil>__ncclM2nGroupEnd)()
-
-
-cdef ncclResult_t _ncclM2nGroupAbort() except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclM2nGroupAbort
-    _check_or_init_nccl_m2n()
-    if __ncclM2nGroupAbort == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclM2nGroupAbort is not found")
-    return (<ncclResult_t (*)() noexcept nogil>__ncclM2nGroupAbort)()
-
-
-cdef const char* _ncclM2nGetLastError() noexcept nogil:
-    global __ncclM2nGetLastError
-    _check_or_init_nccl_m2n()
-    if __ncclM2nGetLastError == NULL:
-        return NULL
-    return (<const char* (*)() noexcept nogil>__ncclM2nGetLastError)()
-
-
-cdef ncclResult_t _ncclReshardWithWindow(ncclM2nHandle_t handle, ncclComm_t comm, ncclWindow_t window, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclReshardWithWindow
-    _check_or_init_nccl_m2n()
-    if __ncclReshardWithWindow == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclReshardWithWindow is not found")
-    return (<ncclResult_t (*)(ncclM2nHandle_t, ncclComm_t, ncclWindow_t, const ncclDistTensor_t*, const ncclDistTensor_t*, cudaStream_t) noexcept nogil>__ncclReshardWithWindow)(
-        handle, comm, window, src, dst, stream)
-
-
-cdef ncclResult_t _ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, const ncclDistTensor_t* src, const ncclDistTensor_t* dst, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-    global __ncclReshard
-    _check_or_init_nccl_m2n()
-    if __ncclReshard == NULL:
-        with gil:
-            raise FunctionNotFoundError("function ncclReshard is not found")
-    return (<ncclResult_t (*)(ncclM2nHandle_t, ncclComm_t, const ncclDistTensor_t*, const ncclDistTensor_t*, cudaStream_t) noexcept nogil>__ncclReshard)(
-        handle, comm, src, dst, stream)
+$wrapper_defs

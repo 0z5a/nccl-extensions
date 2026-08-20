@@ -45,7 +45,7 @@ nccl_ep:
     # Named-struct ABI: ncclEp*Config_t / ncclEpLayoutInfo_t are declared
     # below as AUTO_LOWPP_CLASS so cybind exposes them as Python classes;
     # the Pythonic facade in nccl/ep/handle.py constructs them and forwards
-    # the underlying struct pointer via .ptr.
+    # the underlying struct pointer via ._lowpp.ptr.
     ncclEpCreateHandle:
       return: handle
       except?: 0
@@ -62,6 +62,17 @@ nccl_ep:
     ncclEpDispatch: {}
     ncclEpCombine: {}
     ncclEpComplete: {}
+
+    # Rank masking / fault handling (requires enable_mask in the group config).
+    # The int[nRanks] mask buffers are caller-owned, so they stay plain
+    # pointers instead of becoming a Python return value.
+    ncclEpMaskQuery: {}
+    ncclEpMaskUpdate: {}
+    ncclEpMaskClean: {}
+    ncclEpGetAsyncError:
+      return: error_out
+      except?: -1
+    ncclEpErrorClear: {}
 
   types:
     ncclEpTensor_t:
@@ -101,7 +112,8 @@ nccl_ep:
             post_alloc: |-
               self._ptr[0].size = sizeof(ncclEpGroupConfig_t)
               self._ptr[0].magic = 0xC00FFFEE
-              self._ptr[0].version = 1
+              # = NCCL_EP_API_VERSION; bump with the header.
+              self._ptr[0].version = 2
     ncclEpLayoutInfo_t:
       AUTO_LOWPP_CLASS:
         __config__:

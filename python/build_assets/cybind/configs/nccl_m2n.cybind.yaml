@@ -32,11 +32,16 @@ nccl_m2n:
       return: handle
       except?: 0
     ncclM2nFinalize: {}
+    ncclReshardWithWindow: {}
+    ncclReshard: {}
+    # Returns const char*, so cybind gives it an `except?NULL` contract while
+    # the internal thunk stays no-throw and reports NULL instead.
+    ncclM2nGetLastError: {}
+    # Group symbols are resolved at init but not required, so a library without
+    # them fails only when a group call is made.
     ncclM2nGroupStart: {}
     ncclM2nGroupEnd: {}
     ncclM2nGroupAbort: {}
-    ncclReshardWithWindow: {}
-    ncclReshard: {}
   types:
     ncclM2nConfig_t:
       AUTO_LOWPP_CLASS:
@@ -51,40 +56,46 @@ nccl_m2n:
         maxCta: maxCta
     ncclMesh_t:
       AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclMesh_t)
+              self._ptr[0].version = NCCL_M2N_API_VERSION
         dims:
-          getter: |-
-            return (self._ptr[0].dims[0], self._ptr[0].dims[1])
-          setter: |-
-            if len(val) != NCCL_RESHARD_MESH_NDIMS:
-              raise ValueError(f"dims must have length {NCCL_RESHARD_MESH_NDIMS}")
-            self._ptr[0].dims[0] = val[0]
-            self._ptr[0].dims[1] = val[1]
+          size: ndims
       member_aliases:
         startRank: startRank
     ncclDistTensor_t:
       AUTO_LOWPP_CLASS:
+        __config__:
+          __init__:
+            post_alloc: |-
+              self._ptr[0].size = sizeof(ncclDistTensor_t)
+              self._ptr[0].version = NCCL_M2N_API_VERSION
         localShape:
-          getter: |-
-            return (self._ptr[0].localShape[0], self._ptr[0].localShape[1], self._ptr[0].localShape[2])
-          setter: |-
-            if len(val) != NCCL_RESHARD_MAX_TENSOR_DIMS:
-              raise ValueError(f"localShape must have length {NCCL_RESHARD_MAX_TENSOR_DIMS}")
-            self._ptr[0].localShape[0] = val[0]
-            self._ptr[0].localShape[1] = val[1]
-            self._ptr[0].localShape[2] = val[2]
+          size: ndims
         mesh:
           getter: |-
             return <intptr_t>(self._ptr[0].mesh)
           setter: |-
-            self._ptr[0].mesh = <ncclMesh_t*><intptr_t>val
+            self._ptr[0].mesh = <const ncclMesh_t*><intptr_t>val
         placements:
           getter: |-
-            return (self._ptr[0].placements[0], self._ptr[0].placements[1])
+            cdef int mesh_ndims
+            if self._ptr[0].placements == NULL or self._ptr[0].mesh == NULL:
+              return ()
+            mesh_ndims = self._ptr[0].mesh.ndims
+            if mesh_ndims < 1 or mesh_ndims > NCCL_RESHARD_MAX_MESH_DIMS:
+              raise ValueError(
+                f"mesh.ndims must be in [1, {NCCL_RESHARD_MAX_MESH_DIMS}], got {mesh_ndims}"
+              )
+            return tuple(self._ptr[0].placements[d] for d in range(mesh_ndims))
           setter: |-
-            if len(val) != NCCL_RESHARD_MESH_NDIMS:
-              raise ValueError(f"placements must have length {NCCL_RESHARD_MESH_NDIMS}")
-            self._ptr[0].placements[0] = val[0]
-            self._ptr[0].placements[1] = val[1]
+            if len(val) < 1 or len(val) > NCCL_RESHARD_MAX_MESH_DIMS:
+              raise ValueError(f"placements must have length 1..{NCCL_RESHARD_MAX_MESH_DIMS}")
+            placements = _numpy.ascontiguousarray(val, dtype=_numpy.int32)
+            self._refs["placements"] = placements
+            self._ptr[0].placements = <int*><intptr_t>placements.ctypes.data
       member_aliases:
         dataPtr: dataPtr
         localShape: localShape

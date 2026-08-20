@@ -5,16 +5,19 @@
 # This code was automatically generated $version_span. Do not modify it directly.
 
 cimport cython  # NOQA
-from libc.stdint cimport uint64_t
 from libcpp.vector cimport vector
 
-from ._internal.utils cimport (nested_resource, nullable_unique_ptr, get_buffer_pointer,
+from ._internal.utils cimport (nested_resource, nullable_unique_ptr,
                               get_resource_ptr, get_nested_resource_ptr)
 
-from enum import IntEnum as _IntEnum
+_version_span = "$version_span"
+__version__ = _version_span.split()[-1]
 
-
-$snippet_auto_lowpp_imports_pyx
+# NCCL_VERSION(X,Y,Z) = X*10000 + Y*100 + Z (NCCL >= 2.9).
+_version_parts = __version__.split(".")
+__version_code__ = (
+    int(_version_parts[0]) * 10000 + int(_version_parts[1]) * 100 + int(_version_parts[2])
+)
 
 
 ###############################################################################
@@ -59,6 +62,7 @@ cpdef inline check_status(int status):
 $wrapper_defs
 
 
+# Hand-written: reports the .so the symbols resolved to; not a C entry point.
 cpdef object get_library_path():
     from ._internal.nccl_ep import _inspect_loaded_library_path
     return _inspect_loaded_library_path()
