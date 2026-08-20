@@ -79,8 +79,7 @@ inline combine_smem_config_t choose_combine_smem_config(
 //
 // The struct layouts must match what the kernel expects, so any field added
 // here must also be threaded through the matching kernel entry: the JIT sources
-// device/jit/ll_dispatch_jit.cuh / ll_combine_jit.cuh for dispatch and combine,
-// and the precompiled clean kernel in device/ll_ep_adapter.cu.
+// device/jit/ll_dispatch_jit.cuh, ll_combine_jit.cuh, and ll_clean_jit.cuh.
 // ============================================================================
 
 struct dispatch_kernel_args_t {
@@ -366,7 +365,7 @@ ncclResult_t call_dispatch(
 
 ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream = 0);
 
-void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
+ncclResult_t call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
 
 } // namespace ll
 } // namespace nccl_ep

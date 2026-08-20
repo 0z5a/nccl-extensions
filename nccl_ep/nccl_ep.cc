@@ -765,7 +765,7 @@ struct ncclEpGroup {
     struct {
         // Device communicator (single comm, multiple contexts)
         // HT cross-LSA-team comms use ncclTeamRail on the base communicator
-        ncclDevComm_t* dcomm = nullptr;        // Host device communicator
+        ncclDevComm_t* dcomm = nullptr;        // Host device communicator (runtime-sized)
         ncclDevComm_t* d_dcomm = nullptr;      // Device-resident copy of the device communicator
         int qps_per_rank = 0;                  // Total QPs (connections) per rank
         int num_ctx_per_comm = 0;              // Number of contexts per communicator
@@ -1591,6 +1591,66 @@ static constexpr int NCCL_EP_HT_GIN_MAX_CONTEXTS = 32;
 static constexpr int NCCL_EP_HT_GIN_CTXS_PER_COMM = 4;
 static constexpr int MAX_BARRIER_SESSIONS = 32;
 
+static ncclResult_t commAllocHost(ncclComm_t comm, ncclDevComm_t** outDevComm, size_t* outBytes) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
+    ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
+    NCCLCHECK(ncclCommQueryProperties(comm, &props));
+    *outBytes = props.devCommRuntimeVersionSize;
+#else
+    *outBytes = sizeof(ncclDevComm_t);
+#endif
+
+    *outDevComm = static_cast<ncclDevComm_t*>(calloc(1, *outBytes));
+    if (*outDevComm == nullptr) {
+        return ncclSystemError;
+    }
+    return ncclSuccess;
+}
+
+static ncclResult_t devCommCreate(ncclComm_t comm, ncclDevCommRequirements* reqs,
+                                  ncclDevComm_t** outDevComm, size_t* outBytes) {
+    NCCLCHECK(commAllocHost(comm, outDevComm, outBytes));
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
+    reqs->useRuntimeVersion = true;
+#endif
+
+    ncclResult_t result = ncclDevCommCreate(comm, reqs, *outDevComm);
+    if (result != ncclSuccess) {
+        free(*outDevComm);
+        *outDevComm = nullptr;
+        *outBytes = 0;
+        return result;
+    }
+    return ncclSuccess;
+}
+
+// Allocate and populate the device copy. On failure, destroy and free the host
+// DevComm, free any device allocation, and null both output pointers.
+static ncclResult_t devCommAllocAndCopyToDevice(ncclComm_t comm, ncclDevComm_t** hostDevComm,
+                                                size_t bytes, ncclDevComm_t** deviceDevComm) {
+    *deviceDevComm = nullptr;
+    cudaError_t error = cudaMalloc(reinterpret_cast<void**>(deviceDevComm), bytes);
+    if (error == cudaSuccess) {
+        error = cudaMemcpy(*deviceDevComm, *hostDevComm, bytes, cudaMemcpyHostToDevice);
+    }
+    if (error == cudaSuccess) return ncclSuccess;
+
+    fprintf(stderr, "CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(error));
+    if (*deviceDevComm != nullptr) {
+        cudaFree(*deviceDevComm);
+        *deviceDevComm = nullptr;
+    }
+    ncclResult_t destroy_result = ncclDevCommDestroy(comm, *hostDevComm);
+    if (destroy_result != ncclSuccess) {
+        fprintf(stderr, "Failed to destroy device comm after CUDA error: %s\n",
+                ncclGetErrorString(destroy_result));
+    }
+    free(*hostDevComm);
+    *hostDevComm = nullptr;
+    return ncclInternalError;
+}
+
 static ncclResult_t
 init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
     // Initialize using public NCCL APIs
@@ -1606,7 +1666,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     if (rdma_team_size <= 1) {
         // Single HT outer-domain LSA team — no cross-LSA-team RDMA, but the LSA guard needs a minimal devComm.
-        ep_group->gin_config.dcomm = new ncclDevComm_t{};
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         // Dispatch indexes one LSA barrier session per CTA with blockIdx.x.
         // Combine synchronizes through a single tail CTA at the next session,
@@ -1614,15 +1673,14 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // Keep the compile-time dispatch range available for specialized kernels.
         reqs.lsaBarrierCount =
             std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
-        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, ep_group->gin_config.dcomm));
-        CUDACHECK_RET(cudaMalloc(
-            reinterpret_cast<void**>(&ep_group->gin_config.d_dcomm),
-            sizeof(ncclDevComm_t)));
-        CUDACHECK_RET(cudaMemcpy(
-            ep_group->gin_config.d_dcomm,
-            ep_group->gin_config.dcomm,
-            sizeof(ncclDevComm_t),
-            cudaMemcpyHostToDevice));
+        size_t dcomm_bytes = 0;
+        NCCLCHECK(devCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomm, &dcomm_bytes));
+        NCCLCHECK(devCommAllocAndCopyToDevice(
+            ep_group->comm,
+            &ep_group->gin_config.dcomm,
+            dcomm_bytes,
+            &ep_group->gin_config.d_dcomm));
+        ep_group->ht_buffers.internode_initialized = true;
         return ncclSuccess;
     }
 
@@ -1798,8 +1856,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
     // =========================================================================
-    ep_group->gin_config.dcomm = new ncclDevComm_t{};
-
     {
         ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
         NCCL_CHECK_RESULT(ncclCommQueryProperties(ep_group->comm, &props));
@@ -1809,6 +1865,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         }
     }
 
+    size_t dcomm_bytes = 0;
     {
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         reqs.ginSignalCount = ep_group->gin_config.num_total_signals;
@@ -1820,17 +1877,14 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // combine_num_sms does not affect this resource count.
         reqs.lsaBarrierCount =
             std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
-        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, ep_group->gin_config.dcomm));
+        NCCLCHECK(devCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomm, &dcomm_bytes));
     }
 
-    CUDACHECK_RET(cudaMalloc(
-        reinterpret_cast<void**>(&ep_group->gin_config.d_dcomm),
-        sizeof(ncclDevComm_t)));
-    CUDACHECK_RET(cudaMemcpy(
-        ep_group->gin_config.d_dcomm,
-        ep_group->gin_config.dcomm,
-        sizeof(ncclDevComm_t),
-        cudaMemcpyHostToDevice));
+    NCCLCHECK(devCommAllocAndCopyToDevice(
+        ep_group->comm,
+        &ep_group->gin_config.dcomm,
+        dcomm_bytes,
+        &ep_group->gin_config.d_dcomm));
 
     // WindowRegister
     NCCLCHECK(ncclCommWindowRegister(
@@ -1857,7 +1911,7 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
         if (res != ncclSuccess) {
             fprintf(stderr, "[HT GIN] Warning: Failed to destroy device comm: %s\n", ncclGetErrorString(res));
         }
-        delete ep_group->gin_config.dcomm;
+        free(ep_group->gin_config.dcomm);
         ep_group->gin_config.dcomm = nullptr;
     }
     // Free device memory for dcomm
@@ -2395,7 +2449,6 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         // Create device communicator on ep_group->comm with all GIN contexts.
         // This depends only on group-level parameters (num_experts, nRanks),
         // not on the per-handle layout/num_topk, so it stays at group time.
-        ncclDevComm_t nccl_dev_comm_host{};
         ep_group->num_dispatch_signals = ep_group->num_local_experts * ep_group->nRanks;
         int num_total_signals = ep_group->num_dispatch_signals;
         ep_group->clean_barrier_signal_base = 2 * num_total_signals;
@@ -2416,11 +2469,18 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
             reqs.worldGinBarrierCount = 1;
         }
-        NCCL_CHECK_RESULT(ncclDevCommCreate(ep_group->comm, &reqs, &nccl_dev_comm_host));
+        ncclDevComm_t* nccl_dev_comm_host = nullptr;
+        size_t dcomm_bytes = 0;
+        NCCL_CHECK_RESULT(devCommCreate(ep_group->comm, &reqs, &nccl_dev_comm_host, &dcomm_bytes));
 
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_dev_comm), sizeof(ncclDevComm_t)));
-        CUDA_CHECK(
-            cudaMemcpy(ep_group->nccl_dev_comm, &nccl_dev_comm_host, sizeof(ncclDevComm_t), cudaMemcpyHostToDevice));
+        NCCL_CHECK_RESULT(devCommAllocAndCopyToDevice(
+            ep_group->comm,
+            &nccl_dev_comm_host,
+            dcomm_bytes,
+            &ep_group->nccl_dev_comm));
+
+        free(nccl_dev_comm_host);
+        nccl_dev_comm_host = nullptr;
 
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_epoch_state), sizeof(nccl_ep::LowLatencyEpochState)));
         CUDA_CHECK(cudaMemset(ep_group->ll_epoch_state, 0, sizeof(nccl_ep::LowLatencyEpochState)));
@@ -2556,9 +2616,13 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
         }
 
         // Destroy single NCCL device communicator (copy back from device, destroy on ep_group->comm)
-        ncclDevComm_t dc_host{};
-        CUDA_CHECK(cudaMemcpy(&dc_host, ep_group->nccl_dev_comm, sizeof(ncclDevComm_t), cudaMemcpyDeviceToHost));
-        NCCL_CHECK_RESULT(ncclDevCommDestroy(ep_group->comm, &dc_host));
+        ncclDevComm_t* dc_host = nullptr;
+        size_t dcomm_bytes = 0;
+        NCCL_CHECK_RESULT(commAllocHost(ep_group->comm, &dc_host, &dcomm_bytes));
+
+        CUDA_CHECK(cudaMemcpy(dc_host, ep_group->nccl_dev_comm, dcomm_bytes, cudaMemcpyDeviceToHost));
+        NCCL_CHECK_RESULT(ncclDevCommDestroy(ep_group->comm, dc_host));
+        free(dc_host);
         CUDA_CHECK(cudaFree(ep_group->nccl_dev_comm));
         ep_group->nccl_dev_comm = nullptr;
 
@@ -6404,7 +6468,7 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     clean_params.barrierSignalBase = ep_group->clean_barrier_signal_base;
     clean_params.timeoutCycles = ep_group->timeout_cycles;
 
-    nccl_ep::ll::call_clean_low_latency_buffer(clean_params, stream);
+    NCCLCHECK(nccl_ep::ll::call_clean_low_latency_buffer(clean_params, stream));
 
     // Reset all ranks to active (1 = active).
     // Sync the stream before returning so all_active outlives the async copy.

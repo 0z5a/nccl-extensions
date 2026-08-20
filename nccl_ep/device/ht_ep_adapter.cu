@@ -15,6 +15,7 @@
 #include "common.hpp"
 #include "jit/ht_combine_jit.cuh"
 #include "jit/ht_dispatch_jit.cuh"
+#include "jit/ht_lsa_sync_jit.cuh"
 #include "jit/preprocess_jit.cuh"
 
 #include <algorithm>
@@ -2065,17 +2066,6 @@ void launch_dispatch_permute(
     ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, stream);
 }
 
-// Standalone intra-LSA head/tail sync kernels for the unfused-sync path. A single
-// block's warp runs the same cross-rank LSA barrier the fused kernels do; the
-// kernel boundary provides the whole-grid ordering the fused grid flag gave.
-__global__ void lsa_head_sync_kernel(ncclDevComm_t* dcomm, uint32_t* head_sync_flag) {
-    ::ht_ep::lsa_grid_head_gate(dcomm, head_sync_flag);
-}
-__global__ void lsa_tail_sync_kernel(
-    ncclDevComm_t* dcomm, uint32_t* grid_barrier_counter, uint32_t* head_sync_flag) {
-    ::ht_ep::lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
-}
-
 ncclResult_t launch_dispatch_pull(
     void* recv_x_em,
     float* recv_topk_weights_em,
@@ -2190,11 +2180,12 @@ ncclResult_t launch_dispatch_pull(
         p.caller_out_is_int64 = caller_out_is_int64;
     }
 
-    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomm, head_sync_flag);
+    if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
-    if (unfused_sync)
-        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomm, grid_barrier_counter, head_sync_flag);
+    if (unfused_sync) {
+        NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));
+    }
     return ncclSuccess;
 }
 
@@ -2321,12 +2312,13 @@ ncclResult_t launch_combine_push(
     p.srcpos_map = srcpos_map;
     p.unfused_sync = unfused_sync;
 
-    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomm, head_sync_flag);
+    if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
         top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
-    if (unfused_sync)
-        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomm, grid_barrier_counter, head_sync_flag);
+    if (unfused_sync) {
+        NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));
+    }
     return ncclSuccess;
 }
 

@@ -6528,6 +6528,17 @@ __device__ __forceinline__ decoded_src_t decode_src(int32_t g, int tokens_per_ra
 // Block-uniform LSA grid head gate shared by pull dispatch and push combine.
 // TODO: try replacing the ncclLsaBarrier rendezvous with a bare peer-ptr + atomic-flag sync
 // (as EM local-permute uses) and measure whether it lowers the head/tail sync overhead.
+struct lsa_head_sync_param_t {
+    ncclDevComm_t* dcomm;
+    uint32_t* head_sync_flag;
+};
+
+struct lsa_tail_sync_param_t {
+    ncclDevComm_t* dcomm;
+    uint32_t* grid_barrier_counter;
+    uint32_t* head_sync_flag;
+};
+
 // ready: the value the head gate publishes/waits for. Fused pull-count publishes its
 // metadata before this gate and signals ready=2 so a straggler that only observed the
 // (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
