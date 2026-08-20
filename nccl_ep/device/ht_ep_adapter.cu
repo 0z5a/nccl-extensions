@@ -1266,7 +1266,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.dispatch_push_count.caller_out_is_int64 = params.dispatch_push_count.caller_out_is_int64;
     kp.dispatch_push_count.em_alignment = params.dispatch_push_count.em_alignment;
 
-    // Pass device communicators and windows
+    // Pass device communicator and windows
     kp.dcomm = params.dcomm;
     kp.token_window = params.nccl_token_window;
     kp.prob_window = params.nccl_prob_window;
@@ -1597,12 +1597,11 @@ ncclResult_t call_dispatch(
     kp.num_real_tokens = params.num_real_tokens;
     kp.combine_local_reduce_enabled = params.combine_local_reduce_enabled;
 
-    // Pass device communicators and windows
-    kp.dcomms = params.dcomms;
+    // Pass device communicator and windows
+    kp.dcomm = params.dcomm;
     kp.token_window = params.nccl_token_window;
     kp.prob_window = params.nccl_prob_window;
     kp.dest_window = params.nccl_internal_window;
-    kp.num_gin_comms = params.num_gin_comms;
     kp.num_ctx_per_comm = params.num_ctx_per_comm;
     kp.gin_base_ptr = params.gin_base_ptr;
     kp.signals_base = params.signals_base;
@@ -2069,12 +2068,12 @@ void launch_dispatch_permute(
 // Standalone intra-LSA head/tail sync kernels for the unfused-sync path. A single
 // block's warp runs the same cross-rank LSA barrier the fused kernels do; the
 // kernel boundary provides the whole-grid ordering the fused grid flag gave.
-__global__ void lsa_head_sync_kernel(ncclDevComm_t* dcomms, uint32_t* head_sync_flag) {
-    ::ht_ep::lsa_grid_head_gate(dcomms, head_sync_flag);
+__global__ void lsa_head_sync_kernel(ncclDevComm_t* dcomm, uint32_t* head_sync_flag) {
+    ::ht_ep::lsa_grid_head_gate(dcomm, head_sync_flag);
 }
 __global__ void lsa_tail_sync_kernel(
-    ncclDevComm_t* dcomms, uint32_t* grid_barrier_counter, uint32_t* head_sync_flag) {
-    ::ht_ep::lsa_grid_tail_barrier(dcomms, grid_barrier_counter, head_sync_flag);
+    ncclDevComm_t* dcomm, uint32_t* grid_barrier_counter, uint32_t* head_sync_flag) {
+    ::ht_ep::lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
 }
 
 ncclResult_t launch_dispatch_pull(
@@ -2100,7 +2099,7 @@ ncclResult_t launch_dispatch_pull(
     int sm_count,
     unsigned int shuffle_sms,
     ncclEpDispQuant_t recipe,
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
@@ -2162,7 +2161,7 @@ ncclResult_t launch_dispatch_pull(
     p.caller_num_recv_tokens = caller_num_recv_tokens;
     p.tokens_per_rank = tokens_per_rank;
     p.lsa_team_size = lsa_team_size;
-    p.dcomms = dcomms;
+    p.dcomm = dcomm;
     p.head_sync_flag = head_sync_flag;
     p.grid_barrier_counter = grid_barrier_counter;
     p.unfused_sync = unfused_sync;
@@ -2191,11 +2190,11 @@ ncclResult_t launch_dispatch_pull(
         p.caller_out_is_int64 = caller_out_is_int64;
     }
 
-    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomms, head_sync_flag);
+    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomm, head_sync_flag);
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync)
-        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomms, grid_barrier_counter, head_sync_flag);
+        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomm, grid_barrier_counter, head_sync_flag);
     return ncclSuccess;
 }
 
@@ -2270,7 +2269,7 @@ ncclResult_t launch_combine_push(
     const int32_t* flat2em_slot_map,
     const int32_t* recv_slot_to_src,
     const int32_t* num_recv_tokens_dev,
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     int top_k,
@@ -2309,7 +2308,7 @@ ncclResult_t launch_combine_push(
     p.flat2em_slot_map = flat2em_slot_map;
     p.recv_slot_to_src = recv_slot_to_src;
     p.num_recv_tokens_dev = num_recv_tokens_dev;
-    p.dcomms = dcomms;
+    p.dcomm = dcomm;
     p.head_sync_flag = head_sync_flag;
     p.grid_barrier_counter = grid_barrier_counter;
     p.top_k = top_k;
@@ -2322,12 +2321,12 @@ ncclResult_t launch_combine_push(
     p.srcpos_map = srcpos_map;
     p.unfused_sync = unfused_sync;
 
-    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomms, head_sync_flag);
+    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomm, head_sync_flag);
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
         top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync)
-        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomms, grid_barrier_counter, head_sync_flag);
+        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomm, grid_barrier_counter, head_sync_flag);
     return ncclSuccess;
 }
 

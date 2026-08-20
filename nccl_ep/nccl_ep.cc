@@ -765,10 +765,8 @@ struct ncclEpGroup {
     struct {
         // Device communicator (single comm, multiple contexts)
         // HT cross-LSA-team comms use ncclTeamRail on the base communicator
-        ncclDevComm_t* dcomms = nullptr;       // Host array of device communicators
-        ncclDevComm_t* d_dcomms = nullptr;     // Device array of device communicators
-        int num_comms = 0;                     // Number of communicators (always 1)
-        int num_dcomms = 0;                    // Number of device comms
+        ncclDevComm_t* dcomm = nullptr;        // Host device communicator
+        ncclDevComm_t* d_dcomm = nullptr;      // Device-resident copy of the device communicator
         int qps_per_rank = 0;                  // Total QPs (connections) per rank
         int num_ctx_per_comm = 0;              // Number of contexts per communicator
 
@@ -844,7 +842,7 @@ struct ncclEpGroup {
   // NCCL device API
     size_t num_nccl_comms;
     std::vector<ncclComm_t> nccl_comms;
-    ncclDevComm_t* nccl_dev_comms;
+    ncclDevComm_t* nccl_dev_comm;
     ncclWindow_t* nccl_wins;
     int num_dispatch_signals;
     unsigned clean_barrier_signal_base;
@@ -965,7 +963,7 @@ struct ncclEpGroup {
           num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
           last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
-          node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
+          node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comm(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
 };
 
@@ -1608,8 +1606,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     if (rdma_team_size <= 1) {
         // Single HT outer-domain LSA team — no cross-LSA-team RDMA, but the LSA guard needs a minimal devComm.
-        ep_group->gin_config.num_dcomms = 1;
-        ep_group->gin_config.dcomms = new ncclDevComm_t[1];
+        ep_group->gin_config.dcomm = new ncclDevComm_t{};
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         // Dispatch indexes one LSA barrier session per CTA with blockIdx.x.
         // Combine synchronizes through a single tail CTA at the next session,
@@ -1617,14 +1614,14 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // Keep the compile-time dispatch range available for specialized kernels.
         reqs.lsaBarrierCount =
             std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
-        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
+        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, ep_group->gin_config.dcomm));
         CUDACHECK_RET(cudaMalloc(
-            reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
-            sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
+            reinterpret_cast<void**>(&ep_group->gin_config.d_dcomm),
+            sizeof(ncclDevComm_t)));
         CUDACHECK_RET(cudaMemcpy(
-            ep_group->gin_config.d_dcomms,
-            ep_group->gin_config.dcomms,
-            sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms,
+            ep_group->gin_config.d_dcomm,
+            ep_group->gin_config.dcomm,
+            sizeof(ncclDevComm_t),
             cudaMemcpyHostToDevice));
         return ncclSuccess;
     }
@@ -1785,7 +1782,6 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         return ncclInvalidUsage;
     }
     ep_group->gin_config.qps_per_rank = qps_per_rank;
-    ep_group->gin_config.num_comms = 1;
     // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
@@ -1802,8 +1798,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
     // =========================================================================
-    ep_group->gin_config.num_dcomms = 1;
-    ep_group->gin_config.dcomms = new ncclDevComm_t[1];
+    ep_group->gin_config.dcomm = new ncclDevComm_t{};
 
     {
         ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -1825,16 +1820,16 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // combine_num_sms does not affect this resource count.
         reqs.lsaBarrierCount =
             std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
-        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
+        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, ep_group->gin_config.dcomm));
     }
 
     CUDACHECK_RET(cudaMalloc(
-        reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
-        sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms));
+        reinterpret_cast<void**>(&ep_group->gin_config.d_dcomm),
+        sizeof(ncclDevComm_t)));
     CUDACHECK_RET(cudaMemcpy(
-        ep_group->gin_config.d_dcomms,
-        ep_group->gin_config.dcomms,
-        sizeof(ncclDevComm_t) * ep_group->gin_config.num_dcomms,
+        ep_group->gin_config.d_dcomm,
+        ep_group->gin_config.dcomm,
+        sizeof(ncclDevComm_t),
         cudaMemcpyHostToDevice));
 
     // WindowRegister
@@ -1857,18 +1852,18 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
     // =========================================================================
 
     // Destroy device communicator
-    if (ep_group->gin_config.dcomms != nullptr) {
-        ncclResult_t res = ncclDevCommDestroy(ep_group->comm, &ep_group->gin_config.dcomms[0]);
+    if (ep_group->gin_config.dcomm != nullptr) {
+        ncclResult_t res = ncclDevCommDestroy(ep_group->comm, ep_group->gin_config.dcomm);
         if (res != ncclSuccess) {
             fprintf(stderr, "[HT GIN] Warning: Failed to destroy device comm: %s\n", ncclGetErrorString(res));
         }
-        delete[] ep_group->gin_config.dcomms;
-        ep_group->gin_config.dcomms = nullptr;
+        delete ep_group->gin_config.dcomm;
+        ep_group->gin_config.dcomm = nullptr;
     }
-    // Free device memory for dcomms
-    if (ep_group->gin_config.d_dcomms != nullptr) {
-        cudaFree(ep_group->gin_config.d_dcomms);
-        ep_group->gin_config.d_dcomms = nullptr;
+    // Free device memory for dcomm
+    if (ep_group->gin_config.d_dcomm != nullptr) {
+        cudaFree(ep_group->gin_config.d_dcomm);
+        ep_group->gin_config.d_dcomm = nullptr;
     }
 
     // Deregister the window
@@ -1895,8 +1890,6 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.token_staging_buffer = nullptr;
         ep_group->ht_buffers.dense_prob_buffer = nullptr;
     }
-
-    ep_group->gin_config.num_comms = 0;
 
     ep_group->ht_buffers.internode_initialized = false;
     return ncclSuccess;
@@ -2402,8 +2395,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         // Create device communicator on ep_group->comm with all GIN contexts.
         // This depends only on group-level parameters (num_experts, nRanks),
         // not on the per-handle layout/num_topk, so it stays at group time.
-        ncclDevComm_t* nccl_dev_comms_host = new ncclDevComm_t[1];
-        nccl_dev_comms_host[0] = ncclDevComm_t{};
+        ncclDevComm_t nccl_dev_comm_host{};
         ep_group->num_dispatch_signals = ep_group->num_local_experts * ep_group->nRanks;
         int num_total_signals = ep_group->num_dispatch_signals;
         ep_group->clean_barrier_signal_base = 2 * num_total_signals;
@@ -2424,14 +2416,11 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
             reqs.worldGinBarrierCount = 1;
         }
-        NCCL_CHECK_RESULT(ncclDevCommCreate(ep_group->comm, &reqs, &nccl_dev_comms_host[0]));
+        NCCL_CHECK_RESULT(ncclDevCommCreate(ep_group->comm, &reqs, &nccl_dev_comm_host));
 
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_dev_comms), sizeof(ncclDevComm_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->nccl_dev_comm), sizeof(ncclDevComm_t)));
         CUDA_CHECK(
-            cudaMemcpy(ep_group->nccl_dev_comms, nccl_dev_comms_host, sizeof(ncclDevComm_t), cudaMemcpyHostToDevice));
-
-        delete[] nccl_dev_comms_host;
-        nccl_dev_comms_host = nullptr;
+            cudaMemcpy(ep_group->nccl_dev_comm, &nccl_dev_comm_host, sizeof(ncclDevComm_t), cudaMemcpyHostToDevice));
 
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_epoch_state), sizeof(nccl_ep::LowLatencyEpochState)));
         CUDA_CHECK(cudaMemset(ep_group->ll_epoch_state, 0, sizeof(nccl_ep::LowLatencyEpochState)));
@@ -2567,11 +2556,11 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
         }
 
         // Destroy single NCCL device communicator (copy back from device, destroy on ep_group->comm)
-        ncclDevComm_t dc_host;
-        CUDA_CHECK(cudaMemcpy(&dc_host, ep_group->nccl_dev_comms, sizeof(ncclDevComm_t), cudaMemcpyDeviceToHost));
+        ncclDevComm_t dc_host{};
+        CUDA_CHECK(cudaMemcpy(&dc_host, ep_group->nccl_dev_comm, sizeof(ncclDevComm_t), cudaMemcpyDeviceToHost));
         NCCL_CHECK_RESULT(ncclDevCommDestroy(ep_group->comm, &dc_host));
-        CUDA_CHECK(cudaFree(ep_group->nccl_dev_comms));
-        ep_group->nccl_dev_comms = nullptr;
+        CUDA_CHECK(cudaFree(ep_group->nccl_dev_comm));
+        ep_group->nccl_dev_comm = nullptr;
 
         // No split comms to destroy (using ep_group->comm directly)
     }
@@ -4466,8 +4455,7 @@ ncclResult_t ncclEpDispatch(
                 params.currRank = group->rank;
                 params.numRanks = group->nRanks;
                 params.layout = handle->layout;
-                params.numComms = group->num_nccl_comms;
-                params.devComms = group->nccl_dev_comms;
+                params.devComm = group->nccl_dev_comm;
                 params.windows = group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.workspace = group->ep_workspace;
@@ -5004,11 +4992,11 @@ ncclResult_t ncclEpDispatch(
         params.lsa_S2G_flags = group->ht_buffers.dispatch_lsa_S2G_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
-        // Pass device communicators and windows
+        // Pass device communicator and windows
         // Always pass a valid devComm (single-LSA-team too): the HT LSA sync-guard uses the NCCL LSA
         // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-LSA-team).
         // TODO: remove multiple gin comm notion from group
-        params.dcomm = group->gin_config.dcomms[0];
+        params.dcomm = group->gin_config.d_dcomm;
         params.nccl_token_window = x->win_hdl;
         params.nccl_prob_window = forward_dispatch ? group->gin_config.nccl_window : ncclWindow_t{};
         params.nccl_sf_window = ncclWindow_t{};
@@ -5467,7 +5455,7 @@ ncclResult_t ncclEpDispatch(
                     static_cast<int>(group->dispatch_num_sms),
                     0u,
                     recipe,
-                    group->gin_config.d_dcomms,
+                    group->gin_config.d_dcomm,
                     group->ht_buffers.combine_grid_barrier_counter,  // head gate (idle during dispatch)
                     group->ht_buffers.dispatch_grid_barrier_counter, // tail elect-last-block
                     stream,
@@ -5788,8 +5776,7 @@ ncclResult_t ncclEpCombine(
                 params.currRank = handle->group->rank;
                 params.numRanks = handle->group->nRanks;
                 params.layout = handle->layout;
-                params.numComms = handle->group->num_nccl_comms;
-                params.devComms = handle->group->nccl_dev_comms;
+                params.devComm = handle->group->nccl_dev_comm;
                 params.windows = handle->group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.workspace = handle->group->ep_workspace;
@@ -6048,7 +6035,7 @@ ncclResult_t ncclEpCombine(
                 handle->ht.flat2em_slot_map,
                 handle->ht.recv_slot_to_src,
                 handle->ht.num_tokens_for_experts,
-                group->gin_config.d_dcomms,
+                group->gin_config.d_dcomm,
                 group->ht_buffers.dispatch_grid_barrier_counter, // head gate (idle during combine)
                 group->ht_buffers.combine_grid_barrier_counter,  // tail elect-last-block
                 handle->num_topk,
@@ -6235,11 +6222,10 @@ ncclResult_t ncclEpCombine(
             // Pass device communicators and windows
             // Always pass the devComm (single-LSA-team too): the HT LSA sync-guard now uses the
             // NCCL LSA barrier (needs comm.lsaBarrier). RDMA paths stay if-constexpr-gated.
-            params.dcomms = group->gin_config.d_dcomms;
+            params.dcomm = group->gin_config.d_dcomm;
             params.nccl_token_window = combine_token_window;
             params.nccl_prob_window = !backward_combine ? ncclWindow_t{} : group->gin_config.nccl_window;
             params.nccl_internal_window = group->gin_config.nccl_window;
-            params.num_gin_comms = is_lsa_only ? 0 : group->gin_config.num_comms;
             params.num_ctx_per_comm = is_lsa_only ? 0 : group->gin_config.num_ctx_per_comm;
             params.gin_base_ptr = is_lsa_only ? nullptr : group->gin_config.gin_base_ptr;
             params.signals_base = group->gin_config.signals_base;
@@ -6414,7 +6400,7 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     clean_params.rankMask = ep_group->mask_buffer;
     clean_params.syncBuffer = static_cast<int*>(ep_group->sync_buffer);
     clean_params.syncWindow = ep_group->sync_window;
-    clean_params.devComms = ep_group->nccl_dev_comms;
+    clean_params.devComm = ep_group->nccl_dev_comm;
     clean_params.barrierSignalBase = ep_group->clean_barrier_signal_base;
     clean_params.timeoutCycles = ep_group->timeout_cycles;
 

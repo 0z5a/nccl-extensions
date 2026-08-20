@@ -94,8 +94,7 @@ ncclResult_t call_dispatch(
     args.roundScale = params.roundScale;
     args.recvTopkIdxKind = params.recvTopkIdxKind;
     args.phases = params.phases;
-    args.numComms = params.numComms;
-    args.devComms = params.devComms;
+    args.devComm = params.devComm;
     args.windows = params.windows;
     args.signalsBase = params.signalsBase;
     args.timeoutCycles = params.timeoutCycles;
@@ -227,8 +226,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     args.numWarpsPerGroup = numWarpsPerGroup;
     args.phases = params.phases;
     args.zeroCopy = params.zeroCopy;
-    args.numComms = params.numComms;
-    args.devComms = params.devComms;
+    args.devComm = params.devComm;
     args.windows = params.windows;
     args.signalsBase = params.signalsBase;
     args.timeoutCycles = params.timeoutCycles;
@@ -265,7 +263,7 @@ __launch_bounds__(kLlCleanNumThreads, 1) __global__ void ll_clean_low_latency_bu
         p.clean_1, p.num_clean_int_1,
         p.rankMask,
         p.syncBuffer, p.syncWindow,
-        p.devComms, p.barrierSignalBase, p.timeoutCycles);
+        p.devComm, p.barrierSignalBase, p.timeoutCycles);
 }
 
 // ============================================================================
@@ -280,7 +278,7 @@ void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cu
     args.rankMask = params.rankMask;
     args.syncBuffer = params.syncBuffer;
     args.syncWindow = params.syncWindow;
-    args.devComms = params.devComms;
+    args.devComm = params.devComm;
     args.barrierSignalBase = params.barrierSignalBase;
     args.timeoutCycles = params.timeoutCycles;
 

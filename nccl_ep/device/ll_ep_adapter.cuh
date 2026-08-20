@@ -127,8 +127,7 @@ struct dispatch_kernel_args_t {
     // recv_topk_idx numbering (LOCAL/GLOBAL); resolved on the host (never AUTO).
     ncclEpExpertIdKind_t recvTopkIdxKind;
     int phases;
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
     uint64_t timeoutCycles;
@@ -173,8 +172,7 @@ struct combine_kernel_args_t {
     int numWarpsPerGroup;
     int phases;
     bool zeroCopy;
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
     uint64_t timeoutCycles;
@@ -188,7 +186,7 @@ struct clean_low_latency_buffer_kernel_args_t {
     int* rankMask;
     int* syncBuffer;
     ncclWindow_t* syncWindow;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     unsigned barrierSignalBase;
     uint64_t timeoutCycles;
 };
@@ -247,8 +245,7 @@ struct DispatchParams {
     ncclEpLayout_t layout;
 
     // GIN / NCCL device context
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
 
@@ -315,8 +312,7 @@ struct CombineParams {
     ncclEpLayout_t layout;
 
     // GIN / NCCL device context
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
 
@@ -350,7 +346,7 @@ struct CleanLowLatencyBufferParams {
     int* rankMask;
     int* syncBuffer;
     ncclWindow_t* syncWindow;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     unsigned barrierSignalBase;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
 };

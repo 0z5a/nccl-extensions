@@ -407,7 +407,7 @@ ncclResult_t launch_dispatch_pull(
     int sm_count,
     unsigned int shuffle_sms,
     ncclEpDispQuant_t recipe,
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
@@ -460,7 +460,7 @@ ncclResult_t launch_combine_push(
     const int32_t* flat2em_slot_map,
     const int32_t* recv_slot_to_src,
     const int32_t* num_recv_tokens_dev,
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     int top_k,
@@ -626,7 +626,7 @@ struct DispatchParams {
     uint32_t* dispatch_grid_barrier_counter;
 
     // GIN context (from ep_group, multi-LSA-team only)
-    ncclDevComm dcomm; // Device communicator (single comm, by value)
+    ncclDevComm* dcomm; // Device communicator
     ncclWindow_t nccl_token_window; // Source window handle for token data
     ncclWindow_t nccl_prob_window; // Registered window handle for probability data
     ncclWindow_t nccl_sf_window; // Registered window handle for scaling-factor data
@@ -712,11 +712,10 @@ struct CombineParams {
     uint32_t* combine_grid_barrier_counter;
 
     // GIN context (multi-LSA-team only)
-    ncclDevComm_t* dcomms; // Device communicators array
+    ncclDevComm_t* dcomm; // Device communicator (device pointer)
     ncclWindow_t nccl_token_window; // Source window handle for token data
     ncclWindow_t nccl_prob_window; // Source window handle for probability data
     ncclWindow_t nccl_internal_window; // Internal destination window handle
-    int num_gin_comms; // Number of GIN communicators
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
     unsigned signals_base; // Base signal ID

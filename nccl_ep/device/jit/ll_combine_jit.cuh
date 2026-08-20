@@ -64,8 +64,8 @@ inline std::string ll_combine_jit_source(
         << "      p.numCombinedTokens, p.hidden, p.maxTokensPerRank,\n"
         << "      p.numExperts, p.currRank, p.numRanks,\n"
         << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
-        << "      p.phases, p.zeroCopy, p.numComms,\n"
-        << "      p.devComms, p.windows, p.signalsBase, p.timeoutCycles);\n"
+        << "      p.phases, p.zeroCopy,\n"
+        << "      p.devComm, p.windows, p.signalsBase, p.timeoutCycles);\n"
         << "}\n";
     return src.str();
 }

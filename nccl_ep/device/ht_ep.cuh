@@ -1098,7 +1098,7 @@ struct dispatch_kernel_param_base_t {
     // The number of token output by attn layer on a rank/GPU.
     int num_of_tokens_per_rank;
     // NCCL GIN context
-    ncclDevComm dcomm; // Device communicator
+    ncclDevComm* dcomm; // Device communicator (device pointer)
     ncclWindow_t token_window; // Source window handle for token data
     ncclWindow_t prob_window; // Source window handle for probability data
     ncclWindow_t sf_window; // Source window handle for scaling-factor data
@@ -1175,11 +1175,10 @@ struct combine_kernel_param_base_t {
     // Per-rank grid-barrier counter that elects the last block at the combine tail.
     uint32_t* combine_grid_barrier_counter;
     // NCCL GIN context
-    ncclDevComm_t* dcomms; // Device communicators array (1 element, on device)
+    ncclDevComm_t* dcomm; // Device communicator (device pointer)
     ncclWindow_t token_window; // Source window handle for token data
     ncclWindow_t prob_window; // Source window handle for probability data
     ncclWindow_t dest_window; // Destination window handle
-    int num_gin_comms; // Number of GIN communicators (1)
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
     unsigned signals_base; // Base signal ID
@@ -1216,13 +1215,6 @@ __forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t b
 // Map a data channel onto its GIN context, skipping the reserved contexts.
 __forceinline__ __device__ int get_data_ctx(int channel, int num_ctx_per_comm) {
     return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % num_ctx_per_comm);
-}
-
-// Helper to compute communicator index and context index from global channel
-// Used for 6-comm x 4-ctx GIN configuration (6 communicators with 4 contexts each = 24 total channels)
-__forceinline__ __device__ void get_comm_ctx(int global_channel, int num_ctx_per_comm, int& comm_idx, int& ctx_idx) {
-    comm_idx = global_channel / num_ctx_per_comm;
-    ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
 }
 
 // Advance a ring-buffer slot; on wrap (slot == num_slots) reset to 0 and flip phase parity.
@@ -3241,11 +3233,10 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
     // CONFIG: ncclGin RDMA plumbing
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     ncclWindow_t nccl_token_window,
     ncclWindow_t nccl_prob_window,
     ncclWindow_t nccl_internal_window,
-    int num_gin_comms,
     int num_ctx_per_comm,
     void* gin_base_ptr,
     unsigned signals_base,
@@ -3293,13 +3284,11 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         const int rank_in_remote = lteam_id < my_lteam ? my_lteam - 1 : my_lteam;
         const bool is_residue = (chunk_id >= cpr);
 
-        // Distribute chunks across comms/contexts for parallelism.
-        int total_channels = num_gin_comms * num_ctx_per_comm;
-        int global_channel = chunk_id % total_channels;
-        int comm_idx, ctx_idx;
-        get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-        ncclGin net(dcomms[comm_idx], ctx_idx);
-        ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
+        // Distribute chunks across communicator contexts for parallelism.
+        int global_channel = chunk_id % num_ctx_per_comm;
+        int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
+        ncclGin net(*dcomm, ctx_idx);
+        ncclTeam rail = ncclTeamRail(*dcomm);
         int rdma_tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         int chunk_base_token_idx = lteam_id * rdma_per_lsa_sz + chunk_id * TOKENS_PER_CHUNK;
         // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
@@ -3546,10 +3535,9 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const uint64_t expected_flag_value,
     const bool combine_local_reduce_enabled,
     // CONFIG: ncclGin RDMA plumbing
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     unsigned signals_base,
     unsigned combine_signal_offset,
-    int num_gin_comms,
     int num_ctx_per_comm) {
     // The G2S group is split into single-warp pipelines (warp == pipeline), matching the cross-LSA-team red
     // group; each warp owns an equal slice of the G2S FIFO.
@@ -3621,11 +3609,9 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
 
             if (lane_id == 0) {
                 constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-                int total_channels = num_gin_comms * num_ctx_per_comm;
-                int global_channel = cidx % total_channels;
-                int comm_idx, ctx_idx;
-                get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-                ncclGin net(dcomms[comm_idx], ctx_idx);
+                int global_channel = cidx % num_ctx_per_comm;
+                int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
+                ncclGin net(*dcomm, ctx_idx);
                 for (int n = 1; n < LSA_TEAMS; n++) {
                     int signal_lteam_id = my_lteam >= n ? my_lteam - n : my_lteam + LSA_TEAMS - n;
                     unsigned signal_id = signals_base + combine_signal_offset +
@@ -4345,7 +4331,7 @@ warp_rdma_guard_wait(const uint64_t* peer_flags, int my_lteam, int lsa_teams, ui
 // Publish the expected round into this rank's slot (my_slot) of every rail peer's window.
 // Runs on reserved context 0, so it never shares QP state with a data channel.
 __device__ __forceinline__ void warp_rdma_guard_publish(
-    ncclDevComm dcomm,
+    const ncclDevComm& dcomm,
     ncclWindow_t dest_window,
     size_t my_slot,
     int my_lteam,
@@ -5061,7 +5047,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             if (param.guard_enabled || count_fanout) {
                 ncclLsaBarrierSession<ncclCoopWarp> bar(
                     ncclCoopWarp(),
-                    param.dcomm,
+                    *param.dcomm,
                     ncclTeamTagLsa(),
                     (uint32_t)blockIdx.x);
                 bar.sync(
@@ -5099,7 +5085,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 HIDDEN_DIM,
                 SF_BYTES_PER_TOKEN,
                 param.experts_per_rank,
-                param.dcomm,
+                *param.dcomm,
                 param.num_ctx_per_comm,
                 param.token_window,
                 param.prob_window,
@@ -5127,7 +5113,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             SF_BYTES_PER_TOKEN,
             param.experts_per_rank,
             *param.expected_gin_flag_val,
-            param.dcomm,
+            *param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,
             &param.mr_info,
@@ -5267,7 +5253,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 const uint64_t expected = *param.expected_gin_flag_val;
                 if (param.guard_enabled)
                     warp_rdma_guard_publish(
-                        param.dcomm,
+                        *param.dcomm,
                         param.dest_window,
                         param.mr_info.guard_offset + static_cast<size_t>(my_lteam) * sizeof(uint64_t),
                         my_lteam,
@@ -5525,10 +5511,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.experts_per_rank,
             *param.expected_gin_flag_val,
             param.combine_local_reduce_enabled,
-            param.dcomms,
+            param.dcomm,
             param.signals_base,
             param.combine_signal_offset,
-            param.num_gin_comms,
             param.num_ctx_per_comm);
 #undef COMBINE_G2S_INTER_TEMPLATE
     } else if (
@@ -5551,11 +5536,10 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 param.experts_per_rank,
-                param.dcomms,
+                param.dcomm,
                 param.token_window,
                 param.prob_window,
                 param.dest_window,
-                param.num_gin_comms,
                 param.num_ctx_per_comm,
                 param.gin_base_ptr,
                 param.signals_base,
@@ -5596,7 +5580,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 const uint64_t expected = *param.expected_gin_flag_val;
                 if (param.guard_enabled)
                     warp_rdma_guard_publish(
-                        param.dcomms[0],
+                        *param.dcomm,
                         param.dest_window,
                         param.mr_info.guard_offset + static_cast<size_t>(my_lteam) * sizeof(uint64_t),
                         my_lteam,
@@ -5611,7 +5595,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 if (param.guard_enabled) {
                     ncclLsaBarrierSession<ncclCoopWarp> bar(
                         ncclCoopWarp(),
-                        param.dcomms[0],
+                        *param.dcomm,
                         ncclTeamTagLsa(),
                         param.combine_barrier_offset);
                     bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
@@ -6547,11 +6531,11 @@ __device__ __forceinline__ decoded_src_t decode_src(int32_t g, int tokens_per_ra
 // ready: the value the head gate publishes/waits for. Fused pull-count publishes its
 // metadata before this gate and signals ready=2 so a straggler that only observed the
 // (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
-__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomms, uint32_t* head_sync_flag, int ready = 1) {
+__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag, int ready = 1) {
     int* head_flag = reinterpret_cast<int*>(head_sync_flag);
     if (blockIdx.x == 0) {
         if (threadIdx.x < 32) {
-            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), dcomms[0], ncclTeamTagLsa(), 0u);
+            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), *dcomm, ncclTeamTagLsa(), 0u);
             bar.sync(ncclCoopWarp(), cuda::memory_order_acq_rel);
         }
         __syncthreads();
@@ -6570,13 +6554,13 @@ __device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomms, uint32
 
 // Block-uniform LSA grid tail barrier shared by pull dispatch and push combine.
 __device__ __forceinline__ void lsa_grid_tail_barrier(
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* grid_barrier_counter,
     uint32_t* head_sync_flag) {
     __threadfence_system();
     if (elect_last_block(reinterpret_cast<const int*>(grid_barrier_counter), static_cast<int>(gridDim.x))) {
         if (threadIdx.x < 32) {
-            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), dcomms[0], ncclTeamTagLsa(), 1u);
+            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), *dcomm, ncclTeamTagLsa(), 1u);
             bar.sync(ncclCoopWarp(), cuda::memory_order_acq_rel);
         }
         if (threadIdx.x == 0) {
@@ -6608,7 +6592,7 @@ struct dispatch_pull_param_t {
     int tokens_per_rank;                        // decode src token = g % tokens_per_rank
     int lsa_team_size;                          // decode src rank within the LSA team
     // Intra-LSA head/tail sync: source ready before any peer read, reads done before reuse.
-    ncclDevComm_t* dcomms;
+    ncclDevComm_t* dcomm;
     uint32_t* head_sync_flag;                   // grid head gate (idle counter during dispatch)
     uint32_t* grid_barrier_counter;             // tail elect-last-block
     // When set, head/tail sync runs as separate kernels; this kernel skips the inline sync.
@@ -7011,7 +6995,7 @@ __device__ __forceinline__ void dispatch_pull(
     const int scale_row_bytes = dp.scale_row_bytes;
     const int caller_num_recv_tokens = dp.caller_num_recv_tokens;
     const int tokens_per_rank = dp.tokens_per_rank;
-    ncclDevComm_t* __restrict__ dcomms = dp.dcomms;
+    ncclDevComm_t* __restrict__ dcomm = dp.dcomm;
     uint32_t* __restrict__ head_sync_flag = dp.head_sync_flag;
     uint32_t* __restrict__ grid_barrier_counter = dp.grid_barrier_counter;
     const bool unfused_sync = dp.unfused_sync;
@@ -7206,9 +7190,9 @@ __device__ __forceinline__ void dispatch_pull(
         dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot, meta_ptrs, meta_stride,
             topk_off_bytes, tokens_per_rank, top_k, my_rank, lsa_team_size);
         __syncthreads();
-        lsa_grid_head_gate(dcomms, head_sync_flag, 2);
+        lsa_grid_head_gate(dcomm, head_sync_flag, 2);
     } else if (!unfused_sync) {
-        lsa_grid_head_gate(dcomms, head_sync_flag);
+        lsa_grid_head_gate(dcomm, head_sync_flag);
     }
 
     if constexpr (kFusedMap) {
@@ -7318,7 +7302,7 @@ __device__ __forceinline__ void dispatch_pull(
 
     // Tail sync: all ranks finished reading peer source before it can be reused.
     // Skipped when a separate tail-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_tail_barrier(dcomms, grid_barrier_counter, head_sync_flag);
+    if (!unfused_sync) lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
 }
 
 // Local EM reduce kernel (inverse of local_permute_dup). Sums the top_k EM
@@ -7568,7 +7552,7 @@ struct combine_push_param_t {
     const float* topk_weights_em;     // 1D EM input weights, indexed by em_slot
     const int32_t* srcpos_map;        // [num_recv, top_k] source topk position per copy
     // Intra-LSA sync (head gate + tail barrier)
-    ncclDevComm_t* dcomms;
+    ncclDevComm_t* dcomm;
     uint32_t* head_sync_flag;         // grid head gate (idle dispatch_grid_barrier_counter)
     uint32_t* grid_barrier_counter;   // tail elect-last-block (combine_grid_barrier_counter)
     // Scalar config
@@ -7592,7 +7576,7 @@ __device__ __forceinline__ void combine_push(
     const int32_t* __restrict__ flat2em_slot_map,
     const int32_t* __restrict__ recv_slot_to_src,
     const int32_t* __restrict__ num_recv_tokens_dev,
-    ncclDevComm_t* __restrict__ dcomms,
+    ncclDevComm_t* __restrict__ dcomm,
     uint32_t* __restrict__ head_sync_flag,
     uint32_t* __restrict__ grid_barrier_counter,
     int top_k,
@@ -7618,7 +7602,7 @@ __device__ __forceinline__ void combine_push(
     // ---- HEAD SYNC: gates peer pushes until all ranks reach combine, so a push can't
     // land while the previous iteration's combine_reduce is still reading staging. ----
     // Skipped when a separate head-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_head_gate(dcomms, head_sync_flag);
+    if (!unfused_sync) lsa_grid_head_gate(dcomm, head_sync_flag);
 
     // Metadata smem is sized to the max block; only the first kSlotsPerBlock rows are used.
     __shared__ int32_t smem_flat2em_slot_map[kCombinePushMaxSlots][MaxTopK];
@@ -7818,7 +7802,7 @@ __device__ __forceinline__ void combine_push(
 
     // ---- TAIL SYNC: all peer pushes globally visible before combine_reduce reads ----
     // Skipped when a separate tail-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_tail_barrier(dcomms, grid_barrier_counter, head_sync_flag);
+    if (!unfused_sync) lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
 }
 
 struct combine_reduce_param_t {

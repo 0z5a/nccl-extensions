@@ -103,7 +103,7 @@ __forceinline__ __device__ uint64_t ncclGetP2pPtr(
     const int& rank,
     const int& dstRank,
     const ncclWindow_t* ncclWindows,
-    ncclDevComm* devComms) {
+    ncclDevComm* devComm) {
     // Local rank, no need for peer mapping
     if (rank == dstRank) {
         return dstPtr;
@@ -111,12 +111,12 @@ __forceinline__ __device__ uint64_t ncclGetP2pPtr(
 
     // P2P/NVLink only works between ranks on the same LSA team
     // Use NCCL team APIs to check if dstRank is in the same LSA team.
-    // Always use commId=0: single devComm with all GIN contexts (1-comm N-context design).
-    constexpr int commId = 0;
-    ncclTeam lsa = ncclTeamLsa(devComms[commId]);
-    ncclTeam world = ncclTeamWorld(devComms[commId]);
+    ncclTeam lsa = ncclTeamLsa(*devComm);
+    ncclTeam world = ncclTeamWorld(*devComm);
     if (!ncclTeamRankIsMember(lsa, world, dstRank)) return 0; // Different LSA teams, must use RDMA
 
+    // The window array is indexed per-comm; the 1-comm N-context design pins that to 0.
+    constexpr int commId = 0;
     auto const p2pPtr = reinterpret_cast<uint64_t>(ncclGetPeerPointer(ncclWindows[commId], offset, dstRank));
 
     return p2pPtr ? p2pPtr : 0;
@@ -278,7 +278,7 @@ __forceinline__ __device__ void sendToken(
     bool roundScale,
     int* rankMask,
     const ncclWindow_t* windows,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     // Zero-copy output: direct NVLink writes may target peer token/scale windows.
     ncclWindow_t recvDataWindow,
     size_t recvDataOffset,
@@ -291,7 +291,7 @@ __forceinline__ __device__ void sendToken(
     using vec_t = typename recipe_types::transport_vec_t;
 
     const auto dstSrcRankP2pPtr =
-        ncclGetP2pPtr(srcRankRegionLocalPtr, srcRankRegionOffset, currRank, dstRank, windows, devComms);
+        ncclGetP2pPtr(srcRankRegionLocalPtr, srcRankRegionOffset, currRank, dstRank, windows, devComm);
 
     if (isRankMasked<true>(rankMask, dstRank)) return;
 
@@ -354,8 +354,8 @@ __forceinline__ __device__ void sendToken(
             const size_t expectedSrcOffset = sendOff + tokenIdx * numBytesPerMsg;
             constexpr int commId = 0;
             auto ctxId = getCtxId(hashKey);
-            ncclGin net(devComms[commId], ctxId);
-            ncclTeam world = ncclTeamWorld(devComms[commId]);
+            ncclGin net(*devComm, ctxId);
+            ncclTeam world = ncclTeamWorld(*devComm);
             auto ncclWindow = windows[commId];
             net.put(
                 world,
@@ -463,16 +463,16 @@ __forceinline__ __device__ void sendExpertCount(
     int* rankMask,
     unsigned signalsBase,
     const ncclWindow_t* windows,
-    ncclDevComm* devComms) {
-    const auto dstP2pPtr = ncclGetP2pPtr(recvCntPtr, recvCntOffset, currRank, dstRank, windows, devComms);
+    ncclDevComm* devComm) {
+    const auto dstP2pPtr = ncclGetP2pPtr(recvCntPtr, recvCntOffset, currRank, dstRank, windows, devComm);
 
     if (not isRankMasked(rankMask, dstRank)) {
         if (dstP2pPtr == 0) {
             constexpr int commId = 0;
             auto ctxId = getCtxId(dstExpertLocalIdx);
             auto signalId = signalsBase + dstExpertLocalIdx * numRanks + currRank;
-            ncclGin net(devComms[commId], ctxId);
-            ncclTeam world = ncclTeamWorld(devComms[commId]);
+            ncclGin net(*devComm, ctxId);
+            ncclTeam world = ncclTeamWorld(*devComm);
             auto ncclWindow = windows[commId];
             net.put(
                 world,
@@ -504,7 +504,7 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
     int* asyncErrorFlag,
     unsigned signalsBase,
     const ncclWindow_t* windows,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     int* recvStats,
     int64_t* waitStats,
     uint64_t timeoutCycles) {
@@ -514,12 +514,11 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
 
     if (not isRankMasked(rankMask, srcRank)) {
         size_t srcOffset = recvCntOff + (rankLaneIdx * numRanks + srcRank) * sizeof(int);
-        auto srcP2pPtr = ncclGetP2pPtr(0x01, srcOffset, currRank, srcRank, windows, devComms);
+        auto srcP2pPtr = ncclGetP2pPtr(0x01, srcOffset, currRank, srcRank, windows, devComm);
 
         if (srcP2pPtr == 0) {
-            constexpr int commId = 0;
             auto ctxId = getCtxId(rankLaneIdx);
-            ncclGin net(devComms[commId], ctxId);
+            ncclGin net(*devComm, ctxId);
 
             uint64_t curValue;
             ncclGinSignal_t signalId = signalsBase + rankLaneIdx * numRanks + srcRank;
@@ -679,8 +678,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     bool roundScale = args.roundScale;
     ncclEpExpertIdKind_t recvTopkIdxKind = args.recvTopkIdxKind;
     int phases = args.phases;
-    int numComms = args.numComms;
-    ncclDevComm* devComms = args.devComms;
+    ncclDevComm* devComm = args.devComm;
     const ncclWindow_t* windows = args.windows;
     unsigned signalsBase = args.signalsBase;
     uint64_t timeoutCycles = args.timeoutCycles;
@@ -875,7 +873,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
                         roundScale,
                         rankMask,
                         windows,
-                        devComms,
+                        devComm,
                         recvDataWindow,
                         recvDataOffset,
                         rcvScalesWin,
@@ -977,7 +975,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             rankMask,
             signalsBase,
             windows,
-            devComms);
+            devComm);
 
         // Clean `packed_recv_count` (expert-major only: outCnt is the per-expert slot allocator)
         if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
@@ -1029,9 +1027,8 @@ LOW_LATENCY_DISPATCH_RECV:
         // sender-side ncclGetP2pPtr check above.
         bool isNvlinkSrc = false;
         {
-            constexpr int kCommId = 0;
-            ncclTeam lsa = ncclTeamLsa(devComms[kCommId]);
-            ncclTeam world = ncclTeamWorld(devComms[kCommId]);
+            ncclTeam lsa = ncclTeamLsa(*devComm);
+            ncclTeam world = ncclTeamWorld(*devComm);
             isNvlinkSrc = ncclTeamRankIsMember(lsa, world, srcRank);
         }
 
@@ -1047,7 +1044,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 asyncErrorFlag,
                 signalsBase,
                 windows,
-                devComms,
+                devComm,
                 recvStats,
                 waitStats,
                 timeoutCycles);
@@ -1440,8 +1437,8 @@ __forceinline__ __device__ void sendFinishFlag(
     int* rankMask,
     unsigned signalsBase,
     const ncclWindow_t* windows,
-    ncclDevComm* devComms) {
-    auto dstP2pPtr = ncclGetP2pPtr(recvFlagPtr, recvFlagOffset, currRank, dstRank, windows, devComms);
+    ncclDevComm* devComm) {
+    auto dstP2pPtr = ncclGetP2pPtr(recvFlagPtr, recvFlagOffset, currRank, dstRank, windows, devComm);
 
     if (not isRankMasked(rankMask, dstRank)) {
         if (dstP2pPtr == 0) {
@@ -1449,8 +1446,8 @@ __forceinline__ __device__ void sendFinishFlag(
             constexpr int commId = 0;
             auto ctxId = localExpertIdx % MAX_NCCL_GIN_CTX_PER_COMM;
 
-            ncclGin net(devComms[commId], ctxId);
-            ncclTeam world = ncclTeamWorld(devComms[commId]);
+            ncclGin net(*devComm, ctxId);
+            ncclTeam world = ncclTeamWorld(*devComm);
             auto ncclWindow = windows[commId];
 
             net.put(
@@ -1482,21 +1479,20 @@ __forceinline__ __device__ void waitForRecvFlag(
     int* asyncErrorFlag,
     unsigned signalsBase,
     const ncclWindow_t* windows,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     int64_t* waitStats,
     uint64_t timeoutCycles) {
     auto startTime = clock64();
     uint64_t waitRecvCost = 0;
 
     size_t srcOffset = recvFlagOff + responsibleExpertIdx * sizeof(int);
-    auto srcP2pPtr = ncclGetP2pPtr(0x01, srcOffset, currRank, srcRank, windows, devComms);
+    auto srcP2pPtr = ncclGetP2pPtr(0x01, srcOffset, currRank, srcRank, windows, devComm);
     if (not isRankMasked(rankMask, srcRank)) {
         if (srcP2pPtr == 0) {
             uint64_t curValue;
             auto localExpertIdxWait = responsibleExpertIdx % numLocalExperts;
-            constexpr int commIdWait = 0;
             auto ctxIdWait = localExpertIdxWait % MAX_NCCL_GIN_CTX_PER_COMM;
-            ncclGin net(devComms[commIdWait], ctxIdWait);
+            ncclGin net(*devComm, ctxIdWait);
             do {
                 curValue = net.readSignal(signalsBase + responsibleExpertIdx);
             } while (curValue < 1 // signal not arrived
@@ -1535,15 +1531,15 @@ __forceinline__ __device__ void sendTokenViaRdma(
     size_t recvOff,
     size_t numBytesPerSlot,
     int hidden,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     const ncclWindow_t* windows) {
     const auto expectedDstOffset = recvOff;
     const auto expectedBufOffset = sendOff;
 
     constexpr int commId = 0;
     auto ctxId = getCtxId(rankLaneIdx);
-    ncclGin net(devComms[commId], ctxId);
-    ncclTeam world = ncclTeamWorld(devComms[commId]);
+    ncclGin net(*devComm, ctxId);
+    ncclTeam world = ncclTeamWorld(*devComm);
     auto ncclWindow = windows[commId];
     net.put(
         world,
@@ -1748,7 +1744,7 @@ __forceinline__ __device__ void processAndSendToken(
     TmaLoadAndArriveT& tmaLoadAndArrive,
     GetNumTmaBytesT& getNumTmaBytes,
     int laneId,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     const ncclWindow_t* windows) {
     EP_STATIC_ASSERT(kRecipe != NCCL_EP_COMB_QUANT_NVFP4 || !kUseLogFMT,
                      "NVFP4 combine does not support LogFMT");
@@ -1840,7 +1836,7 @@ __forceinline__ __device__ void processAndSendToken(
                 recvOff,
                 numBytesPerSlot,
                 hidden,
-                devComms,
+                devComm,
                 windows);
         }
     }
@@ -1948,7 +1944,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
   // CONFIG
   int numCombinedTokens, int hidden, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
-  int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, int numComms, ncclDevComm* devComms,
+  int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, ncclDevComm* devComm,
   const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles) {
 #if !defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || \
     (__CUDA_ARCH_FAMILY_SPECIFIC__ != 1000 && __CUDA_ARCH_FAMILY_SPECIFIC__ != 1070 && \
@@ -2119,7 +2115,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                     const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
                     const auto expectedDstOffset = recvOff + rcvTokenOffset;
                     const auto dstP2pPtr =
-                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComm);
                     const float globalScale =
                         kRecipe == NCCL_EP_COMB_QUANT_NVFP4 ? __ldg(inGlobalScales + offset) : 1.f;
 
@@ -2151,7 +2147,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                         tmaLoadAndArrive,
                         getNumTmaBytes,
                         laneId,
-                        devComms,
+                        devComm,
                         windows);
                 }
             } else if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
@@ -2182,7 +2178,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                     const auto recvPtr = reinterpret_cast<uint64_t>(recvBuf) + rcvTokenOffset;
                     const auto expectedDstOffset = recvOff + rcvTokenOffset;
                     const auto dstP2pPtr =
-                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComms);
+                        ncclGetP2pPtr(recvPtr, expectedDstOffset, currRank, dstRank, windows, devComm);
                     const float globalScale =
                         kRecipe == NCCL_EP_COMB_QUANT_NVFP4 ? __ldg(inGlobalScales + slot) : 1.f;
 
@@ -2214,7 +2210,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                         tmaLoadAndArrive,
                         getNumTmaBytes,
                         laneId,
-                        devComms,
+                        devComm,
                         windows);
                 }
             }
@@ -2244,7 +2240,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
                 rankMask,
                 signalsBase,
                 windows,
-                devComms);
+                devComm);
             atomic_add_release_global(atomicCleanFlag, -1);
         }
         __syncwarp();
@@ -2277,7 +2273,7 @@ LOW_LATENCY_COMBINE_RECV:
                 asyncErrorFlag,
                 signalsBase,
                 windows,
-                devComms,
+                devComm,
                 waitStats,
                 timeoutCycles);
         }
@@ -2535,16 +2531,15 @@ template <int kNumThreads>
 __forceinline__ __device__ void maskAwareBarrier(
     int threadId,
     int myRank,
-    ncclDevComm& dcomm,
     int* rankMask,
     int* syncBuffer,
     const ncclWindow_t* syncWindow,
     unsigned barrierSignalBase,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     uint64_t timeoutCycles) {
     if (isRankMasked(rankMask, myRank)) return;
 
-    int nRanks = dcomm.nRanks;
+    int nRanks = devComm->nRanks;
     EP_DEVICE_ASSERT(kNumThreads >= nRanks);
 
     // Decrement local sync counter (monotonically decreasing)
@@ -2570,14 +2565,13 @@ __forceinline__ __device__ void maskAwareBarrier(
                 myRank,
                 peer,
                 syncWindow,
-                devComms);
+                devComm);
 
             if (p2pPtr == 0) {
                 // RDMA peer: use GIN signal
-                constexpr int commId = 0;
                 auto ctxId = peer % MAX_NCCL_GIN_CTX_PER_COMM;
-                ncclGin net(devComms[commId], ctxId);
-                ncclTeam world = ncclTeamWorld(devComms[commId]);
+                ncclGin net(*devComm, ctxId);
+                ncclTeam world = ncclTeamWorld(*devComm);
                 net.put(
                     world,
                     peer,
@@ -2608,7 +2602,7 @@ __forceinline__ __device__ void maskAwareBarrier(
                 myRank,
                 peer,
                 syncWindow,
-                devComms);
+                devComm);
 
             if (p2pPtr != 0) {
                 // NVLink peer: poll syncBuffer directly
@@ -2626,14 +2620,13 @@ __forceinline__ __device__ void maskAwareBarrier(
 
     // RDMA peers: wait on GIN signal (thread 0 handles aggregate)
     if (threadId == 0) {
-        constexpr int commId = 0;
         auto ctxId = myRank % MAX_NCCL_GIN_CTX_PER_COMM;
-        ncclGin net(devComms[commId], ctxId);
+        ncclGin net(*devComm, ctxId);
 
         int numExpectedSignals = 0;
         for (int r = 0; r < nRanks; r++) {
             if (r == myRank || isRankMasked(rankMask, r)) continue;
-            auto p2p = ncclGetP2pPtr(0x01, 0, myRank, r, syncWindow, devComms);
+            auto p2p = ncclGetP2pPtr(0x01, 0, myRank, r, syncWindow, devComm);
             if (p2p == 0) numExpectedSignals++;
         }
 
@@ -2648,7 +2641,7 @@ __forceinline__ __device__ void maskAwareBarrier(
                 printf("Warning: NCCL EP clean barrier timeout (GIN), myRank %d\n", myRank);
                 for (int r = 0; r < nRanks; r++) {
                     if (r == myRank || isRankMasked(rankMask, r)) continue;
-                    auto p2p = ncclGetP2pPtr(0x01, 0, myRank, r, syncWindow, devComms);
+                    auto p2p = ncclGetP2pPtr(0x01, 0, myRank, r, syncWindow, devComm);
                     if (p2p == 0) atomicExch(rankMask + r, 0);
                 }
             }
@@ -2666,27 +2659,25 @@ __device__ __forceinline__ void clean_low_latency_buffer_kernel_impl(
     int* rankMask,
     int* syncBuffer,
     ncclWindow_t* syncWindow,
-    ncclDevComm* devComms,
+    ncclDevComm* devComm,
     unsigned barrierSignalBase,
     uint64_t timeoutCycles) {
     int threadId = static_cast<int>(threadIdx.x);
-    auto dcomm = devComms[0];
 
     // Pre-clean barrier
     if (rankMask == nullptr) {
-        ncclGin net(dcomm, 0);
+        ncclGin net(*devComm, 0);
         ncclGinBarrierSession<ncclCoopCta> bar(ncclCoopCta(), net, ncclTeamTagWorld(), blockIdx.x);
         bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
     } else {
         maskAwareBarrier<kNumThreads>(
             threadId,
-            dcomm.rank,
-            dcomm,
+            devComm->rank,
             rankMask,
             syncBuffer,
             syncWindow,
             barrierSignalBase,
-            devComms,
+            devComm,
             timeoutCycles);
     }
 
@@ -2697,19 +2688,18 @@ __device__ __forceinline__ void clean_low_latency_buffer_kernel_impl(
 
     // Post-clean barrier
     if (rankMask == nullptr) {
-        ncclGin net(dcomm, 0);
+        ncclGin net(*devComm, 0);
         ncclGinBarrierSession<ncclCoopCta> bar(ncclCoopCta(), net, ncclTeamTagWorld(), blockIdx.x);
         bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
     } else {
         maskAwareBarrier<kNumThreads>(
             threadId,
-            dcomm.rank,
-            dcomm,
+            devComm->rank,
             rankMask,
             syncBuffer,
             syncWindow,
             barrierSignalBase,
-            devComms,
+            devComm,
             timeoutCycles);
     }
 }
