@@ -8,28 +8,32 @@ import sys
 from pathlib import Path
 
 from Cython.Build import cythonize
-from setuptools import setup, Extension
-
+from setuptools import Extension, setup
 
 ROOT = Path(__file__).resolve().parent
 EP_PACKAGE = ROOT / "nccl" / "ep"
 M2N_PACKAGE = ROOT / "nccl" / "m2n"
+REQUIRE_NATIVE_LIBS = (
+    os.environ.get("NCCL_EXTENSIONS_REQUIRE_NATIVE_LIBS", "0") != "0"
+)
 
 
-def _warn_missing_staged_library(library: Path, package: str) -> None:
+def _check_staged_library(library: Path, package: str) -> None:
     if library.exists():
         return
-    print(
-        f"WARNING: {library} not found. The built wheel will not include the "
+    message = (
+        f"{library} not found. The built wheel will not include the "
         f"{package} shared library and will require a compatible external library "
         f"at runtime. Stage the library at that path before building the wheel "
-        f"to make it self-contained.",
-        file=sys.stderr,
+        f"to make it self-contained."
     )
+    if REQUIRE_NATIVE_LIBS:
+        raise SystemExit(f"Error: {message}")
+    print(f"WARNING: {message}", file=sys.stderr)
 
 
-_warn_missing_staged_library(EP_PACKAGE / "lib" / "libnccl_ep.so", "nccl.ep")
-_warn_missing_staged_library(M2N_PACKAGE / "lib" / "libnccl_m2n.so", "nccl.m2n")
+_check_staged_library(EP_PACKAGE / "lib" / "libnccl_ep.so", "nccl.ep")
+_check_staged_library(M2N_PACKAGE / "lib" / "libnccl_m2n.so", "nccl.m2n")
 
 
 CUDA_HOME = os.environ.get("CUDA_HOME")

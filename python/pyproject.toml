@@ -93,6 +93,19 @@ include = ["nccl._extensions*", "nccl.ep*", "nccl.m2n*"]
     "include/nccl_m2n.h",
 ]
 
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+skip = "*-musllinux_*"
+build-verbosity = 1
+
+[tool.cibuildwheel.linux]
+archs = ["native"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+# These libraries are supplied by the matching NCCL/CUDA runtime rather than
+# vendored into the nccl-extensions wheel.
+repair-wheel-command = "auditwheel repair --exclude libnccl.so.2 --exclude libcuda.so.1 --exclude libcudart.so.12 --exclude libcudart.so.13 -w {dest_dir} {wheel}"
+
 [tool.uv]
 conflicts = [
     [

@@ -118,7 +118,8 @@ endif
 # we may not have). -Xlinker skips nvcc's own file-type sniffing, which
 # rejects a versioned libnccl.so.<N> outright.
 LIB_LDFLAGS := -Xlinker $(NCCL_LIB_FILE) \
-               -L$(CUDA_HOME)/lib64 -lcudart -lcuda
+               -L$(CUDA_LIB) -lcudart \
+               $(CUDA_DRIVER_LDFLAGS) -lcuda
 M2N_LIB_LDFLAGS := $(LIB_LDFLAGS) -Xlinker -rpath -Xlinker '$$ORIGIN'
 
 # Benchmarks and tests link against libnccl_m2n.so + MPI (for bootstrap).

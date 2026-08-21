@@ -190,7 +190,9 @@ $(LIBTARGET): $(ALL_OBJ) $(DEVGLUE_OBJ) | $(NCCL_EP_JIT_HEADER_TARGETS)
 $(SOLIBTARGET): $(ALL_OBJ) $(DEVGLUE_OBJ) | $(NCCL_EP_JIT_HEADER_TARGETS)
 	@echo "Creating shared library $@"
 	@mkdir -p $(dir $@)
-	$(NVCC) -shared $(NVCC_GENCODE) -Xlinker -soname=$(SOLIBSONAME) -o $@ $^ -L$(NCCL_LIBDIR) -lnccl -lcuda $(LDFLAGS)
+	$(NVCC) -shared $(NVCC_GENCODE) -Xlinker -soname=$(SOLIBSONAME) \
+		-o $@ $^ -L$(NCCL_LIBDIR) -lnccl \
+		$(CUDA_DRIVER_LDFLAGS) -lcuda $(LDFLAGS)
 
 # Versioned-soname and unversioned symlinks (libnccl_ep.so.MAJOR, libnccl_ep.so).
 $(LIBDIR)/$(SOLIBSONAME): $(SOLIBTARGET)
