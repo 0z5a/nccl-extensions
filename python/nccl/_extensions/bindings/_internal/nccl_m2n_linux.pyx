@@ -9,6 +9,7 @@ import os
 import threading
 
 from cuda.pathfinder import load_nvidia_dynamic_lib
+from nccl._extensions._runtime import bundled_library
 from .utils import FunctionNotFoundError
 
 
@@ -37,9 +38,8 @@ def _candidate_library_paths() -> list[str]:
 
     # With no explicit override, prefer the native library bundled with this
     # facade before environment and SONAME fallbacks.
-    candidates = [os.path.normpath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "m2n", "lib", "libnccl_m2n.so"
-    ))]
+    bundled = bundled_library("nccl_m2n")
+    candidates = [bundled] if bundled is not None else []
 
     home = os.environ.get("NCCL_M2N_HOME")
     if home:

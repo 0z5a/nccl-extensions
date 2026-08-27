@@ -16,6 +16,24 @@ fi
 : "${CUDA_HOME:?CUDA_HOME must be set}"
 : "${NCCL_HOME:?NCCL_HOME must be set}"
 
+NVCC="${CUDA_HOME}/bin/nvcc"
+if [[ ! -x "${NVCC}" ]]; then
+    echo "ERROR: CUDA compiler is not executable: ${NVCC}" >&2
+    exit 1
+fi
+if ! NVCC_VERSION="$("${NVCC}" --version 2>&1)"; then
+    echo "ERROR: failed to run ${NVCC}" >&2
+    echo "${NVCC_VERSION}" >&2
+    exit 1
+fi
+if [[ "${NVCC_VERSION}" =~ release[[:space:]]+(12|13)\. ]]; then
+    CUDA_VARIANT="cu${BASH_REMATCH[1]}"
+else
+    echo "ERROR: expected CUDA 12 or 13 at ${CUDA_HOME}" >&2
+    echo "${NVCC_VERSION}" >&2
+    exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="$(cd "$1" && pwd)"
 PACKAGE_DIR="${ROOT}/python"
@@ -42,8 +60,9 @@ trap cleanup EXIT
 rm -rf "${DIST_DIR}"
 cleanup
 
-mkdir -p "${M2N_PACKAGE_DIR}/lib" "${M2N_PACKAGE_DIR}/include" "${DIST_DIR}"
-cp "${LIBRARY}" "${M2N_PACKAGE_DIR}/lib/libnccl_m2n.so"
+mkdir -p "${M2N_PACKAGE_DIR}/lib/${CUDA_VARIANT}" \
+    "${M2N_PACKAGE_DIR}/include" "${DIST_DIR}"
+cp "${LIBRARY}" "${M2N_PACKAGE_DIR}/lib/${CUDA_VARIANT}/libnccl_m2n.so"
 cp "${HEADER}" "${M2N_PACKAGE_DIR}/include/nccl_m2n.h"
 
 # The wheel build below Cython-compiles the checked-in generated sources for
@@ -70,14 +89,14 @@ SDIST="$(find "${DIST_DIR}" -maxdepth 1 -name '*.tar.gz' -print -quit)"
 test -n "${WHEEL}"
 test -n "${SDIST}"
 
-"${PYTHON}" - "${WHEEL}" <<'PY'
+"${PYTHON}" - "${WHEEL}" "${CUDA_VARIANT}" <<'PY'
 import sys
 import zipfile
 
 with zipfile.ZipFile(sys.argv[1]) as wheel:
     names = wheel.namelist()
     for expected in (
-        "nccl/m2n/lib/libnccl_m2n.so",
+        f"nccl/m2n/lib/{sys.argv[2]}/libnccl_m2n.so",
         "nccl/m2n/include/nccl_m2n.h",
     ):
         if expected not in names:
@@ -87,16 +106,20 @@ with zipfile.ZipFile(sys.argv[1]) as wheel:
         raise SystemExit("wheel metadata is missing the bench extra")
 PY
 tar -tzf "${SDIST}" | grep -E '/nccl/_extensions/bindings/(nccl_m2n|cynccl_m2n)\.pyx$'
-tar -tzf "${SDIST}" | grep -E '/nccl/m2n/include/nccl_m2n\.h$'
+if tar -tzf "${SDIST}" | grep -E '/nccl/(ep|m2n)/include/'; then
+    echo "ERROR: the source distribution contains staged native headers" >&2
+    exit 1
+fi
 if tar -tzf "${SDIST}" | grep -E '\.so$'; then
     echo "ERROR: the source distribution contains a shared library" >&2
     exit 1
 fi
 
 "${PYTHON}" -m venv "${VENV_DIR}"
-# Match the CUDA 12 build image and install the benchmark dependency through
-# the public extras, rather than relying on undeclared transitive packages.
-"${VENV_DIR}/bin/pip" install --disable-pip-version-check "${WHEEL}[cu12,bench]"
+# Match the build image's CUDA major and install the benchmark dependency
+# through the public extras, rather than relying on undeclared transitive packages.
+"${VENV_DIR}/bin/pip" install --disable-pip-version-check \
+    "${WHEEL}[${CUDA_VARIANT},bench]"
 LD_LIBRARY_PATH="${NCCL_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
     "${VENV_DIR}/bin/python" -c 'import nccl.m2n; from nccl._extensions.bindings import nccl_m2n'
 LD_LIBRARY_PATH="${NCCL_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \

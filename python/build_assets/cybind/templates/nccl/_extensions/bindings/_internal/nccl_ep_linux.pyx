@@ -7,6 +7,7 @@
 from .utils import FunctionNotFoundError, NotSupportedError
 
 import os
+from nccl._extensions._runtime import bundled_library
 
 
 cdef extern from "<dlfcn.h>" nogil:
@@ -30,23 +31,13 @@ cdef extern from "<dlfcn.h>" nogil:
 # located here instead of through cuda.pathfinder.
 ###############################################################################
 
-# The .so ships under this library's facade package (nccl_ep -> nccl/ep/lib),
-# so derive that directory from ${libname} rather than hardcoding it.
+# The matching CUDA variant ships under this library's facade package.
 # _resolve_library_path() runs on the first call that needs a symbol, not at
 # import; after that the generated init guard holds the resolved pointers.
-_PACKAGE_LIB_RELPATH = os.path.join(
-    "${libname}".removeprefix("nccl_"), "lib", "lib${libname}.so"
-)
-
-
 def _resolve_library_path() -> str:
-    # 1. nccl-extensions package path. lib${libname}.so is at nccl/<lib>/lib/;
-    #    this file lives in
-    #    nccl/_extensions/bindings/_internal/, so go up three dirs to reach nccl/.
-    pkg_lib = os.path.normpath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", _PACKAGE_LIB_RELPATH
-    ))
-    if os.path.exists(pkg_lib):
+    # 1. CUDA-specific nccl-extensions package path.
+    pkg_lib = bundled_library("${libname}")
+    if pkg_lib is not None:
         return pkg_lib
 
     # 2. CONDA_PREFIX/lib[64]

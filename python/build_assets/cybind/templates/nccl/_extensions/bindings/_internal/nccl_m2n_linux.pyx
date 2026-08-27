@@ -8,6 +8,7 @@ from .utils import FunctionNotFoundError, NotSupportedError
 
 import os
 
+from nccl._extensions._runtime import bundled_library
 
 cdef extern from "<dlfcn.h>" nogil:
     void* dlopen(const char*, int)
@@ -36,9 +37,8 @@ def _candidate_library_paths() -> list[str]:
 
     # With no explicit override, prefer the native library bundled with this
     # facade before environment and SONAME fallbacks.
-    candidates = [os.path.normpath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "m2n", "lib", "libnccl_m2n.so"
-    ))]
+    bundled = bundled_library("${libname}")
+    candidates = [bundled] if bundled is not None else []
 
     home = os.environ.get("NCCL_M2N_HOME")
     if home:

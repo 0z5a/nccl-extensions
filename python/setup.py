@@ -7,39 +7,52 @@ import os
 import sys
 from pathlib import Path
 
-from Cython.Build import cythonize
-from setuptools import setup, Extension
-
+from setuptools import Extension, setup
 
 ROOT = Path(__file__).resolve().parent
 EP_PACKAGE = ROOT / "nccl" / "ep"
 M2N_PACKAGE = ROOT / "nccl" / "m2n"
+BUILDING_SDIST = "sdist" in sys.argv
+REQUIRE_NATIVE_LIBS = (
+    os.environ.get("NCCL_EXTENSIONS_REQUIRE_NATIVE_LIBS", "0") != "0"
+)
 
 
-def _warn_missing_staged_library(library: Path, package: str) -> None:
-    if library.exists():
+def _check_staged_libraries(package_dir: Path, library: str, package: str) -> None:
+    variants = tuple(package_dir / "lib" / f"cu{major}" / library for major in (12, 13))
+    if REQUIRE_NATIVE_LIBS:
+        missing = [path for path in variants if not path.is_file()]
+        if not missing:
+            return
+        raise SystemExit(
+            "Error: Production wheels require both CUDA variants; missing: "
+            + ", ".join(str(path) for path in missing)
+        )
+    if any(path.is_file() for path in variants):
         return
-    print(
-        f"WARNING: {library} not found. The built wheel will not include the "
-        f"{package} shared library and will require a compatible external library "
-        f"at runtime. Stage the library at that path before building the wheel "
-        f"to make it self-contained.",
-        file=sys.stderr,
+    message = (
+        f"No CUDA variant of the {package} shared library was found under "
+        f"{package_dir / 'lib'}. The built wheel will require a compatible "
+        "external library at runtime."
     )
+    print(f"WARNING: {message}", file=sys.stderr)
 
 
-_warn_missing_staged_library(EP_PACKAGE / "lib" / "libnccl_ep.so", "nccl.ep")
-_warn_missing_staged_library(M2N_PACKAGE / "lib" / "libnccl_m2n.so", "nccl.m2n")
+if not BUILDING_SDIST:
+    from Cython.Build import cythonize
 
+    _check_staged_libraries(EP_PACKAGE, "libnccl_ep.so", "nccl.ep")
+    _check_staged_libraries(M2N_PACKAGE, "libnccl_m2n.so", "nccl.m2n")
 
-CUDA_HOME = os.environ.get("CUDA_HOME")
-if not CUDA_HOME:
-    raise SystemExit("Error: CUDA_HOME is not set")
-
-cuda_path = Path(CUDA_HOME)
-if not cuda_path.exists() or not cuda_path.is_dir():
-    raise SystemExit(f"Error: CUDA_HOME does not exist or is not a directory: {CUDA_HOME}")
-CUDA_INC = str(cuda_path / "include")
+    CUDA_HOME = os.environ.get("CUDA_HOME")
+    if not CUDA_HOME:
+        raise SystemExit("Error: CUDA_HOME is not set")
+    cuda_path = Path(CUDA_HOME)
+    if not cuda_path.exists() or not cuda_path.is_dir():
+        raise SystemExit(
+            f"Error: CUDA_HOME does not exist or is not a directory: {CUDA_HOME}"
+        )
+    CUDA_INC = str(cuda_path / "include")
 
 
 PACKAGE = "nccl._extensions.bindings"
@@ -76,25 +89,30 @@ def libname_extensions(libname: str) -> list[Extension]:
     ]
 
 
-pkg_dir = os.path.join(*PACKAGE.split("."))
-ext_modules = [
-    _ext(f"{PACKAGE}._internal.utils", os.path.join(pkg_dir, "_internal", "utils.pyx"))
-]
-for libname in LIBNAMES:
-    ext_modules.extend(libname_extensions(libname))
-compiler_directives = {
-    "embedsignature": True,
-    "show_performance_hints": True,
-    "freethreading_compatible": True,
-}
-
-setup(
-    ext_modules=cythonize(
+ext_modules = []
+if not BUILDING_SDIST:
+    pkg_dir = os.path.join(*PACKAGE.split("."))
+    ext_modules.append(
+        _ext(
+            f"{PACKAGE}._internal.utils",
+            os.path.join(pkg_dir, "_internal", "utils.pyx"),
+        )
+    )
+    for libname in LIBNAMES:
+        ext_modules.extend(libname_extensions(libname))
+    ext_modules = cythonize(
         ext_modules,
         verbose=True,
         language_level=3,
-        compiler_directives=compiler_directives,
-    ),
+        compiler_directives={
+            "embedsignature": True,
+            "show_performance_hints": True,
+            "freethreading_compatible": True,
+        },
+    )
+
+setup(
+    ext_modules=ext_modules,
     zip_safe=False,
     options={"build_ext": {"inplace": False}},
 )

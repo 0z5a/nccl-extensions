@@ -45,6 +45,8 @@ nccl_m2n.%:
 		BUILDDIR=$(ABS_NCCL_M2N_BUILDDIR)
 
 nccl-submodule:
-	git -C $(REPO_ROOT) submodule update --init third_party/nccl
+	@if [ ! -e "$(NCCL_SUBMODULE_HOME)/.git" ]; then \
+		git -C "$(REPO_ROOT)" submodule update --init third_party/nccl; \
+	fi
 	$(MAKE) -C $(NCCL_SUBMODULE_HOME) -j src.build \
 		BUILDDIR=$(ABS_NCCL_BUILDDIR)

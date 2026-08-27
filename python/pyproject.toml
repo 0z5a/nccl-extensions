@@ -67,6 +67,9 @@ issues = "https://github.com/NVIDIA/nccl-extensions/issues"
 [tool.setuptools]
 include-package-data = false
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.dynamic]
 version = { attr = "nccl._extensions._version.__version__" }
 
@@ -82,16 +85,31 @@ include = ["nccl._extensions*", "nccl.ep*", "nccl.m2n*"]
 [tool.setuptools.package-data]
 "nccl._extensions.bindings" = ["cynccl_*.pxd", "nccl_*.pxd"]
 "nccl.ep" = [
-    "lib/libnccl_ep.so",
+    "lib/cu12/libnccl_ep.so",
+    "lib/cu13/libnccl_ep.so",
     "include/*.h",
     "include/nccl_ep/*.h",
     "include/nccl_ep/*.hpp",
     "include/nccl_ep/device/*.cuh",
 ]
 "nccl.m2n" = [
-    "lib/libnccl_m2n.so",
+    "lib/cu12/libnccl_m2n.so",
+    "lib/cu13/libnccl_m2n.so",
     "include/nccl_m2n.h",
 ]
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+skip = "*-musllinux_*"
+build-verbosity = 1
+
+[tool.cibuildwheel.linux]
+archs = ["native"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+# These libraries are supplied by the matching NCCL/CUDA runtime rather than
+# vendored into the nccl-extensions wheel.
+repair-wheel-command = "auditwheel repair --exclude libnccl.so.2 --exclude libcuda.so.1 -w {dest_dir} {wheel}"
 
 [tool.uv]
 conflicts = [

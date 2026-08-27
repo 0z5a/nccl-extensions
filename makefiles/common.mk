@@ -43,6 +43,14 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 
 CUDA_LIB ?= $(CUDA_HOME)/lib64
 CUDA_INC ?= $(CUDA_HOME)/include
+# Use the toolkit's driver stub for linking when available. This adds no
+# runtime search path; deployed binaries still load the real libcuda.so.1.
+# Override CUDA_DRIVER_LIBDIR for a non-standard CUDA layout.
+CUDA_DRIVER_LIBDIR ?= $(patsubst %/,%,$(dir $(firstword $(wildcard \
+    $(CUDA_HOME)/lib64/stubs/libcuda.so \
+    $(CUDA_HOME)/lib/stubs/libcuda.so \
+    $(CUDA_HOME)/targets/*/lib/stubs/libcuda.so))))
+CUDA_DRIVER_LDFLAGS := $(if $(CUDA_DRIVER_LIBDIR),-L$(CUDA_DRIVER_LIBDIR))
 CUDA_VERSION = $(strip $(shell which $(NVCC) >/dev/null && $(NVCC) --version | grep release | sed 's/.*release //' | sed 's/\,.*//'))
 #CUDA_VERSION ?= $(shell ls $(CUDA_LIB)/libcudart.so.* | head -1 | rev | cut -d "." -f -2 | rev)
 CUDA_MAJOR = $(shell echo $(CUDA_VERSION) | cut -d "." -f 1)
