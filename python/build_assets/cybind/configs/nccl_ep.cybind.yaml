@@ -2,7 +2,7 @@ nccl_ep:
   module: nccl._extensions.bindings.nccl_ep
   data:
     versions:
-    - - 0.1.0
+    - - 0.2.0
     headers:
     - nccl_ep.h
     patterns:
@@ -181,7 +181,4 @@ nccl_ep:
   attrs: {}
   enums:
     ^nccl: ''
-    ^NCCL_EP_TENSOR_FLAG_: ''
     ^ALGO_: ''
-    ^LAYOUT_: ''
-    ^TENSOR_TAG_: ''

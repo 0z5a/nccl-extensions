@@ -4,6 +4,8 @@
 #
 # This code was automatically generated $version_span. Do not modify it directly.
 
+$external_imports
+
 
 ###############################################################################
 # Types (structs, enums, ...)
@@ -21,6 +23,7 @@ cdef extern from *:
     #include <cuComplex.h>
     """
     ctypedef void* cudaStream_t 'cudaStream_t'
+    ctypedef int cudaError_t 'cudaError_t'
 
 
 $type_decls
