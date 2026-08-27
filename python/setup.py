@@ -7,12 +7,12 @@ import os
 import sys
 from pathlib import Path
 
-from Cython.Build import cythonize
 from setuptools import Extension, setup
 
 ROOT = Path(__file__).resolve().parent
 EP_PACKAGE = ROOT / "nccl" / "ep"
 M2N_PACKAGE = ROOT / "nccl" / "m2n"
+BUILDING_SDIST = "sdist" in sys.argv
 REQUIRE_NATIVE_LIBS = (
     os.environ.get("NCCL_EXTENSIONS_REQUIRE_NATIVE_LIBS", "0") != "0"
 )
@@ -38,18 +38,21 @@ def _check_staged_libraries(package_dir: Path, library: str, package: str) -> No
     print(f"WARNING: {message}", file=sys.stderr)
 
 
-_check_staged_libraries(EP_PACKAGE, "libnccl_ep.so", "nccl.ep")
-_check_staged_libraries(M2N_PACKAGE, "libnccl_m2n.so", "nccl.m2n")
+if not BUILDING_SDIST:
+    from Cython.Build import cythonize
 
+    _check_staged_libraries(EP_PACKAGE, "libnccl_ep.so", "nccl.ep")
+    _check_staged_libraries(M2N_PACKAGE, "libnccl_m2n.so", "nccl.m2n")
 
-CUDA_HOME = os.environ.get("CUDA_HOME")
-if not CUDA_HOME:
-    raise SystemExit("Error: CUDA_HOME is not set")
-
-cuda_path = Path(CUDA_HOME)
-if not cuda_path.exists() or not cuda_path.is_dir():
-    raise SystemExit(f"Error: CUDA_HOME does not exist or is not a directory: {CUDA_HOME}")
-CUDA_INC = str(cuda_path / "include")
+    CUDA_HOME = os.environ.get("CUDA_HOME")
+    if not CUDA_HOME:
+        raise SystemExit("Error: CUDA_HOME is not set")
+    cuda_path = Path(CUDA_HOME)
+    if not cuda_path.exists() or not cuda_path.is_dir():
+        raise SystemExit(
+            f"Error: CUDA_HOME does not exist or is not a directory: {CUDA_HOME}"
+        )
+    CUDA_INC = str(cuda_path / "include")
 
 
 PACKAGE = "nccl._extensions.bindings"
@@ -86,25 +89,30 @@ def libname_extensions(libname: str) -> list[Extension]:
     ]
 
 
-pkg_dir = os.path.join(*PACKAGE.split("."))
-ext_modules = [
-    _ext(f"{PACKAGE}._internal.utils", os.path.join(pkg_dir, "_internal", "utils.pyx"))
-]
-for libname in LIBNAMES:
-    ext_modules.extend(libname_extensions(libname))
-compiler_directives = {
-    "embedsignature": True,
-    "show_performance_hints": True,
-    "freethreading_compatible": True,
-}
-
-setup(
-    ext_modules=cythonize(
+ext_modules = []
+if not BUILDING_SDIST:
+    pkg_dir = os.path.join(*PACKAGE.split("."))
+    ext_modules.append(
+        _ext(
+            f"{PACKAGE}._internal.utils",
+            os.path.join(pkg_dir, "_internal", "utils.pyx"),
+        )
+    )
+    for libname in LIBNAMES:
+        ext_modules.extend(libname_extensions(libname))
+    ext_modules = cythonize(
         ext_modules,
         verbose=True,
         language_level=3,
-        compiler_directives=compiler_directives,
-    ),
+        compiler_directives={
+            "embedsignature": True,
+            "show_performance_hints": True,
+            "freethreading_compatible": True,
+        },
+    )
+
+setup(
+    ext_modules=ext_modules,
     zip_safe=False,
     options={"build_ext": {"inplace": False}},
 )

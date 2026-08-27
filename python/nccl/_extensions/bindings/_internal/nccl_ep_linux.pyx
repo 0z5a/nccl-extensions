@@ -55,15 +55,9 @@ cdef object _cyb_symbol_lock = _cyb_threading.Lock()
 
 from .utils import FunctionNotFoundError, NotSupportedError
 
-from cuda.pathfinder import load_nvidia_dynamic_lib
+import os
 from nccl._extensions._runtime import bundled_library
 
-
-###############################################################################
-# Extern
-###############################################################################
-
-# You must 'from .utils import NotSupportedError' before using this template
 
 cdef extern from "<dlfcn.h>" nogil:
     void* dlopen(const char*, int)
