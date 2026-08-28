@@ -131,5 +131,6 @@ python -m nccl.m2n.benchmarks.reshard_bench --help
 ## Native library loading
 
 The M2N loader uses `NCCL_M2N_LIBRARY` when supplied. Otherwise, it prefers the
-bundled `nccl/m2n/lib/libnccl_m2n.so` and retains the existing `NCCL_M2N_HOME`,
-Conda, CUDA, and SONAME fallbacks.
+bundled `nccl/m2n/lib/cu12` or `lib/cu13` library selected by the installed
+`cuda.bindings` major, and retains the existing `NCCL_M2N_HOME`, Conda, CUDA,
+and SONAME fallbacks.

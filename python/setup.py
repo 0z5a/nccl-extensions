@@ -18,22 +18,28 @@ REQUIRE_NATIVE_LIBS = (
 )
 
 
-def _check_staged_library(library: Path, package: str) -> None:
-    if library.exists():
+def _check_staged_libraries(package_dir: Path, library: str, package: str) -> None:
+    variants = tuple(package_dir / "lib" / f"cu{major}" / library for major in (12, 13))
+    if REQUIRE_NATIVE_LIBS:
+        missing = [path for path in variants if not path.is_file()]
+        if not missing:
+            return
+        raise SystemExit(
+            "Error: Production wheels require both CUDA variants; missing: "
+            + ", ".join(str(path) for path in missing)
+        )
+    if any(path.is_file() for path in variants):
         return
     message = (
-        f"{library} not found. The built wheel will not include the "
-        f"{package} shared library and will require a compatible external library "
-        f"at runtime. Stage the library at that path before building the wheel "
-        f"to make it self-contained."
+        f"No CUDA variant of the {package} shared library was found under "
+        f"{package_dir / 'lib'}. The built wheel will require a compatible "
+        "external library at runtime."
     )
-    if REQUIRE_NATIVE_LIBS:
-        raise SystemExit(f"Error: {message}")
     print(f"WARNING: {message}", file=sys.stderr)
 
 
-_check_staged_library(EP_PACKAGE / "lib" / "libnccl_ep.so", "nccl.ep")
-_check_staged_library(M2N_PACKAGE / "lib" / "libnccl_m2n.so", "nccl.m2n")
+_check_staged_libraries(EP_PACKAGE, "libnccl_ep.so", "nccl.ep")
+_check_staged_libraries(M2N_PACKAGE, "libnccl_m2n.so", "nccl.m2n")
 
 
 CUDA_HOME = os.environ.get("CUDA_HOME")

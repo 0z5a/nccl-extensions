@@ -55,8 +55,15 @@ cdef object _cyb_symbol_lock = _cyb_threading.Lock()
 
 from .utils import FunctionNotFoundError, NotSupportedError
 
-import os
+from cuda.pathfinder import load_nvidia_dynamic_lib
+from nccl._extensions._runtime import bundled_library
 
+
+###############################################################################
+# Extern
+###############################################################################
+
+# You must 'from .utils import NotSupportedError' before using this template
 
 cdef extern from "<dlfcn.h>" nogil:
     void* dlopen(const char*, int)
@@ -79,23 +86,14 @@ cdef extern from "<dlfcn.h>" nogil:
 # located here instead of through cuda.pathfinder.
 ###############################################################################
 
-# The .so ships under this library's facade package (nccl_ep -> nccl/ep/lib),
-# so derive that directory from nccl_ep rather than hardcoding it.
-# _resolve_library_path() runs on the first call that needs a symbol, not at
-# import; after that the generated init guard holds the resolved pointers.
-_PACKAGE_LIB_RELPATH = os.path.join(
-    "nccl_ep".removeprefix("nccl_"), "lib", "libnccl_ep.so"
-)
-
-
+# Resolved at first import via _resolve_library_path() below. Path lookup runs
+# once, then dlopen handle is cached in the lowpp nccl_ep init guard.
+#
 def _resolve_library_path() -> str:
-    # 1. nccl-extensions package path. libnccl_ep.so is at nccl/<lib>/lib/;
-    #    this file lives in
-    #    nccl/_extensions/bindings/_internal/, so go up three dirs to reach nccl/.
-    pkg_lib = os.path.normpath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", _PACKAGE_LIB_RELPATH
-    ))
-    if os.path.exists(pkg_lib):
+    # 1. nccl-extensions package path (replaces cuda.pathfinder's
+    #    NVIDIA-pip-wheel step).
+    pkg_lib = bundled_library("nccl_ep")
+    if pkg_lib is not None:
         return pkg_lib
 
     # 2. CONDA_PREFIX/lib[64]

@@ -18,8 +18,8 @@ It contributes exactly three directories to that namespace, and no
 
 | path | contents |
 | --- | --- |
-| `nccl/ep/` | public facade for nccl_ep, plus `lib/libnccl_ep.so` and headers |
-| `nccl/m2n/` | public facade for NCCL M2N, plus `lib/libnccl_m2n.so` and headers. See the [M2N Python guide](nccl/m2n/README.md) for API usage and examples. |
+| `nccl/ep/` | public facade for nccl_ep, plus CUDA-specific native libraries and headers |
+| `nccl/m2n/` | public facade for NCCL M2N, plus CUDA-specific native libraries and headers. See the [M2N Python guide](nccl/m2n/README.md) for API usage and examples. |
 | `nccl/_extensions/` | internals shared by every extension library — the Cython bindings, `binding_dataclass`, the distribution version |
 
 ## Install
@@ -33,9 +33,9 @@ Building requires a CUDA toolkit and a Cython toolchain.
 Stage native artifacts before building a distributable wheel:
 
 ```text
-python/nccl/ep/lib/libnccl_ep.so
+python/nccl/ep/lib/cu{12,13}/libnccl_ep.so
 python/nccl/ep/include/**
-python/nccl/m2n/lib/libnccl_m2n.so
+python/nccl/m2n/lib/cu{12,13}/libnccl_m2n.so
 python/nccl/m2n/include/**
 ```
 
@@ -60,6 +60,11 @@ to nccl4py's `cu12` / `cu13` extras, and are mutually exclusive):
 ```bash
 pip install -e 'python/[cu13]'
 ```
+
+At runtime, the installed `cuda.bindings` major selects the matching bundled
+`lib/cu12` or `lib/cu13` native libraries. NCCL EP compiles kernels at runtime
+with `NCCL_EP_JIT_NVCC`, `NVCC`, or the compiler under `CUDA_HOME`; that compiler
+and its headers must match the selected CUDA major.
 
 > **Do not run Python from inside `python/`.** There is no `nccl/__init__.py`
 > there, so that directory resolves only as a namespace portion and these
