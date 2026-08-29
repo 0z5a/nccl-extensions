@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,7 +167,11 @@ static void ep_parse_args(int argc, char* argv[], const char* uid_suffix) {
     }
 }
 
-// Returns false if the test binary should exit (wrong device / too few ranks).
+// Returns false ONLY when the test should be skipped because this environment
+// cannot run it (e.g. pre-SM_90 hardware). Callers map a false return to
+// exit(0), so every genuine failure must exit non-zero here rather than return
+// -- otherwise a broken NCCL bootstrap reports as a passing suite. This matches
+// ep_parse_args above, which already exits directly on a bad command line.
 static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     ep_parse_args(argc, argv, uid_suffix);
     ::testing::InitGoogleTest(&argc, argv);
@@ -180,9 +185,13 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
         if (g_rank == 0) printf("SKIP: SM_90+ required (this device is SM_%d0)\n", major);
         return false;
     }
+    // An insufficient world size is a launch error, not an environment
+    // limitation. Callers map a false return to exit(0), so returning false
+    // here would report a pass while running no distributed coverage at all.
+    // Exit non-zero instead; no NCCL resources exist yet to tear down.
     if (g_nranks < 2) {
-        if (g_rank == 0) printf("SKIP: at least 2 ranks required\n");
-        return false;
+        fprintf(stderr, "FATAL: at least 2 ranks required, got %d\n", g_nranks);
+        exit(EXIT_FAILURE);
     }
 
     ncclUniqueId uid{};
@@ -196,7 +205,7 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
             "that the loopback interface is reachable.\n",
             g_rank,
             comm_ret);
-        return false;
+        exit(EXIT_FAILURE);
     }
     cudaStreamCreate(&g_stream);
 
@@ -212,7 +221,7 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     ncclResult_t grp_ret = ncclEpCreateGroup(&g_ep_group, g_comm, &gcfg);
     if (grp_ret != ncclSuccess) {
         fprintf(stderr, "Rank %d: ncclEpCreateGroup failed (err=%d).\n", g_rank, grp_ret);
-        return false;
+        exit(EXIT_FAILURE);
     }
 
     // Expert-major group (same config; layout is per-handle, not per-group)
@@ -220,7 +229,7 @@ static bool ep_bootstrap(int argc, char* argv[], const char* uid_suffix) {
     grp_ret = ncclEpCreateGroup(&g_ep_group_em, g_comm, &gcfg_em);
     if (grp_ret != ncclSuccess) {
         fprintf(stderr, "Rank %d: ncclEpCreateGroup (expert-major) failed (err=%d).\n", g_rank, grp_ret);
-        return false;
+        exit(EXIT_FAILURE);
     }
 
     cudaStreamSynchronize(g_stream);

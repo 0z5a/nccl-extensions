@@ -246,16 +246,17 @@ static bool elastic_bootstrap(int argc, char* argv[]) {
         if (g_rank == 0) printf("SKIP: SM_90+ required (this device is SM_%d0)\n", major);
         return false;
     }
+    // Launch error, not an environment limitation -- see test_common.h.
     if (g_nranks < 2) {
-        if (g_rank == 0) printf("SKIP: at least 2 ranks required\n");
-        return false;
+        fprintf(stderr, "FATAL: at least 2 ranks required, got %d\n", g_nranks);
+        exit(EXIT_FAILURE);
     }
 
     ncclUniqueId uid{};
     exchange_uid(&uid);
     if (ncclCommInitRank(&g_comm, g_nranks, uid, g_rank) != ncclSuccess) {
         fprintf(stderr, "Rank %d: ncclCommInitRank failed\n", g_rank);
-        return false;
+        exit(EXIT_FAILURE);
     }
     cudaStreamCreate(&g_stream);
 
@@ -270,7 +271,7 @@ static bool elastic_bootstrap(int argc, char* argv[]) {
     gcfg.max_recv_tokens_per_rank     = kXbRecv;
     if (ncclEpCreateGroup(&g_elastic_group, g_comm, &gcfg) != ncclSuccess) {
         fprintf(stderr, "Rank %d: ncclEpCreateGroup failed\n", g_rank);
-        return false;
+        exit(EXIT_FAILURE);
     }
     cudaStreamSynchronize(g_stream);
     return true;

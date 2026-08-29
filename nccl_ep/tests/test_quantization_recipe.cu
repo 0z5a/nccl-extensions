@@ -564,7 +564,7 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchPreservesPackedFp4Bytes) {
 static void run_ht_expert_major_scales_forward_packed_fp4(
     bool windowed_outputs,
     ncclEpZeroCopyMode_t zero_copy_mode) {
-    if (g_nranks != 4) GTEST_SKIP() << "requires exactly four ranks";
+    if (g_nranks != 4) FAIL() << "requires exactly four ranks, got " << g_nranks;
 
     constexpr int kHtTokens = 16;
     constexpr int kTopK2 = 2;
@@ -819,7 +819,7 @@ TEST_F(QuantizationRecipeTest, HtExpertMajorScalesForwardWindowedAutoPreservesPa
 // must accept recv token and scale buffers sized to the per-step recv count, which is
 // below the worst-case max_recv_tokens budget.
 static void run_ht_em_scales_forward_eager_below_budget() {
-    if (g_nranks != 4) GTEST_SKIP() << "requires exactly four ranks";
+    if (g_nranks != 4) FAIL() << "requires exactly four ranks, got " << g_nranks;
 
     constexpr int kHtTokens = 16;
     constexpr int kTopK2 = 2;
@@ -950,7 +950,7 @@ TEST_F(QuantizationRecipeTest, HtExpertMajorScalesForwardEagerAcceptsBelowBudget
 // otherwise the empty caller buffer pairs with the non-empty internal FLAT scale
 // staging and trips the launcher's scale-pairing assert.
 static void run_ht_em_scales_forward_eager_zero_recv() {
-    if (g_nranks != 4) GTEST_SKIP() << "requires exactly four ranks";
+    if (g_nranks != 4) FAIL() << "requires exactly four ranks, got " << g_nranks;
 
     constexpr int kHtTokens = 16;
     constexpr int kTopK1 = 1;
