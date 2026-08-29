@@ -113,6 +113,38 @@ for entry in "${SUITES[@]}"; do
     run_suite "${bin}" "${desc}"
 done
 
+# LL epoch-ring regression suites. These need an exact world size rather than
+# one rank per GPU, so they are invoked here instead of from SUITES above:
+#
+#   test_ll_epoch_protocol  single process, no NCCL; checks the epoch state
+#                           machine (bank parity, staged send/recv, rollover).
+#   test_ll_group_epoch     two LL handles on one group; self-skips unless the
+#                           world size is exactly 4. A skip exits 0, so running
+#                           it at NUM_GPUS != 4 would report a pass without
+#                           testing anything -- pin the rank count instead.
+#
+# Both are LL-only, so they are not re-run under the HT-EM modes below.
+run_fixed_rank_suite() {
+    local BINARY="$1"
+    local SUITE_NAME="$2"
+    local RANKS="$3"
+
+    [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${BINARY}" ]] || return 0
+    if (( NUM_GPUS < RANKS )); then
+        echo "${SUITE_NAME}: requires exactly ${RANKS} ranks, only ${NUM_GPUS} GPUs available. Skipping."
+        return 0
+    fi
+
+    # run_suite spawns one rank per NUM_GPUS; scope the override to this call.
+    local SAVED_NUM_GPUS="${NUM_GPUS}"
+    NUM_GPUS="${RANKS}"
+    run_suite "${BINARY}" "${SUITE_NAME} (${RANKS} ranks)" "${RANKS}"
+    NUM_GPUS="${SAVED_NUM_GPUS}"
+}
+
+run_fixed_rank_suite test_ll_epoch_protocol "EP LL Epoch Protocol Tests" 1
+run_fixed_rank_suite test_ll_group_epoch    "EP LL Group Epoch Tests"    4
+
 for mode in LOCAL_DUP NVLINK_DUP; do
     label="$( [[ ${mode} == LOCAL_DUP ]] && echo 'Local Fanout' || echo 'NVLink Dup' )"
     export "NCCL_EP_HT_EM_${mode}=1"

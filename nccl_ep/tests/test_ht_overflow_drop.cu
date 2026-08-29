@@ -453,8 +453,9 @@ TEST_F(HtOverflowDropTest, EmDispatchCombineContinueOnOverflow) {
 // with 8 real rows; expert 1's zone is clamped away and all 8 of its assignments
 // (em slots 16..23) must be dropped -- pre-fix these were the OOB writes.
 TEST_F(HtOverflowDropTest, EmLocalPermuteAlignedDropNoOob) {
+    // Wrong world size is a launch error, not an environment limitation.
     if (g_nranks != 4) {
-        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+        FAIL() << "requires exactly 4 ranks (8 experts -> 2 per rank), got " << g_nranks;
     }
     constexpr unsigned int kCap = 16;       // recv capacity; multiple of kAlign
     constexpr int kAlign = 16;              // per-expert zone alignment
@@ -684,8 +685,9 @@ TEST_F(HtOverflowDropTest, EmLocalPermuteAlignedDropNoOob) {
 // rows 4..7 are phantom and must read back zero. Expert 1's zone is clamped
 // away; ranks 2-3 are fully dropped and must combine back zeros.
 TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed) {
+    // Wrong world size is a launch error, not an environment limitation.
     if (g_nranks != 4) {
-        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+        FAIL() << "requires exactly 4 ranks (8 experts -> 2 per rank), got " << g_nranks;
     }
     constexpr unsigned int kCap = 8;
     constexpr int kAlign = 4;
