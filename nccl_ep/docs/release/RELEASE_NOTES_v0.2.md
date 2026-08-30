@@ -209,20 +209,6 @@ Internal changes with no API impact, but worth knowing.
 
 ## Known Limitations
 
-### LL: one handle per group
-
-LL has a single double-buffered RDMA allocation per **group**, but the bank selector is
-per-handle and is host-advanced on each dispatch or combine. Two handles on the same group
-therefore compute identical offsets into the same two banks while advancing independent
-parities. This causes data corruption due to a cross-rank race condition.
-
-CUDA-graph capture has the same ownership problem in a different form: capture bakes a
-host-selected bank parity into the graph, and replay does not advance the selector.
-
-**Use one LL handle per group, and do not capture LL dispatch or combine into a CUDA graph.**
-A fix that moves bank selection to group-owned state is available on the development branch and
-is targeted at a following release.
-
 ### HT: at most 33 RDMA domains
 
 The HT combine path parallelizes its RDMA transfers across LSA teams within a single warp pass,
