@@ -388,10 +388,10 @@ ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBu
   ncclWindow_t windowA = nullptr, windowB = nullptr;
   ncclDevComm devCommA, devCommB;
   ReshardDevCommUse devCommAUse, devCommBUse;
-  SUW_NCCLCHECK(reshardSplitEnsureResources(sc, stagingBuffer, stagingCapacity, numCtas, ginSignalCountA,
-                                            /*ginCounterCountA=*/0, signalsPerSlotB, /*countersPerSlotB=*/0,
-                                            ctxPerSlotB, maxConcurrency, stream, &windowA, &windowB, &devCommA,
-                                            &devCommAUse, &devCommB, &devCommBUse));
+  SUW_NCCLCHECK(reshardSplitEnsureResources(
+    sc, stagingBuffer, stagingCapacity, numCtas, RESHARD_DEVCOMM_BARRIER_HYBRID, ginSignalCountA,
+    /*ginCounterCountA=*/0, signalsPerSlotB, /*countersPerSlotB=*/0, ctxPerSlotB, maxConcurrency, stream, &windowA,
+    &windowB, &devCommA, &devCommAUse, &devCommB, &devCommBUse));
 
   ncclReshardParamsSplit sp;
   buildSplitReshardParams(baseParams, sc, numCtas, windowA, windowB, &sp);
