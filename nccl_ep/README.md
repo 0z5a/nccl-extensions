@@ -6,13 +6,13 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 
 # Maintainers
 
-| GitHub | Areas |
-|--------|------|
-| @artpol84 | APIs, new features, layouts |
-| @kwen2501 | APIs, integration |
-| @sb17v | Kernels, build systems |
-| @nv-lschneider | Kernels, mnnvl |
-| @kgioioso | GIN, NCCL |
+| GitHub         | Areas                       |
+|----------------|-----------------------------|
+| @artpol84      | APIs, new features, layouts |
+| @kwen2501      | APIs, integration           |
+| @sb17v         | Kernels, build systems      |
+| @nv-lschneider | Kernels, mnnvl              |
+| @kgioioso      | GIN, NCCL                   |
 
 # Table of Contents
 
@@ -144,16 +144,39 @@ For quantization recipes, tensor contracts, and `max_token_bytes` sizing, see
 [Quantization](docs/documentation/quantization.md).
 
 
-#### LL mode (same data type)
+#### LL mode, expert-major layout (same data type)
 
-| Operation | Struct             | Field             | Dims             |
-|:---------:|:-------------------|:------------------|:----------------:|
-| Dispatch  | dispatch_inputs    | tokens            | [B x H]          |
-|           | dispatch_outputs   | tokens            | [L x (R*B) x H]  |
-|           | layout_info        | expert_counters   | [L]              |
-| Combine   | combine_inputs     | tokens            | [L x (R*B) x H]  |
-|           | combine_outputs    | tokens            | [B x H]          |
-|           | combine_outputs    | topk_weights      | [B x K]          |
+| Operation | Struct           | Field           | Dims              |
+|:---------:|:-----------------|:----------------|:-----------------:|
+| Dispatch  | dispatch_inputs  | tokens          | [B x H]           |
+|           | dispatch_outputs | tokens          | [L x (R x B) x H] |
+|           | layout_info      | expert_counters | [L]               |
+| Combine   | combine_inputs   | tokens          | [L x (R x B) x H] |
+|           | combine_outputs  | tokens          | [B x H]           |
+|           | combine_outputs  | topk_weights    | [B x K]           |
+
+The combine kernel applies the per-token routing weights on the receive side, so
+`combine_outputs.topk_weights` is required.
+
+#### LL mode, rank-major layout (same data type)
+
+Tokens arrive grouped by source rank with no expert dimension, so dispatch also
+returns per-slot routing metadata and the caller pre-reduces across local experts
+before combine.
+
+| Operation | Struct           | Field             | Dims        |
+|:---------:|:-----------------|:------------------|:-----------:|
+| Dispatch  | dispatch_inputs  | tokens            | [B x H]     |
+|           | dispatch_inputs  | topk_weights      | [B x K]     |
+|           | dispatch_outputs | tokens            | [R x B x H] |
+|           | dispatch_outputs | topk_weights      | [R x B x K] |
+|           | dispatch_outputs | topk_idx          | [R x B x K] |
+|           | layout_info      | src_rank_counters | [R]         |
+| Combine   | combine_inputs   | tokens            | [R x B x H] |
+|           | combine_outputs  | tokens            | [B x H]     |
+
+Note `src_rank_counters`, not `expert_counters`. The caller applies the weights
+during its own pre-reduction, so `combine_outputs.topk_weights` is left unset.
 
 
 #### HT mode (same data type)
@@ -164,9 +187,9 @@ With `NCCL_EP_LAYOUT_EXPERT_MAJOR`, dispatch output is grouped by local expert, 
 
 **Handle creation**
 
-| Operation | Struct        | Field           | Dims |
-|-----------|:--------------|:----------------|:----:|
-| Create    | layout_info   | expert_counters | [L]  |
+| Operation | Struct      | Field           | Dims |
+|-----------|:------------|:----------------|:----:|
+| Create    | layout_info | expert_counters | [L]  |
 
 
 **Forward pass**
@@ -174,15 +197,15 @@ With `NCCL_EP_LAYOUT_EXPERT_MAJOR`, dispatch output is grouped by local expert, 
 `topk_idx` is supplied once via `ncclEpCreateHandle` (or refreshed via
 `ncclEpUpdateHandle`) and cached on the handle; subsequent dispatches reuse it.
 
-| Operation | Struct             | Field             | Dims       |
-|:---------:|:-------------------|:------------------|:----------:|
-| Dispatch  | dispatch_inputs    | tokens            | [B x H]    |
-|           | dispatch_inputs    | topk_weights      | [B x K]    |
-|           | dispatch_outputs   | tokens            | [N(r) x H] |
-|           | dispatch_outputs   | topk_weights      | [N(r) x K] |
-|           | dispatch_outputs   | topk_idx          | [N(r) x K] |
-| Combine   | combine_inputs     | tokens            | [N(r) x H] |
-|           | combine_outputs    | tokens            | [B x H]    |
+| Operation | Struct           | Field        | Dims       |
+|:---------:|:-----------------|:-------------|:----------:|
+| Dispatch  | dispatch_inputs  | tokens       | [B x H]    |
+|           | dispatch_inputs  | topk_weights | [B x K]    |
+|           | dispatch_outputs | tokens       | [N(r) x H] |
+|           | dispatch_outputs | topk_weights | [N(r) x K] |
+|           | dispatch_outputs | topk_idx     | [N(r) x K] |
+| Combine   | combine_inputs   | tokens       | [N(r) x H] |
+|           | combine_outputs  | tokens       | [B x H]    |
 
 **Backward pass**
 
@@ -190,17 +213,17 @@ Compared to the Forward pass, the Backward pass requires per-token routing
 weights to be passed as `combine_inputs.topk_weights` and returned via
 `combine_outputs.topk_weights`.
 
-| Operation | Struct             | Field             | Dims       |
-|:---------:|:-------------------|:------------------|:----------:|
-| Dispatch  | dispatch_inputs    | tokens            | [B x H]    |
-|           | dispatch_inputs    | topk_weights      | [B x K]    |
-|           | dispatch_outputs   | tokens            | [N(r) x H] |
-|           | dispatch_outputs   | topk_weights      | [N(r) x K] |
-|           | dispatch_outputs   | topk_idx          | [N(r) x K] |
-| Combine   | combine_inputs     | tokens            | [N(r) x H] |
-|           | combine_inputs     | **topk_weights**  | [N(r) x K] |
-|           | combine_outputs    | tokens            | [B x H]    |
-|           | combine_outputs    | **topk_weights**  | [B x K]    |
+| Operation | Struct           | Field            | Dims       |
+|:---------:|:-----------------|:-----------------|:----------:|
+| Dispatch  | dispatch_inputs  | tokens           | [B x H]    |
+|           | dispatch_inputs  | topk_weights     | [B x K]    |
+|           | dispatch_outputs | tokens           | [N(r) x H] |
+|           | dispatch_outputs | topk_weights     | [N(r) x K] |
+|           | dispatch_outputs | topk_idx         | [N(r) x K] |
+| Combine   | combine_inputs   | tokens           | [N(r) x H] |
+|           | combine_inputs   | **topk_weights** | [N(r) x K] |
+|           | combine_outputs  | tokens           | [B x H]    |
+|           | combine_outputs  | **topk_weights** | [B x K]    |
 
 
 # Usage
@@ -209,12 +232,12 @@ weights to be passed as `combine_inputs.topk_weights` and returned via
 
 ### Dependencies
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| CUDA | 13+ | Required |
-| NCCL | 2.29+ | With Device API and GIN support |
-| MPI | Any (OpenMPI, MPICH, etc.) | Required for multi-process launch |
-| GPU | Hopper (H100) or Blackwell | Tested configurations |
+| Component | Version                    | Notes                             |
+|-----------|----------------------------|-----------------------------------|
+| CUDA      | 13+                        | Required                          |
+| NCCL      | 2.29+                      | With Device API and GIN support   |
+| MPI       | Any (OpenMPI, MPICH, etc.) | Required for multi-process launch |
+| GPU       | Hopper (H100) or Blackwell | Tested configurations             |
 
 ### Discover compute capabilities
 
@@ -560,14 +583,14 @@ documentation for more details.
 The complete C API reference lives in **[docs/documentation/api_reference.md](docs/documentation/api_reference.md)**,
 covering all 18 public entry points:
 
-| Group | Functions |
-|---|---|
-| Library | `ncclEpGetVersion` |
-| Group Management | `ncclEpCreateGroup`, `ncclEpGroupDestroy` |
-| Tensor Descriptors | `ncclEpTensorAlloc`, `ncclEpTensorDestroy` |
-| Handle Management | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
-| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete` |
-| Fault Tolerance (LL) | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear` |
+| Group                    | Functions                                                                                                    |
+|--------------------------|--------------------------------------------------------------------------------------------------------------|
+| Library                  | `ncclEpGetVersion`                                                                                           |
+| Group Management         | `ncclEpCreateGroup`, `ncclEpGroupDestroy`                                                                    |
+| Tensor Descriptors       | `ncclEpTensorAlloc`, `ncclEpTensorDestroy`                                                                   |
+| Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
+| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete`                                                          |
+| Fault Tolerance (LL)     | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear`          |
 
 # Execution Modes
 
