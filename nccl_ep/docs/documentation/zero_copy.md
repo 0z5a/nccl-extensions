@@ -105,23 +105,34 @@ Under `ON`:
 
 ### `ON` changes the expert-major algorithm
 
-The expert-major recipe is auto-selected from `zero_copy` and the topology:
+A token routed to *k* of this rank's local experts needs *k* copies in the
+expert-major output. **Who makes those copies, and when**, is the expert-major
+recipe, and it is auto-selected from `zero_copy` and the topology:
 
-| `zero_copy` | LSA teams | Selected mode                                           |
-|-------------|-----------|---------------------------------------------------------|
-| not `ON`    | any       | `kLocalPermute` — FLAT dispatch, then permute kernels   |
-| `ON`        | > 1       | `kNvlinkDup` — sender duplicates per-expert over NVLink |
-| `ON`        | 1         | `kLocalDup` — receiver-side fan-out                     |
+| `zero_copy` | LSA teams | Expert-major recipe                                                                         |
+|-------------|-----------|---------------------------------------------------------------------------------------------|
+| not `ON`    | any       | Tokens are staged deduplicated; a permute kernel then expands them into the caller's buffer |
+| `ON`        | > 1       | The sender writes one copy per destination expert directly over NVLink                      |
+| `ON`        | 1         | The receiver fans each token out to its local experts                                       |
 
 So `ON` is a performance decision as well as a memory one: it selects a different
 implementation with different staging and different behavior.
 
-**The switch cannot be opted out of.** `NCCL_EP_HT_EM_LOCAL_DUP` and
-`NCCL_EP_HT_EM_NVLINK_DUP` force a dup mode — including under `AUTO`, where the
-staging buffers are still allocated — but there is no corresponding override for
-`kLocalPermute`. Permute is reachable only as the fallthrough: no override set
-*and* `zero_copy != ON`. Selecting `ON` therefore commits expert-major to a dup
-mode, so windowing policy and algorithm choice are not independent.
+**`ON` and the permute recipe are mutually exclusive.** Setting `zero_copy = ON`
+always selects one of the two duplicating recipes, and there is no way to require
+windows while keeping the permute recipe. Expert-major uses permute only when
+`zero_copy` is not `ON` *and* neither of the env overrides below is set.
+
+The overrides work in one direction only: `NCCL_EP_HT_EM_NVLINK_DUP` and
+`NCCL_EP_HT_EM_LOCAL_DUP` force the sender-side and receiver-side recipes
+respectively, even under `AUTO`/`OFF` — but nothing forces the permute recipe
+back on. So choosing `ON` for its window enforcement or its memory saving also
+commits you to a different expert-major implementation; the two decisions cannot
+be made separately.
+
+> **Note:** the mapping from `zero_copy` to expert-major recipe, and the fact
+> that the two are coupled, may change in future releases. Do not depend on a
+> particular recipe being selected.
 
 ### Memory
 
