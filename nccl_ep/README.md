@@ -523,7 +523,7 @@ The recorded layout offsets on every live handle are pure offsets relative to th
   2. **Reallocation drops the contents of the old RDMA buffer.** Any operation issued with `send_only = 1` that has staged data but is still awaiting its receive half via `ncclEpComplete` will lose its in-flight data. Drain all such operations before triggering a reallocation.
   3. **CUDA graph capture bakes the RDMA base pointer into the captured kernel parameters.** `ncclEpInitHandle` (in AUTO mode) must not be called between `cudaStreamBeginCapture` and `cudaStreamEndCapture`. Any previously captured graph containing EP kernels must be destroyed and re-captured after a reallocation.
 
-- **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` is purely local; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. Use this mode if you need to avoid collective handle creation, mid-stream reallocation, or graph invalidation. Use `nccl_ep::get_low_latency_rdma_size_hint(...)` to compute a worst-case upper bound across all layouts and `num_topk ≤ MAX_NUM_TOPK`.
+- **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` is purely local; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. Use this mode if you need to avoid collective handle creation, mid-stream reallocation, or graph invalidation. There is currently no public API for computing the required size — one is planned for a future release. Until then, size conservatively: a buffer that is too small for the requested `(layout, num_topk)` is reported cleanly by `ncclEpInitHandle` rather than failing later.
 
 ## Zero-copy
 
