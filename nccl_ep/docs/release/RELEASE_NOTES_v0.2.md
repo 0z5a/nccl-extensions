@@ -149,6 +149,8 @@ Added FP16 and FP32 data type support.
 - **HT zero receive in eager mode** — ranks receiving no tokens are now handled correctly.
 - **HT `local_permute_dup` out-of-bounds write** on overflow.
 - **LL combine stage reuse** now correctly fenced.
+- **LL epoch ring is now group-owned** — concurrent LL handles on one group no longer race on
+  the shared double-buffered RDMA banks, and CUDA-graph replay advances the bank selector.
 - **HT sync guard for consecutive same-direction ops** — enabled by default, disable via env for
   testing.
 - **Byte-padded HT routing map** to fix a scan layout mismatch.
