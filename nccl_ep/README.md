@@ -77,9 +77,11 @@ NCCL EP relies on NCCL Device API, using GIN `put`/`signal` operations for RDMA 
 ncclEpCreateGroup(&ep_group, comm, &config);
 ncclEpGroupDestroy(ep_group);
 
-// Handle management. `topk_idx` is a pointer to a caller-owned tensor
-// descriptor; the routing it carries is cached in the handle and reused by
-// all dispatches until ncclEpUpdateHandle is called with new routing.
+// Handle management. Both calls take the routing as `const ncclEpTensor_t*`.
+// Here `topk_idx` is a caller-owned descriptor passed by address; a heap
+// descriptor from ncclEpTensorAlloc would be passed directly instead. The
+// routing it carries is cached in the handle and reused by all dispatches
+// until ncclEpUpdateHandle is called with new routing.
 // `layout_info` is an optional ncclEpLayoutInfo_t* whose fields advertise
 // device-side metadata tensors (expert_counters, src_rank_counters,
 // expert_offsets, recv_total_counter).
