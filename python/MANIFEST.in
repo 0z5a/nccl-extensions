@@ -13,3 +13,4 @@ global-exclude *.so *.cpp
 
 # Local build output and binding-generation tooling never belong in an sdist.
 prune build
+prune build_assets
