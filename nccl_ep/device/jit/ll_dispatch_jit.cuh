@@ -88,29 +88,24 @@ inline ncclResult_t launch_ll_dispatch(
     const dispatch_kernel_args_t& args,
     cudaStream_t stream) {
     static const int variant_identity = 0;
-    const std::string variant_name = [&] {
-        std::ostringstream name;
-        name << "ll_dispatch"
-             << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
-             << "_topk" << num_topk
-             << "_recipe" << kernel_spec.recipe_cache_tag
-             << "_payload" << kernel_spec.payload_cache_tag
-             << "_scale" << kernel_spec.scale_cache_tag
-             << (nvlinkOnly ? "_nvlinkonly" : "")
-             << (topkIdxIsInt64 ? "_topk64" : "_topk32")
-             << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype);
-        return name.str();
-    }();
-    const std::string source = ll_dispatch_jit_source(
-        kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ll_dispatch";
-    variant.variant_name = variant_name;
-    variant.source = source;
     variant.entry_name = kLlDispatchJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
+    // Derived from the raw parameters so the warm-cache launch path never has
+    // to build the variant-name string.
+    std::uint64_t key = ::nccl_ep::jit::kRuntimeKeySeed;
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(hidden));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(layout));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(num_topk));
+    key = ::nccl_ep::jit::runtime_key_mix(key, kernel_spec.recipe_cache_tag);
+    key = ::nccl_ep::jit::runtime_key_mix(key, kernel_spec.payload_cache_tag);
+    key = ::nccl_ep::jit::runtime_key_mix(key, kernel_spec.scale_cache_tag);
+    key = ::nccl_ep::jit::runtime_key_mix(
+        key, (nvlinkOnly ? 1u : 0u) | (topkIdxIsInt64 ? 2u : 0u));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
+    variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
     // Dispatch uses only statically allocated shared memory.
@@ -122,9 +117,33 @@ inline ncclResult_t launch_ll_dispatch(
     variant.cluster_dim_x = (numSms % 2 == 0) ? 2 : 1;
 
     std::string error;
+    // Warm-cache fast path: launches without materializing variant_name/source.
     // sizeof = 0 means "kernel_param points to a single fixed-size arg struct".
-    const ::nccl_ep::jit::JitKernelStatus status =
-        ::nccl_ep::jit::launch_jit_kernel(variant, const_cast<dispatch_kernel_args_t*>(&args), stream, &error);
+    ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel_cached(
+        variant, const_cast<dispatch_kernel_args_t*>(&args), 0, stream, &error);
+
+    std::string variant_name;
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched &&
+        status != ::nccl_ep::jit::JitKernelStatus::kLaunchFailed) {
+        // Cache miss: build the name + source and take the compile/load path.
+        std::ostringstream name;
+        name << "ll_dispatch"
+             << "_hdim" << hidden << ::nccl_ep::jit::layout_name_tag(layout)
+             << "_topk" << num_topk
+             << "_recipe" << kernel_spec.recipe_cache_tag
+             << "_payload" << kernel_spec.payload_cache_tag
+             << "_scale" << kernel_spec.scale_cache_tag
+             << (nvlinkOnly ? "_nvlinkonly" : "")
+             << (topkIdxIsInt64 ? "_topk64" : "_topk32")
+             << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype);
+        variant_name = name.str();
+        const std::string source = ll_dispatch_jit_source(
+            kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype);
+        variant.variant_name = variant_name;
+        variant.source = source;
+        status = ::nccl_ep::jit::launch_jit_kernel(
+            variant, const_cast<dispatch_kernel_args_t*>(&args), stream, &error);
+    }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         std::fprintf(stderr, "[nccl_ep jit] fatal LL dispatch JIT launch failure for %s: %s%s%s\n",

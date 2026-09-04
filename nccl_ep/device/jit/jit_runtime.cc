@@ -343,6 +343,9 @@ void log_memory_cache_event(
     const JitKernelVariant& variant,
     const char* state,
     const char* scope) {
+    // Runs on every launch (warm-cache hits included): don't build the message
+    // unless logging is actually on.
+    if (!jit_log_enabled()) return;
     log_jit_event(
         variant,
         kernel_log_prefix(variant) + " memory_cache=" + state + " scope=" + scope +
@@ -833,6 +836,43 @@ const char* jit_kernel_status_name(JitKernelStatus status) {
     return "unknown";
 }
 
+namespace {
+
+JitKernelStatus resolve_launch_target(int* device, CUcontext* context, std::string* error) {
+    if (cudaGetDevice(device) != cudaSuccess) {
+        if (error != nullptr) *error = "cudaGetDevice failed";
+        return JitKernelStatus::kUnsupportedDevice;
+    }
+
+    CUresult rc = cuCtxGetCurrent(context);
+    if (rc == CUDA_SUCCESS && *context == nullptr) {
+        cudaFree(nullptr);
+        rc = cuCtxGetCurrent(context);
+    }
+    if (rc != CUDA_SUCCESS || *context == nullptr) {
+        if (error != nullptr) *error = (rc == CUDA_SUCCESS) ? "no current CUDA context" : cu_error_string(rc);
+        return JitKernelStatus::kUnsupportedDevice;
+    }
+    return JitKernelStatus::kLaunched;
+}
+
+} // namespace
+
+JitKernelStatus launch_jit_kernel_cached(
+    const JitKernelVariant& variant,
+    void* kernel_param,
+    std::size_t kernel_param_size,
+    cudaStream_t stream,
+    std::string* error) {
+    int device = 0;
+    CUcontext context = nullptr;
+    const JitKernelStatus target_status = resolve_launch_target(&device, &context, error);
+    if (target_status != JitKernelStatus::kLaunched) return target_status;
+
+    const FastCacheKey fast_key{variant.identity, variant.runtime_key, context, device};
+    return try_fast_launch(fast_key, variant, kernel_param, kernel_param_size, stream, error);
+}
+
 JitKernelStatus launch_jit_kernel(
     const JitKernelVariant& variant,
     void* kernel_param,
@@ -840,21 +880,9 @@ JitKernelStatus launch_jit_kernel(
     cudaStream_t stream,
     std::string* error) {
     int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        if (error != nullptr) *error = "cudaGetDevice failed";
-        return JitKernelStatus::kUnsupportedDevice;
-    }
-
     CUcontext context = nullptr;
-    CUresult rc = cuCtxGetCurrent(&context);
-    if (rc == CUDA_SUCCESS && context == nullptr) {
-        cudaFree(nullptr);
-        rc = cuCtxGetCurrent(&context);
-    }
-    if (rc != CUDA_SUCCESS || context == nullptr) {
-        if (error != nullptr) *error = (rc == CUDA_SUCCESS) ? "no current CUDA context" : cu_error_string(rc);
-        return JitKernelStatus::kUnsupportedDevice;
-    }
+    const JitKernelStatus target_status = resolve_launch_target(&device, &context, error);
+    if (target_status != JitKernelStatus::kLaunched) return target_status;
 
     const FastCacheKey fast_key{variant.identity, variant.runtime_key, context, device};
     const JitKernelStatus fast_status =

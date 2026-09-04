@@ -18,6 +18,9 @@ namespace jit {
 
 std::string env_value(const char* name);
 bool env_flag_enabled(const char* name, bool default_value = false);
+// NCCL_EP_JIT_LOG, read once per process. Callers on hot paths must check this
+// before building a log message so disabled logging costs nothing per launch.
+bool jit_log_enabled();
 void jit_log(std::string_view message);
 
 // Returns true the first time each distinct `key` is seen. Thread-safe.

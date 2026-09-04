@@ -44,8 +44,13 @@ bool announce_once(const std::string& key) {
     return announced.insert(key).second;
 }
 
+bool jit_log_enabled() {
+    static const bool enabled = env_flag_enabled("NCCL_EP_JIT_LOG");
+    return enabled;
+}
+
 void jit_log(std::string_view message) {
-    if (!env_flag_enabled("NCCL_EP_JIT_LOG")) return;
+    if (!jit_log_enabled()) return;
     std::fprintf(stderr, "[nccl_ep jit] pid=%ld %.*s\n", static_cast<long>(getpid()), static_cast<int>(message.size()),
                  message.data());
 }

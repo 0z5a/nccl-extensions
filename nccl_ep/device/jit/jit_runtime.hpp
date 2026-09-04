@@ -47,6 +47,41 @@ struct JitKernelVariant {
     int cluster_dim_z = 1;
 };
 
+// Allocation-free FNV-1a folding used to derive JitKernelVariant::runtime_key
+// from the raw variant parameters (ints, bools, short literal tags) instead of
+// hashing a heap-built name string. runtime_key only has to be stable within a
+// process: it keys the in-memory fast cache; the on-disk cache key is derived
+// from the full source text.
+constexpr std::uint64_t kRuntimeKeySeed = 1469598103934665603ull;
+
+constexpr std::uint64_t runtime_key_mix(std::uint64_t key, std::uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        key ^= (value >> (8 * i)) & 0xffu;
+        key *= 1099511628211ull;
+    }
+    return key;
+}
+
+constexpr std::uint64_t runtime_key_mix(std::uint64_t key, const char* text) {
+    for (; text != nullptr && *text != '\0'; ++text) {
+        key ^= static_cast<unsigned char>(*text);
+        key *= 1099511628211ull;
+    }
+    return key;
+}
+
+// Fast path only: launch the variant from the in-process kernel cache.
+// Requires just identity/runtime_key and the launch configuration —
+// variant_name and source may be left empty, so callers can skip building
+// them entirely on the (hot) warm-cache path. Returns kDisabled on a cache
+// miss; the caller then materializes the strings and calls launch_jit_kernel.
+JitKernelStatus launch_jit_kernel_cached(
+    const JitKernelVariant& variant,
+    void* kernel_param,
+    std::size_t kernel_param_size,
+    cudaStream_t stream,
+    std::string* error);
+
 JitKernelStatus launch_jit_kernel(
     const JitKernelVariant& variant,
     void* kernel_param,
