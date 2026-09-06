@@ -49,6 +49,15 @@ __device__ __forceinline__ int getLocalExpertIdx(int expertIdx, int numLocalExpe
     return (expertIdx >= 0) ? expertIdx % numLocalExperts : -1;
 }
 
+// Distance from `myRank` to `otherRank` going forward around the ring, in [0, numRanks).
+// Used to place each sender's per-srcRank staging region at an offset relative to
+// (sender,receiver) rather than at the sender's absolute rank index to enable
+// NVL VA distribution.
+__device__ __forceinline__ int relativeRankSlot(int senderRank, int receiverRank, int numRanks) {
+    return (senderRank >= receiverRank) ? (senderRank - receiverRank)
+                                         : (senderRank - receiverRank + numRanks);
+}
+
 __device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExperts) {
     return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
 }
@@ -819,7 +828,8 @@ __device__ __forceinline__ void dispatch_kernel_impl( // INPUT
                     // Per-srcRank region base on the peer; sendToken picks the
                     // NVLink (split layout, direct from `inData`) or RDMA
                     // (interleaved, gin.put from staging) path internally.
-                    const size_t srcRankOffset = currRank * srcRankRegionBytes;
+                    const size_t srcRankOffset =
+                        static_cast<size_t>(relativeRankSlot(currRank, dstRank, numRanks)) * srcRankRegionBytes;
                     const auto srcRankLocalPtr = reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
                     const auto sendBufInt4 = reinterpret_cast<const int4*>(sendBufBase);
                     sendToken<kRecipe, kNvlinkOnly, ScaleT>(
@@ -1041,8 +1051,9 @@ LOW_LATENCY_DISPATCH_RECV:
                 int tokenIdx = i / numTopk;
                 int topkIdx = i % numTopk;
 
-                const auto recvBufUint8 =
-                    reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
+                const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) +
+                    static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank *
+                        numBytesPerMsg;
                 // NVLink split layout puts the per-slot header at the head of
                 // the per-srcRank region; the legacy RDMA layout has each
                 // header inline at the start of its [hdr|data|scales] message.
@@ -1110,8 +1121,9 @@ LOW_LATENCY_DISPATCH_RECV:
             // outRecvTopkIdx/Weights are written so the user can route and reduce.
             for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens;
                  i += numWarpsPerGroup * numLocalExperts) {
-                const auto recvBufUint8 =
-                    reinterpret_cast<uint8_t*>(recvBuf) + srcRank * maxTokensPerRank * numBytesPerMsg;
+                const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) +
+                    static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank *
+                        numBytesPerMsg;
                 const auto recvHdrPtr =
                     isNvlinkSrc ? (recvBufUint8 + i * dispatch_hdr_sz) : (recvBufUint8 + i * numBytesPerMsg);
                 const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvHdrPtr);
