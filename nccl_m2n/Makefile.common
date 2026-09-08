@@ -33,7 +33,7 @@ SKIP_DEP_CHECK := $(if $(MAKECMDGOALS),$(if $(filter-out $(NO_DEPS_GOALS),$(MAKE
 
 ifeq ($(SKIP_DEP_CHECK),)
 ifeq ($(wildcard $(NCCL_HOME)/include/nccl_device.h),)
-$(error NCCL_HOME=$(NCCL_HOME) does not contain include/nccl_device.h. Point NCCL_HOME at an NCCL install that ships the Device API headers)
+$(error NCCL_HOME=$(NCCL_HOME) does not contain include/nccl_device.h. Point NCCL_HOME to an NCCL build or installation that includes the Device API headers, or build the vendored NCCL with: make -C $(NCCL_EXTENSIONS_ROOT) nccl-submodule)
 endif
 ifeq ($(wildcard $(NVCC)),)
 $(error NVCC not found at $(NVCC). Set CUDA_HOME correctly.)
