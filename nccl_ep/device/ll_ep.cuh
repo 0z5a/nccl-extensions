@@ -18,6 +18,7 @@
 #include "device_primitives.cuh"
 #include "common.hpp"
 #include "ll_ep_smem.cuh"
+#include "ll_ep_adapter.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -647,27 +648,66 @@ __forceinline__ __device__ void copyRecvTokenData(
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
 template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kNvlinkOnly,
           typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT>
-__device__ __forceinline__ void dispatch_kernel_impl( // INPUT
-  const void* inData,
-  const uint8_t* inScalesBuf, // non-null for QUANT_FWD
-  const TopkIdxT* inTopkIdx, const float* inTopkWeights, int* rankMask, int* asyncErrorFlag,
-  // OUTPUT
-  void* outDataBuf, void* outScalesBuf, int* outSrcInfo, int* outRecvRankCounter, int64_t* outLayout, int* outCnt,
-  float* outRecvTopkWeights, int32_t* outRecvTopkIdx,
-  // INTERMEDIATE
-  void* rdmaBuf, size_t sendOffBase, size_t recvOffBase, size_t recvCntOffBase,
-  int* rankCountersBase, int* rankDone, int nextRecvCntBufSize, int* recvStats, int64_t* waitStats,
-  LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
-  // CONFIG
-  int numTokens, int scalesPerToken, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
-  int numWarpGroups, int numWarpsPerGroup, bool roundScale, ncclEpExpertIdKind_t recvTopkIdxKind, int phases,
-  int numComms, ncclDevComm* devComms, const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles,
-  // Zero-copy dispatch output (rank-major + nvlinkOnly): each available token
-  // or QUANT_FWD scale window is written directly to its peer output.
-  ncclWindow_t recvDataWindow, size_t recvDataOffset, ncclWindow_t rcvScalesWin, size_t rcvScalesOffs) {
+__device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_t& args) {
     EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= combine_smem::kWarpSize - kLlDispatchControlWarps,
                      "LL dispatch top-k must leave one control warp");
     constexpr int numTopk = kNumTopk;
+    // Bind every args field to a same-named local (struct sendOff/recvOff/
+    // recvCntOff bind as *Base). All bindings must stay ahead of the
+    // RECV-phase goto: jumping past an initialized local is ill-formed.
+    // INPUT
+    const void* inData = args.inData;
+    const uint8_t* inScalesBuf = static_cast<const uint8_t*>(args.inScalesBuf); // non-null for QUANT_FWD
+    const TopkIdxT* inTopkIdx = static_cast<const TopkIdxT*>(args.inTopkIdx);
+    const float* inTopkWeights = args.inTopkWeights;
+    int* rankMask = args.rankMask;
+    int* asyncErrorFlag = args.asyncErrorFlag;
+    // OUTPUT
+    void* outDataBuf = args.outDataBuf;
+    void* outScalesBuf = args.outScalesBuf;
+    int* outSrcInfo = args.outSrcInfo;
+    int* outRecvRankCounter = args.outRecvRankCounter;
+    int64_t* outLayout = args.outLayout;
+    int* outCnt = args.outCnt;
+    float* outRecvTopkWeights = args.outRecvTopkWeights;
+    int32_t* outRecvTopkIdx = args.outRecvTopkIdx;
+    // INTERMEDIATE
+    void* rdmaBuf = args.rdmaBuf;
+    size_t sendOffBase = args.sendOff;
+    size_t recvOffBase = args.recvOff;
+    size_t recvCntOffBase = args.recvCntOff;
+    int* rankCountersBase = args.rankCountersBase;
+    int* rankDone = args.rankDone;
+    int nextRecvCntBufSize = args.nextRecvCntBufSize;
+    int* recvStats = args.recvStats;
+    int64_t* waitStats = args.waitStats;
+    LowLatencyEpochState* epochState = args.epochState;
+    size_t payloadSlotStride = args.payloadSlotStride;
+    size_t signalSlotStride = args.signalSlotStride;
+    // CONFIG
+    int numTokens = args.numTokens;
+    int scalesPerToken = args.scalesPerToken;
+    int maxTokensPerRank = args.maxTokensPerRank;
+    int numExperts = args.numExperts;
+    int currRank = args.currRank;
+    int numRanks = args.numRanks;
+    int numWarpGroups = args.numWarpGroups;
+    int numWarpsPerGroup = args.numWarpsPerGroup;
+    bool roundScale = args.roundScale;
+    ncclEpExpertIdKind_t recvTopkIdxKind = args.recvTopkIdxKind;
+    int phases = args.phases;
+    int numComms = args.numComms;
+    ncclDevComm* devComms = args.devComms;
+    const ncclWindow_t* windows = args.windows;
+    unsigned signalsBase = args.signalsBase;
+    uint64_t timeoutCycles = args.timeoutCycles;
+    // Zero-copy dispatch output (rank-major + nvlinkOnly): each available token
+    // or QUANT_FWD scale window is written directly to its peer output.
+    ncclWindow_t recvDataWindow = args.recvDataWindow;
+    size_t recvDataOffset = args.recvDataOffset;
+    ncclWindow_t rcvScalesWin = args.rcvScalesWin;
+    size_t rcvScalesOffs = args.rcvScalesOffs;
+
     const auto smId = static_cast<int>(blockIdx.x);
     const auto threadId = static_cast<int>(threadIdx.x);
     const auto warpId = threadId / 32, laneId = get_lane_id();
