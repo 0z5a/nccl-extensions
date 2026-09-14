@@ -3309,6 +3309,12 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     const bool em_permute_active = em_local_permute_enabled(ep_group, handle);
+    // Overflow-drop EM-permute: zero the caller's counter buffer here so the scan's
+    // per-block atomicAdd of the post-drop delivered count has a race-free base.
+    if (expert_major && em_permute_active && ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP &&
+        per_expert_counts_device != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(per_expert_counts_device, 0, experts_per_rank * sizeof(int32_t), stream));
+    }
     int max_recv_tpr = static_cast<int>(ep_group->config.max_recv_tokens_per_rank);
     const int alignment = static_cast<int>(handle->ht.dispatch_output_per_expert_alignment);
     if (ep_group->eager_mode && em_permute_active && (alignment > 0)) {
@@ -4434,33 +4440,6 @@ ncclResult_t ncclEpDispatch(
                     group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[group->lsa_rank];
                 perm_scale_row_bytes =
                     static_cast<int>(recv_scales->sizes[1]) * ncclTypeSize(recv_scales->datatype);
-            }
-            // Drop-mode phantom-row zero-init (local-permute only): under deep FLAT
-            // overflow (raw recv count > capacity) the published per-expert counts can
-            // exceed the rows the permute kernel delivers — FLAT-dropped tokens leave
-            // holes that neither the copy nor the pad warp covers. Zeroed buffers turn
-            // those phantom rows into zero-token/zero-weight no-ops instead of garbage
-            // GEMM inputs. Runs after every output descriptor is validated and
-            // window-resolved. Unconditional per drop-mode dispatch for simplicity; a
-            // delivered-row recount in the scan would make the pad warp cover these
-            // rows exactly and remove this cost (follow-up optimization).
-            if (group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP && !group->eager_mode) {
-                // The kernels never write past the configured capacity, so bound the
-                // zeroing there too — callers may declare buffers with trailing slack
-                // that is theirs, not ours.
-                const size_t zero_rows = static_cast<size_t>(group->max_recv_tokens);
-                if (recv_x->data != nullptr && zero_rows > 0) {
-                    CUDA_CHECK(cudaMemsetAsync(recv_x->data, 0, zero_rows * row_bytes, stream));
-                }
-                if (forward_dispatch && recv_topk_weights != nullptr &&
-                    recv_topk_weights->data != nullptr && zero_rows > 0) {
-                    CUDA_CHECK(cudaMemsetAsync(
-                        recv_topk_weights->data, 0, zero_rows * sizeof(float), stream));
-                }
-                if (perm_recv_scales_em != nullptr && zero_rows > 0) {
-                    CUDA_CHECK(cudaMemsetAsync(
-                        perm_recv_scales_em, 0, zero_rows * perm_scale_row_bytes, stream));
-                }
             }
             if (em_pull_active) {
                 // Pull staging holds one full smem row per warp. The launch already

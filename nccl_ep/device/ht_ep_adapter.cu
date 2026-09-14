@@ -804,8 +804,10 @@ void launch_build_em_tables(
 size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank, int num_sms, bool is_local_permute) {
     assert(num_sms > 0);
     if (is_local_permute) {
-        // Fused em-permute scan: per-expert decoupled-scan state
-        // expert_scan_tmp[num_sms * experts_per_rank] tmp_state_t (independent of nrpn).
+        // Fused em-permute scan: per-expert decoupled-scan state for the assigned-count
+        // reduction (expert_scan_tmp), [num_sms * experts_per_rank] tmp_state_t
+        // (independent of nrpn). The drop-mode post-drop delivered count is tallied
+        // straight into em_actual_counts_out (atomicAdd), so it needs no scratch.
         return static_cast<size_t>(num_sms) * experts_per_rank * sizeof(::ht_ep::tmp_state_t);
     }
     // em_scan_kernel (kLocalDup / nvlink_dup path): block_count[num_sms][nrpn*epr] int32.

@@ -5233,13 +5233,24 @@ __device__ __forceinline__ void local_permute_dup(
         // Host validates row_bytes % 16 == 0; pass it straight to cp.async.bulk.
         assert((row_bytes & 15) == 0);
         const bool zero_weights = (recv_topk_weights_em != nullptr);
+        // Running position in the concatenated stream of pad rows across all experts
+        // seen so far. Under random routing only a handful of (low-index) experts carry
+        // any pad_count at all, and each one is tiny relative to total_pad_lanes -- if
+        // every expert's stripe restarted at my_pad_lane, the same few low-numbered lanes
+        // would be hit by every expert while the rest of the grid sat idle. Continuing the
+        // stripe across experts (global_pos accumulates, never resets) spreads that same
+        // total work evenly over all total_pad_lanes lanes instead.
+        int64_t global_pos = 0;
         for (int e = 0; e < experts_per_rank; ++e) {
             const int64_t zone_start = expert_token_offsets[e];
             const int64_t zone_end = expert_token_offsets[e + 1];
             const int32_t active = per_expert_counts_active[e];
             const int64_t pad_begin = zone_start + active;
             const int64_t pad_count = zone_end - pad_begin;
-            for (int64_t offs = my_pad_lane; offs < pad_count; offs += total_pad_lanes) {
+            int64_t rel = (my_pad_lane - global_pos) % total_pad_lanes;
+            if (rel < 0) rel += total_pad_lanes;
+            global_pos += pad_count;
+            for (int64_t offs = rel; offs < pad_count; offs += total_pad_lanes) {
                 const int64_t slot = pad_begin + offs;
                 uint8_t* dst_g = recv_x_em + static_cast<size_t>(slot) * row_bytes;
                 cuda::ptx::cp_async_bulk(
@@ -5468,10 +5479,17 @@ __device__ __forceinline__ void dispatch_pull_pad_fill(
     const int my_pad_warp = static_cast<int>(blockIdx.x) * kPadWarps + pad_idx;
     const bool zero_weights = (recv_topk_weights_em != nullptr);
     const int4 zero_v = int4{0, 0, 0, 0};
+    // Running offset across experts (mirrors local_permute_dup's pad-warp fix):
+    // restarting at my_pad_warp per expert repeatedly hits the same warps, leaving
+    // the rest of the grid's pad warps idle.
+    int64_t global_pos = 0;
     for (int e = 0; e < experts_per_rank; ++e) {
         const int64_t pad_begin = expert_token_offsets[e] + per_expert_counts_active[e];
         const int64_t pad_count = expert_token_offsets[e + 1] - pad_begin;
-        for (int64_t r = my_pad_warp; r < pad_count; r += total_pad_warps) {
+        int64_t rel = (my_pad_warp - global_pos) % total_pad_warps;
+        if (rel < 0) rel += total_pad_warps;
+        global_pos += pad_count;
+        for (int64_t r = rel; r < pad_count; r += total_pad_warps) {
             const int64_t slot = pad_begin + r;
             int4* row = dst_int4 + static_cast<size_t>(slot) * HiddenInt4;
             for (int j = lane; j < HiddenInt4; j += kThreadsPerSlot) {

@@ -4580,6 +4580,7 @@ void printUsage(const char* programName, int myRank) {
             "                             HT only (0 = auto; HT default: FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k).\n"
             "                             Ignored in LL mode.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
+        printf("  --overflow-drop          HT: NCCL_EP_OVERFLOW_DROP instead of trapping on overflow\n");
         printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
         printf("  --shuffle-sms <N> SMs for the token permutation (shuffle) kernels (0 = auto, default: 0)\n");
         printf("  --preprocess-num-sms <N> SMs for the preprocessing scan kernels (0 = auto, default: 0)\n");
@@ -4643,6 +4644,7 @@ int main(int argc, char* argv[]) {
     bool run_backward = false;  // Also benchmark the HT backward dispatch/combine ops
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
     unsigned int max_recv_tokens_per_rank = UINT_MAX;  // HT only; UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
+    bool overflow_drop = false;  // HT only; NCCL_EP_OVERFLOW_DROP instead of the library default (trap)
     bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
     bool ht_em_local_dup = false;
@@ -4705,6 +4707,7 @@ int main(int argc, char* argv[]) {
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
         {"backward", no_argument, 0, 'B'},
+        {"overflow-drop", no_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -4924,6 +4927,9 @@ int main(int argc, char* argv[]) {
             break;
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
+            break;
+        case 1005:  // --overflow-drop
+            overflow_drop = true;
             break;
         case 'h':
             printUsage(argv[0], myRank);
@@ -5326,6 +5332,7 @@ int main(int argc, char* argv[]) {
         max_recv_tokens_per_rank = NCCL_EP_AUTO;
     }
     config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
+    if (overflow_drop) config.overflow_policy = NCCL_EP_OVERFLOW_DROP;
     config.max_num_sms = max_num_sms;
     config.zero_copy = zcopy ? NCCL_EP_ZERO_COPY_ON : NCCL_EP_ZERO_COPY_AUTO;
     if (ht_em_local_dup) {

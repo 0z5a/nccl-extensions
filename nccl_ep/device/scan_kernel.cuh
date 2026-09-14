@@ -62,13 +62,15 @@ struct scan_flat_smem_t {
     int32_t* expert_total;        // [experts_per_rank]
     int32_t* expert_base;         // [experts_per_rank]
     int32_t* warp_expert_prefix;  // [num_warps * experts_per_rank]
+    int32_t* expert_delivered_local; // [experts_per_rank] post-drop delivered tally (drop mode only)
+    int32_t* overflow_flag;       // [1] Phase 1's overflow verdict, broadcast to Phase 2
 
     // Total int32 slots the layout needs -- must mirror from_raw()'s advances.
     static __host__ __device__ size_t num_ints(
         int num_warps, int num_ranks, int experts_per_rank, bool has_expert_counts, bool has_em_permute) {
         size_t n = static_cast<size_t>(2 * num_warps + 1) * num_ranks;  // rank region
         if (has_expert_counts) n += static_cast<size_t>(experts_per_rank);
-        if (has_em_permute) n += static_cast<size_t>(2 * num_warps + 3) * experts_per_rank;
+        if (has_em_permute) n += static_cast<size_t>(2 * num_warps + 4) * experts_per_rank + 1;
         return n;
     }
     static __host__ __device__ size_t byte_size(
@@ -93,6 +95,8 @@ struct scan_flat_smem_t {
             s.expert_total        = p; p += experts_per_rank;
             s.expert_base         = p; p += experts_per_rank;
             s.warp_expert_prefix  = p; p += num_warps * experts_per_rank;
+            s.expert_delivered_local = p; p += experts_per_rank;
+            s.overflow_flag       = p; p += 1;
         }
         return s;
     }
@@ -367,7 +371,11 @@ __device__ __forceinline__ void write_local_routing(
     bool allow_overflow_drop = false,
     int max_recv_tokens_per_rank = 0,
     // Pull dispatch (USE_TOPK_IDX): source top-k position of each hit, parallel to flat2em.
-    int32_t* srcpos_map = nullptr) {
+    int32_t* srcpos_map = nullptr,
+    // True iff this call's true (pre-drop) total exceeds capacity (Phase 1's
+    // em_populate_cnt_tensors verdict, broadcast via smem); gates the delivered-count
+    // tally below so non-overflowing calls pay nothing extra.
+    bool overflow_this_call = false) {
 
     // Protect from writing invalid and overflowing slots
     bool lane_participates =
@@ -456,7 +464,22 @@ __device__ __forceinline__ void write_local_routing(
             }
             __syncwarp();  // all lanes read pref_k before lane 0 overwrites it
             if (g.lane_id == 0) {
-                smem.warp_expert_prefix[g.warp_id * experts_per_rank + k] = pref_k + __popc(expert_mask);
+                const int count = __popc(expert_mask);
+                // Post-drop delivered tally, closed form: within this warp's em_slot run
+                // [base_offset, base_offset + count), em_slot is monotonic in lane order, so
+                // the dropped/kept boundary is a single threshold crossing (no per-lane ballot
+                // needed) -- the delivered count is the run's overlap with
+                // [0, max_recv_tokens_per_rank). Only computed on overflowing calls, since
+                // otherwise delivered == assigned and Phase 1's count already holds.
+                if (overflow_this_call) {
+                    const int base_offset = smem.expert_base[k] + pref_k;
+                    const int room = max_recv_tokens_per_rank - base_offset;
+                    const int delivered_this_warp_k = min(count, max(0, room));
+                    if (delivered_this_warp_k > 0) {
+                        atomicAdd(smem.expert_delivered_local + k, delivered_this_warp_k);
+                    }
+                }
+                smem.warp_expert_prefix[g.warp_id * experts_per_rank + k] = pref_k + count;
             }
             __syncwarp();  // publish update before the next tile re-reads this slot
         } else if constexpr (ENABLE_PER_EXPERT_COUNTS) {
@@ -509,7 +532,9 @@ __device__ __forceinline__ void assign_recv_slots(
     // Pull dispatch: recv slot -> global source token id (inverse of token_to_recv_slot).
     int32_t* recv_slot_to_src = nullptr,
     int num_topk = 0,
-    int32_t* srcpos_map = nullptr) {
+    int32_t* srcpos_map = nullptr,
+    // True iff this call's true (pre-drop) total exceeds capacity; see write_local_routing.
+    bool overflow_this_call = false) {
 
     // Scan the range of assigned tokens (defined by the scan geometry)
     for (int i = 0; i < g.num_of_tokens_per_thread; i++) {
@@ -614,7 +639,8 @@ __device__ __forceinline__ void assign_recv_slots(
             em_top_k,
             allow_overflow_drop,
             max_recv_tokens_per_rank,
-            srcpos_map);
+            srcpos_map,
+            overflow_this_call);
 
         // EM-permute updates warp_expert_prefix in smem; keep the warp converged
         // before the next tile re-reads it.
@@ -831,6 +857,21 @@ __device__ __forceinline__ void cross_block_prefix_scan_experts(
     }
 }
 
+// Drop-mode delivered-count tally: adds this block's Phase-2 post-drop delivered
+// count (smem.expert_delivered_local) straight into em_actual_counts_out, which
+// the host zeroed via cudaMemsetAsync before this launch (call_metadata_preprocessing).
+template <int NUM_THREADS_PER_BLOCK>
+__device__ __forceinline__ void reduce_delivered_counts(
+    scan_flat_smem_t& smem,
+    int experts_per_rank,
+    int32_t* em_actual_counts_out) {
+    if (em_actual_counts_out == nullptr) return;
+    for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
+        const int32_t delivered = smem.expert_delivered_local[e];
+        if (delivered != 0) atomicAdd(em_actual_counts_out + e, delivered);
+    }
+}
+
 // Thread 0 turns the per-expert cross-block grand totals (smem.expert_total)
 // into padded per-expert zone bases (smem.expert_base, computed by every block),
 // and block 0 additionally publishes the global EM count/offset tensors
@@ -853,6 +894,17 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
     bool allow_overflow_drop) {
     if (threadIdx.x == 0) {
         const int align = (em_alignment > 1) ? em_alignment : 1;
+        // Predetermine the overflow verdict (same padded-total computation the main loop
+        // below repeats while accumulating cum) so it's known before that loop needs it
+        // to decide whether to seed em_actual_counts_out with the assigned count or defer
+        // to Phase 2's post-drop recount.
+        int predicted_total = 0;
+        for (int k = 0; k < experts_per_rank; k++) {
+            const int c = smem.expert_total[k];
+            const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
+            predicted_total += padded;
+        }
+        const bool overflow = predicted_total > max_recv_tokens_per_rank;
         int cum = 0;
         for (int k = 0; k < experts_per_rank; k++) {
             const int c = smem.expert_total[k];
@@ -874,14 +926,21 @@ __device__ __forceinline__ void em_populate_cnt_tensors(
                 const int zone_base =
                     (allow_overflow_drop && cum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : cum;
                 if (em_internal_offsets) em_internal_offsets[k] = zone_base;
-                if (em_actual_counts_out) em_actual_counts_out[k] = rep_actual;
+                // On an overflowing call, Phase 2 recounts the true post-drop delivered count
+                // and atomicAdds it into this slot after assign_recv_slots runs; the host has
+                // already zeroed em_actual_counts_out, so skip writing here (a write from just
+                // this block would race the other blocks' atomicAdd).
+                if (em_actual_counts_out && !overflow) em_actual_counts_out[k] = rep_actual;
                 if (em_padded_out_counts) em_padded_out_counts[k] = static_cast<EM_OUT_T>(rep_padded);
                 if (em_out_offsets) em_out_offsets[k] = static_cast<EM_OUT_T>(zone_base);
             }
             cum += padded;
         }
-        const int true_total = cum;
-        const bool overflow = true_total > max_recv_tokens_per_rank;
+        const int true_total = cum;  // == predicted_total; recomputed above via the same padded sums.
+        // Broadcast to Phase 2 (every block computes the same true_total/overflow from
+        // its own cross-block-reduced smem.expert_total, so this is already per-block
+        // consistent; no cross-block communication needed here).
+        smem.overflow_flag[0] = overflow ? 1 : 0;
         if (blockIdx.x == 0) {
             // Internal total drives recv processing, so clamp to capacity (slots above it
             // were dropped); recv_total_counter still reports the true pre-drop padded total.
@@ -1008,6 +1067,12 @@ __device__ __forceinline__ void scan_impl_flat(
         }
         __syncthreads();
     }
+    if constexpr (ENABLE_EM_PERMUTE) {
+        for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
+            smem.expert_delivered_local[e] = 0;
+        }
+        __syncthreads();
+    }
 
     // Phase 1: rank tally (+ per-local-expert tally when EM-permute is enabled).
     // Passing &smem drives the warp-reduce of rank counts into smem.warp_rank_sums.
@@ -1065,6 +1130,15 @@ __device__ __forceinline__ void scan_impl_flat(
     }
     __syncthreads();
 
+    // Phase 1's overflow verdict (smem.overflow_flag), read after the sync above so
+    // it's visible to every thread. Gates Phase 2's delivered-count tally: on
+    // non-overflowing calls delivered == assigned, so this stays false and Phase 2
+    // does no extra work beyond the pre-existing baseline.
+    bool overflow_this_call = false;
+    if constexpr (ENABLE_EM_PERMUTE) {
+        overflow_this_call = (smem.overflow_flag[0] != 0);
+    }
+
     // Phase 2: single token pass -> FLAT recv slots + FLAT LERM (+ EM slots).
     assign_recv_slots<NUM_RANK_TILES, LSA_TEAM_SIZE, NUM_MASK_WORDS, ENABLE_PER_EXPERT_COUNTS, ENABLE_EM_PERMUTE,
                       USE_TOPK_IDX, EXPERTS_PER_RANK>(
@@ -1089,13 +1163,30 @@ __device__ __forceinline__ void scan_impl_flat(
         em_top_k,
         recv_slot_to_src,
         em_top_k,
-        srcpos_map);
+        srcpos_map,
+        overflow_this_call);
 
     if constexpr (ENABLE_PER_EXPERT_COUNTS) {
         __syncthreads();
         for (int e = threadIdx.x; e < experts_per_rank; e += NUM_THREADS_PER_BLOCK) {
             int32_t block_count = smem.expert_counts[e];
             if (block_count > 0) atomicAdd(per_expert_token_counts + e, block_count);
+        }
+    }
+
+    // Drop mode: em_actual_counts_out (Phase 1's assigned count) can overstate what
+    // Phase 2 actually delivered, since FLAT-level drop cuts a suffix of some
+    // experts' hit sequences after Phase 1 already ran. em_populate_cnt_tensors
+    // already seeded em_actual_counts_out to 0 for this call; tally each block's
+    // delivered count into it so the pad-fill kernels (which read
+    // em_actual_counts_out) cover exactly the dropped rows instead of relying on
+    // a blanket zero-init of recv_x.
+    if constexpr (ENABLE_EM_PERMUTE) {
+        if (overflow_this_call) {
+            // All warps must finish their write_local_routing atomicAdds into
+            // smem.expert_delivered_local before this block's tally reads it.
+            __syncthreads();
+            reduce_delivered_counts<NUM_THREADS_PER_BLOCK>(smem, experts_per_rank, em_actual_counts_out);
         }
     }
 
