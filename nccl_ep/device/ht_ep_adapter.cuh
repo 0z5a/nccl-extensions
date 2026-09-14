@@ -579,6 +579,7 @@ struct CombineParams {
     ncclDataType_t token_dtype = ncclBfloat16;  // Actual token wire dtype
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
+    uint32_t combine_barrier_offset; // Reserved LSA barrier session index, not a byte offset
 
     ncclEpCombQuant_t combine_recipe = NCCL_EP_COMB_QUANT_NONE;
 };

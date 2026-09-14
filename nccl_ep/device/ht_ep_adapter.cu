@@ -1307,6 +1307,7 @@ ncclResult_t call_dispatch(
     kp.lsa_S2G_flags = params.lsa_S2G_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
     kp.guard_enabled = params.guard_enabled;
+    kp.combine_barrier_offset = params.combine_barrier_offset;
 
     // Runtime config
     kp.local_rank = params.local_rank;

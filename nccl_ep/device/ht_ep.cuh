@@ -1148,6 +1148,7 @@ struct combine_kernel_param_base_t {
     // Cross-round WAR sync-guards: LSA (intra-LSA staging) uses the NCCL LSA barrier; RDMA
     // (cross-LSA-team staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
+    uint32_t combine_barrier_offset; // Reserved LSA barrier session index, not a byte offset
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     combine_warp_timing_entry_t* warp_timing;
     combine_block_timing_entry_t* block_timing;
@@ -4865,7 +4866,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                         ncclCoopWarp(),
                         param.dcomms[0],
                         ncclTeamTagLsa(),
-                        (uint32_t)NBLOCKS);
+                        param.combine_barrier_offset);
                     bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
                 }
             }

@@ -5322,6 +5322,7 @@ ncclResult_t ncclEpCombine(
             params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
             params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
+            params.combine_barrier_offset = group->comm_num_sms;
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
             const size_t combine_token_offset =
