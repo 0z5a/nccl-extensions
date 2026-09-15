@@ -322,6 +322,61 @@ template void pack_topk_idx<int32_t>(const int32_t*, uint16_t*, uint16_t*, int, 
 template void pack_topk_idx<int64_t>(const int64_t*, uint16_t*, uint16_t*, int, int, int, cudaStream_t);
 
 // ============================================================================
+// Pull-native metadata (gated by NCCL_EP_HT_EM_AG_SCAN_MODE, see dispatch_pull_count_capable):
+// count-row histogram + map build
+// ============================================================================
+// Pack the handle-local top-k snapshot and accumulate its send-count histogram.
+template <typename TopkIdxT>
+__global__ void pack_topk_and_count_row_kernel(
+    const TopkIdxT* __restrict__ topk_idx, uint16_t* __restrict__ topk_idx_u16, int num_tokens,
+    int max_tokens, int num_topk, int experts_per_rank, int num_experts,
+    int32_t* __restrict__ cnt_rank, int32_t* __restrict__ cnt_expert) {
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    for (int token = blockIdx.x * blockDim.x + threadIdx.x; token < max_tokens; token += stride) {
+        const size_t row_off = static_cast<size_t>(token) * num_topk;
+        uint16_t* out = topk_idx_u16 + row_off;
+        if (token >= num_tokens) {
+            for (int k = 0; k < num_topk; k++) out[k] = kTopkIdxInvalid;
+            continue;
+        }
+        const TopkIdxT* in_row = topk_idx + row_off;
+        unsigned long long seen[nccl_ep::bit_words(::ht_ep::kPullMaxLsaRanks)] = {0};
+        for (int k = 0; k < num_topk; k++) {
+            const TopkIdxT expert = in_row[k];
+            // Validate before the uint16_t cast, else an out-of-range id can wrap into a valid one.
+            const bool valid = expert >= 0 && expert < static_cast<TopkIdxT>(num_experts);
+            const uint16_t u = valid ? static_cast<uint16_t>(expert) : kTopkIdxInvalid;
+            out[k] = u;
+            if (!valid) continue;
+            atomicAdd(&cnt_expert[static_cast<int>(u)], 1);
+            const int dr = static_cast<int>(u) / experts_per_rank;
+            if (nccl_ep::test_bit(seen, dr)) continue;
+            nccl_ep::set_bit(seen, dr);
+            atomicAdd(&cnt_rank[dr], 1);
+        }
+    }
+}
+
+template <typename TopkIdxT>
+void pack_topk_and_count_row(
+    const TopkIdxT* topk_idx, uint16_t* topk_idx_u16, int num_tokens, int max_tokens, int num_topk,
+    int experts_per_rank, int num_experts, int32_t* cnt_rank, int32_t* cnt_expert, int num_sms,
+    cudaStream_t stream) {
+    int block = 256;
+    int grid = nccl_ep::ceil_div(max_tokens, block);
+    if (grid < 1) grid = 1;
+    if (num_sms > 0 && grid > num_sms) grid = num_sms;
+    pack_topk_and_count_row_kernel<<<grid, block, 0, stream>>>(
+        topk_idx, topk_idx_u16, num_tokens, max_tokens, num_topk, experts_per_rank, num_experts,
+        cnt_rank, cnt_expert);
+}
+
+template void pack_topk_and_count_row<int32_t>(
+    const int32_t*, uint16_t*, int, int, int, int, int, int32_t*, int32_t*, int, cudaStream_t);
+template void pack_topk_and_count_row<int64_t>(
+    const int64_t*, uint16_t*, int, int, int, int, int, int32_t*, int32_t*, int, cudaStream_t);
+
+// ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob
 // ============================================================================
 template <typename TopkIdxT>
@@ -2014,15 +2069,15 @@ ncclResult_t launch_dispatch_pull(
     void* recv_x_em,
     float* recv_topk_weights_em,
     void* recv_x_scale_em,
-    const int32_t* flat2em_slot_map,
-    const int32_t* srcpos_map,
-    const int32_t* recv_slot_to_src,
+    int32_t* flat2em_slot_map,
+    int32_t* srcpos_map,
+    int32_t* recv_slot_to_src,
     const void* const* peer_input_ptrs,
     const float* const* peer_weight_ptrs,
     const void* const* peer_scale_ptrs,
-    const int32_t* num_recv_tokens_dev,
-    const int64_t* expert_token_offsets,
-    const int32_t* per_expert_counts_active,
+    int32_t* num_recv_tokens_dev,
+    int64_t* expert_token_offsets,
+    int32_t* per_expert_counts_active,
     int top_k,
     int experts_per_rank,
     int row_bytes,
@@ -2037,7 +2092,28 @@ ncclResult_t launch_dispatch_pull(
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
-    bool unfused_sync) {
+    bool unfused_sync,
+    // Fused pull-count inputs; leave at defaults (layout_ready == nullptr) for the scan path.
+    const uint8_t* const* meta_ptrs,
+    int topk_off_bytes,
+    int32_t* rank_cursor,
+    int32_t* expert_cursor,
+    int32_t* layout_ready,
+    int my_rank,
+    int max_recv_tokens_per_rank,
+    int flat_recv_capacity,
+    int em_alignment,
+    bool allow_overflow_drop,
+    const int32_t* own_row,
+    const uint16_t* own_topk_snapshot,
+    uint8_t* own_meta_staging,
+    int32_t* layout_slot_base,
+    int32_t* layout_expert_base,
+    const int32_t* cached_cnt_rows,
+    void* caller_offsets,
+    void* caller_counts,
+    void* caller_recv_total,
+    bool caller_out_is_int64) {
     assert(experts_per_rank > 0 && top_k <= ::ht_ep::kPullDispatchMaxActive);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2078,6 +2154,30 @@ ncclResult_t launch_dispatch_pull(
     p.head_sync_flag = head_sync_flag;
     p.grid_barrier_counter = grid_barrier_counter;
     p.unfused_sync = unfused_sync;
+    // Fused pull-count: layout_ready != nullptr is what jit::launch_dispatch_pull checks to
+    // select the MAP-warp-group variant, so every field here must be set together.
+    if (layout_ready != nullptr) {
+        for (int i = 0; i < lsa_team_size; i++) p.meta_ptrs[i] = meta_ptrs[i];
+        p.topk_off_bytes = topk_off_bytes;
+        p.rank_cursor = rank_cursor;
+        p.expert_cursor = expert_cursor;
+        p.layout_ready = layout_ready;
+        p.my_rank = my_rank;
+        p.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
+        p.flat_recv_capacity = flat_recv_capacity;
+        p.em_alignment = em_alignment;
+        p.allow_overflow_drop = allow_overflow_drop;
+        p.own_row = own_row;
+        p.own_topk_snapshot = own_topk_snapshot;
+        p.own_meta_staging = own_meta_staging;
+        p.layout_slot_base = layout_slot_base;
+        p.layout_expert_base = layout_expert_base;
+        p.cached_cnt_rows = cached_cnt_rows;
+        p.caller_offsets = caller_offsets;
+        p.caller_counts = caller_counts;
+        p.caller_recv_total = caller_recv_total;
+        p.caller_out_is_int64 = caller_out_is_int64;
+    }
 
     if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomms, head_sync_flag);
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream);

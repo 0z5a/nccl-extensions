@@ -863,6 +863,8 @@ struct ncclEpGroup {
         uint16_t** combine_expert_input_token_buffer_ptrs;
         float** combine_expert_input_prob_buffer_ptrs;
         uint8_t** dispatch_push_count_meta_table_ptrs;
+    // Fused pull-count metadata inboxes (one [count row | uint16 topk] row per source rank).
+        uint8_t** pull_meta_ptrs;
 
     // Local buffers (owned by this rank)
         void* expert_output_token;
@@ -871,6 +873,7 @@ struct ncclEpGroup {
         uint8_t* expert_output_meta_tables;
         uint16_t* expert_input_token;
         float* expert_input_prob;
+        uint8_t* pull_meta_staging;
 
     // Slot capacity of expert_output_token / expert_input_token.
         size_t token_staging_slots;
@@ -899,6 +902,12 @@ struct ncclEpGroup {
         // FLAT recv-slot weights (EM local-permute only). Sized by kEpCountMaxTopk.
             float* recv_topk_weights_flat = nullptr;
         } count_scratch;
+
+    // Fused pull-count MAP-build scratch (group-shared; zeroed and consumed within a single
+    // dispatch, so group-scoping stays 1F1B-safe like em_permute_cursors).
+        int32_t* pull_recv_cursor = nullptr;  // [lsa_team_size + num_local_experts + 1] rank + expert cursors, plus trailing arrival counter
+        int32_t* pull_layout_ready = nullptr; // single grid-wide "layout published" flag
+        int32_t* pull_map_layout = nullptr;   // [lsa_team_size + num_local_experts] CTA0-published slot/expert bases
 
     // RDMA buffers (multi-LSA-team only)
         uint64_t* dispatch_gin_G2S_flags;
@@ -931,6 +940,7 @@ struct ncclEpGroup {
         size_t published_offset = 0; // sender-published count rows offset within the tables region
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
+        size_t ipc_pull_meta_offset = 0;  // fused pull-count metadata inbox region
 
         // Merged completion flags
         uint32_t* completion_flags_base = nullptr;
@@ -1200,11 +1210,11 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute;
     // LERM bitmap rows, then one published [cnt_rank | cnt_expert] count row per sender.
     // Both regions are skipped when the group can't take the count path.
+    const size_t count_row_ints =
+        static_cast<size_t>(ep_group->nRanks) + ep_group->config.num_experts;
     size_t published_offset = 0;
     size_t dispatch_meta_tables_aligned = 0;
     if (group_count_capable) {
-        const size_t count_row_ints =
-            static_cast<size_t>(ep_group->nRanks) + ep_group->config.num_experts;
         published_offset = align_ipc(max_output_slots * lerm_words * sizeof(uint64_t));
         dispatch_meta_tables_aligned =
             published_offset +
@@ -1213,6 +1223,35 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.published_offset = published_offset;
     size_t combine_token_aligned = skip_token_staging ? 0 : align_ipc(expert_input_token_sz);
     size_t combine_prob_aligned = align_ipc(expert_input_prob_sz);
+
+    // Fused pull-count metadata inbox: one [count row | uint16 topk] row per source rank.
+    // Single-LSA-team, non-eager pull-push only; same NCCL_EP_HT_EM_AG_SCAN_MODE fallback gate
+    // as dispatch_push_count_capable (see dispatch_pull_count_capable), so it must match that
+    // gate exactly, or the mega-buffer region this rank allocates disagrees with what dispatch
+    // expects to publish into.
+    const bool group_pull_count_capable = pull_push &&
+        !nccl_ep_env_flag_on(ep_group->env.ht_em_ag_scan_mode) &&
+        !is_internode_available(ep_group) && !ep_group->eager_mode;
+    // Collective: every rank must agree, since a peer resolves pull_meta_ptrs[i] from its own
+    // group_pull_count_capable applied to peer i's IPC base -- a mismatched peer (e.g. stale env
+    // var on one rank) would otherwise compute an out-of-bounds NVLink pointer into that peer.
+    {
+        std::vector<unsigned int> all_pull_count(ep_group->nRanks, 0);
+        all_pull_count[ep_group->rank] = group_pull_count_capable ? 1u : 0u;
+        ncclAllGatherHost(
+            all_pull_count.data(), sizeof(unsigned int), ep_group->rank, ep_group->nRanks, comm, stream);
+        for (int r = 1; r < ep_group->nRanks; ++r) {
+            EP_HOST_ASSERT(
+                all_pull_count[r] == all_pull_count[0] &&
+                "ncclEpCreateGroup: NCCL_EP_HT_EM_AG_SCAN_MODE must resolve identically across ranks");
+        }
+    }
+    const size_t pull_meta_row_bytes =
+        count_row_ints * sizeof(int32_t) +
+        per_rank_tokens * static_cast<size_t>(MAX_NUM_TOPK) * sizeof(uint16_t);
+    const size_t pull_meta_stride = nccl_ep::align<size_t>(pull_meta_row_bytes, 16);
+    size_t pull_meta_aligned = group_pull_count_capable
+        ? align_ipc(static_cast<size_t>(ep_group->nRanks) * pull_meta_stride) : 0;
 
     struct StagingSegment {
         const char* name;
@@ -1237,7 +1276,8 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned +
-                     dispatch_meta_tables_aligned + combine_token_aligned + combine_prob_aligned;
+                     dispatch_meta_tables_aligned + combine_token_aligned + combine_prob_aligned +
+                     pull_meta_aligned;
     {
         ncclResult_t mega_res = ncclMemAlloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz);
         if (mega_res != ncclSuccess) epWarnMegaBufferAllocFailed(ep_group, mega_sz);
@@ -1289,10 +1329,17 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.expert_input_prob =
         reinterpret_cast<float*>(mega_base + ep_group->ht_buffers.ipc_combine_prob_offset);
 
+    ep_group->ht_buffers.ipc_pull_meta_offset =
+        dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned +
+        dispatch_meta_tables_aligned + combine_token_aligned + combine_prob_aligned;
+    ep_group->ht_buffers.pull_meta_staging =
+        group_pull_count_capable ? mega_base + ep_group->ht_buffers.ipc_pull_meta_offset : nullptr;
+
     // Host pointer arrays indexed by HT local rank within LSA team.
     size_t host_block_sz = sizeof(void*) * lsa_ranks + sizeof(float*) * lsa_ranks // dispatch prob
                            + sizeof(void*) * lsa_ranks     // dispatch scales
                            + sizeof(uint8_t*) * lsa_ranks  // dispatch count tables (count mode)
+                           + sizeof(uint8_t*) * lsa_ranks  // pull-native count/topk staging
                            + sizeof(uint16_t*) * lsa_ranks + sizeof(float*) * lsa_ranks;
     CUDA_CHECK(cudaHostAlloc(&ep_group->ht_buffers.host_ptr_block, host_block_sz, cudaHostAllocMapped));
 
@@ -1304,6 +1351,8 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs = reinterpret_cast<void**>(hptr);
     hptr += sizeof(void*) * lsa_ranks;
     ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs = reinterpret_cast<uint8_t**>(hptr);
+    hptr += sizeof(uint8_t*) * lsa_ranks;
+    ep_group->ht_buffers.pull_meta_ptrs = reinterpret_cast<uint8_t**>(hptr);
     hptr += sizeof(uint8_t*) * lsa_ranks;
     ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs = reinterpret_cast<uint16_t**>(hptr);
     hptr += sizeof(uint16_t*) * lsa_ranks;
@@ -1355,6 +1404,23 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // Group-shared count-mode / EM local-permute scratch (zeroed/written per dispatch).
     alloc_ht_count_scratch(ep_group);
 
+    // Pull-count map-build cursors (per-rank recv + per-expert EM); zeroed per UpdateHandle.
+    // +1 trailing int: DROP-mode phantom-row fixup's grid arrival counter (mirrors
+    // em_permute_cursors above; see allow_overflow_drop's doc comment on
+    // local_permute_dup_param_t in ht_ep.cuh).
+    if (group_pull_count_capable) {
+        CUDA_CHECK(ep_group->alloc.alloc_fn(
+            reinterpret_cast<void**>(&ep_group->ht_buffers.pull_recv_cursor),
+            static_cast<size_t>(lsa_ranks + num_local_experts + 1) * sizeof(int32_t), ep_group->alloc.context));
+        // Payload consumers wait for CTA 0 to publish the receiver layout.
+        CUDA_CHECK(ep_group->alloc.alloc_fn(
+            reinterpret_cast<void**>(&ep_group->ht_buffers.pull_layout_ready),
+            sizeof(int32_t), ep_group->alloc.context));
+        CUDA_CHECK(ep_group->alloc.alloc_fn(
+            reinterpret_cast<void**>(&ep_group->ht_buffers.pull_map_layout),
+            static_cast<size_t>(lsa_ranks + num_local_experts) * sizeof(int32_t), ep_group->alloc.context));
+    }
+
     // =========================================================================
     // Phase 2: Register windows for shared intra-LSA regions
     // Consolidated registration: mega buffer (token+prob+combine) & completion flags
@@ -1387,6 +1453,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
                 ep_group->ht_buffers.expert_output_scaling_factor;
             ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs[i] = ep_group->ht_buffers.expert_output_meta_tables;
+            ep_group->ht_buffers.pull_meta_ptrs[i] = ep_group->ht_buffers.pull_meta_staging;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_token;
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_prob;
         } else {
@@ -1411,6 +1478,8 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
                 pb + ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset;
             ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs[i] =
                 pb + ep_group->ht_buffers.ipc_dispatch_meta_tables_offset;
+            ep_group->ht_buffers.pull_meta_ptrs[i] =
+                group_pull_count_capable ? pb + ep_group->ht_buffers.ipc_pull_meta_offset : nullptr;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
                 skip_token_staging ? nullptr : reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
@@ -1458,6 +1527,7 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.expert_output_meta_tables = nullptr;
         ep_group->ht_buffers.expert_input_token = nullptr;
         ep_group->ht_buffers.expert_input_prob = nullptr;
+        ep_group->ht_buffers.pull_meta_staging = nullptr;
     }
     // Free the consolidated counter block (grid barriers + expected counters).
     if (ep_group->ht_buffers.dev_counter_block) {
@@ -1473,6 +1543,20 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
 
     // Free group-shared count-mode / EM local-permute scratch
     free_ht_count_scratch(ep_group);
+
+    // Free pull-count map-build cursors
+    if (ep_group->ht_buffers.pull_recv_cursor) {
+        ep_group->alloc.free_fn(ep_group->ht_buffers.pull_recv_cursor, ep_group->alloc.context);
+        ep_group->ht_buffers.pull_recv_cursor = nullptr;
+    }
+    if (ep_group->ht_buffers.pull_layout_ready) {
+        ep_group->alloc.free_fn(ep_group->ht_buffers.pull_layout_ready, ep_group->alloc.context);
+        ep_group->ht_buffers.pull_layout_ready = nullptr;
+    }
+    if (ep_group->ht_buffers.pull_map_layout) {
+        ep_group->alloc.free_fn(ep_group->ht_buffers.pull_map_layout, ep_group->alloc.context);
+        ep_group->ht_buffers.pull_map_layout = nullptr;
+    }
 
     // Free merged completion flags local allocation
     if (ep_group->ht_buffers.completion_flags_base) {
@@ -2652,6 +2736,9 @@ struct ncclEpHandle {
 
             // Count mode, always used (both fused and unfused meta dispatch): per-handle scratch
             // that persists UpdateHandle -> Dispatch, grouped so the count metadata stays one unit.
+            // own_row/cached_cnt_rows/fused_meta_dispatch are shared by EM local-permute's push-count
+            // path and kPullPush's pull-count path (mutually exclusive per group, same [nRanks |
+            // num_experts] row shape); the other fields are local-permute's push-count scratch only.
             struct {
                 // own_chunk_rank holds this rank's per-source-chunk per-dest-rank send counts so the
                 // s2d build assigns slots deterministically (rank-major, sender token order) without
@@ -2767,6 +2854,27 @@ static inline bool em_pull_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
     return em_pull_enabled(group, handle->layout);
 }
 
+// Fused pull-count gate: receiver-side MAP warps build the recv-slot/EM maps in-kernel from a
+// pulled count+topk row, replacing the scan (routing-map AllGather + host-side map build) that
+// pull dispatch otherwise depends on. Fused count stages per-handle metadata during UpdateHandle,
+// then pushes it to receiver inboxes and builds maps during dispatch. Eager mode needs maps
+// earlier and keeps using the scan path. Restricted to kPullPush within one LSA team; shares the
+// NCCL_EP_HT_EM_AG_SCAN_MODE fallback-to-scan flag with dispatch_push_count_capable, so one env
+// var forces every HT EM path back to scan for an apples-to-apples comparison.
+static inline bool dispatch_pull_count_capable(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    // dispatch_pull_map_warp packs local_expert * MAX_NUM_TOPK + topk_position into a uint16_t
+    // hit; local_expert must stay within [0, 65536 / MAX_NUM_TOPK) or it silently wraps.
+    constexpr int kPullCountMaxLocalExperts = 65536 / MAX_NUM_TOPK;
+    return !nccl_ep_env_flag_on(group->env.ht_em_ag_scan_mode) &&
+           !is_internode_available(group) &&
+           !group->eager_mode &&
+           group->num_local_experts <= kPullCountMaxLocalExperts &&
+           em_pull_enabled(group, layout);
+}
+static inline bool dispatch_pull_count_active(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    return dispatch_pull_count_capable(group, handle->layout);
+}
+
 // Push EM combine: a variant of em_permute that pushes each expert rank's locally
 // reduced token rows into the destination attn-ranks over NVLink instead of the
 // attn-ranks pulling from peer expert buffers. Part of the kPullPush recipe.
@@ -2822,6 +2930,8 @@ struct HtBlockLayout {
     size_t sz_count_scratch;
     size_t sz_recv_slot_to_src; // pull dispatch only
     size_t sz_srcpos_map;       // pull dispatch only
+    size_t sz_pull_count_own_row;     // fused pull-count only
+    size_t sz_pull_count_cached_rows; // fused pull-count only
     size_t zero_region, no_memset_region, total;
 
     static HtBlockLayout compute(ncclEpGroup_t ep_group, ncclEpLayout_t layout, int num_topk = 0) {
@@ -2949,10 +3059,26 @@ struct HtBlockLayout {
             (needs_pull_buffers && num_topk > 0)
                 ? align256(max_flat_recv_tokens * num_topk * sizeof(int32_t))
                 : 0;
+        // Fused pull-count per-handle scratch: own_row backs dispatch_pull_param_t's own_row
+        // input (this rank's count row, staged during UpdateHandle and published to peer
+        // inboxes at dispatch); cached_cnt_rows only fills when the caller also requests
+        // layout tensors (unfused AllGather tail -> compute_layout_info). Single-LSA-team
+        // only (dispatch_pull_count_capable already excludes internode), so nRanks == lsa_team_size.
+        const bool pull_count_capable_here = dispatch_pull_count_capable(ep_group, layout);
+        L.sz_pull_count_own_row =
+            pull_count_capable_here
+                ? align256(static_cast<size_t>(ep_group->nRanks + num_experts) * sizeof(int32_t))
+                : 0;
+        L.sz_pull_count_cached_rows =
+            pull_count_capable_here
+                ? align256(static_cast<size_t>(ep_group->nRanks) *
+                           (ep_group->nRanks + num_experts) * sizeof(int32_t))
+                : 0;
         L.zero_region = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
         L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
                              L.sz_emuf_group_buf + L.sz_emuf_group_count + L.sz_flat2em_slot_map +
                              L.sz_token_to_recv_slot + L.sz_count_scratch + L.sz_recv_slot_to_src +
+                             L.sz_pull_count_own_row + L.sz_pull_count_cached_rows +
                              L.sz_srcpos_map;
         L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
         return L;
@@ -3324,6 +3450,20 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     handle->ht.srcpos_map =
         (L.sz_srcpos_map > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_srcpos_map;
+    // Pull-count reuses dispatch_push_count.own_row/cached_cnt_rows/fused_meta_dispatch (see
+    // struct docstring); EM local-permute already assigned them via ht_assign_count_scratch
+    // above, so only touch them here when pull-count is the one that sized this region.
+    if (L.sz_pull_count_own_row > 0) {
+        handle->ht.dispatch_push_count.own_row = reinterpret_cast<int32_t*>(ptr + offset);
+    }
+    offset += L.sz_pull_count_own_row;
+    if (L.sz_pull_count_cached_rows > 0) {
+        handle->ht.dispatch_push_count.cached_cnt_rows = reinterpret_cast<int32_t*>(ptr + offset);
+    }
+    offset += L.sz_pull_count_cached_rows;
+    if (L.sz_pull_count_own_row > 0) {
+        handle->ht.dispatch_push_count.fused_meta_dispatch = true;
+    }
     handle->ht.dispatch_output_per_expert_alignment = 0;
 
     if (is_internode_available(ep_group)) {
@@ -3514,6 +3654,87 @@ static ncclResult_t ht_update_handle_count_mode(
     return ncclSuccess;
 }
 
+// Fused pull-count UpdateHandle path: packs this rank's top-k into the handle-local uint16
+// snapshot (dispatch_pull's own_topk_snapshot) and accumulates its send-count histogram (own_row)
+// in the same pass. dispatch_pull then publishes own_row/own_topk_snapshot to peer inboxes and
+// builds the recv-slot/EM maps in-kernel; no AllGather/scan runs here unless the caller asked
+// for layout tensors.
+static ncclResult_t ht_update_handle_pull_count_mode(
+    ncclEpGroup_t ep_group,
+    ncclEpHandle_t handle,
+    bool out_is_int64,
+    void* padded_out_counts,
+    void* out_offsets,
+    void* recv_total_counter,
+    int32_t* per_expert_counts_device,
+    int max_recv_tpr,
+    cudaStream_t stream) {
+    const int num_experts = ep_group->config.num_experts;
+    const int max_tokens = ep_group->config.max_dispatch_tokens_per_rank;
+    const int experts_per_rank = ep_group->num_local_experts;
+    const int nRanks = ep_group->nRanks;  // == lsa_team_size (single LSA team; see the gate)
+    const size_t count_row_ints = static_cast<size_t>(nRanks) + num_experts;
+
+    EP_HOST_ASSERT(ep_group->config.num_experts <= kTopkIdxInvalid);
+    uint16_t* snapshot = static_cast<uint16_t*>(handle->ht.topk_idx);
+
+    // Per-handle own_row keeps batched-ahead UpdateHandles independent (comm-free; dispatch
+    // publishes it to peer inboxes, not this call).
+    int32_t* own_row = handle->ht.dispatch_push_count.own_row;
+    int32_t* own_cnt_expert = own_row + nRanks;
+    // Zero this rank's count row [cnt_rank(nRanks) | cnt_expert(num_experts)] before the fused
+    // pack+histogram pass below accumulates into it.
+    CUDA_CHECK(cudaMemsetAsync(own_row, 0, count_row_ints * sizeof(int32_t), stream));
+    // Pack topk to uint16 into the per-handle snapshot and build the count-row histogram in one
+    // pass: the histogram atomics consume each token's uint16 conversion straight from the
+    // register that just computed it, instead of a second kernel re-reading the snapshot.
+    if (handle->topk_idx.datatype == ncclInt32) {
+        nccl_ep::ht::pack_topk_and_count_row(
+            static_cast<const int32_t*>(handle->topk_idx.data), snapshot, handle->num_tokens,
+            max_tokens, handle->num_topk, experts_per_rank, num_experts, own_row, own_cnt_expert,
+            ep_group->preprocess_num_sms, stream);
+    } else {
+        nccl_ep::ht::pack_topk_and_count_row(
+            static_cast<const int64_t*>(handle->topk_idx.data), snapshot, handle->num_tokens,
+            max_tokens, handle->num_topk, experts_per_rank, num_experts, own_row, own_cnt_expert,
+            ep_group->preprocess_num_sms, stream);
+    }
+    handle->ht.dispatch_push_count.fused_meta_dispatch = true;
+
+    // Layout outputs requested by the caller must be ready before dispatch: AllGather count
+    // rows now and derive them immediately via the same reduction the unfused push-count path
+    // uses (nccl_ep::ht::compute_layout_info), instead of waiting for dispatch to publish.
+    const bool provide_layout_info =
+        (padded_out_counts != nullptr) || (out_offsets != nullptr) || (recv_total_counter != nullptr);
+    if (provide_layout_info) {
+        NCCL_CHECK_RESULT(ncclAllGather(
+            own_row,
+            handle->ht.dispatch_push_count.cached_cnt_rows,
+            count_row_ints,
+            ncclInt32,
+            ep_group->comm,
+            stream));
+        nccl_ep::ht::compute_layout_info(
+            handle->ht.dispatch_push_count.cached_cnt_rows,
+            nRanks,
+            num_experts,
+            experts_per_rank,
+            ep_group->rank,
+            static_cast<int>(handle->ht.dispatch_output_per_expert_alignment),
+            max_recv_tpr,
+            ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
+            out_is_int64,
+            handle->ht.expert_token_offsets,
+            padded_out_counts,
+            out_offsets,
+            per_expert_counts_device,
+            recv_total_counter,
+            stream);
+        handle->ht.dispatch_push_count.fused_meta_dispatch = false;
+    }
+    return ncclSuccess;
+}
+
 ncclResult_t ncclEpUpdateHandle(
     ncclEpHandle_t handle,
     const ncclEpTensor_t* topk_idx,
@@ -3585,17 +3806,23 @@ ncclResult_t ncclEpUpdateHandle(
 
     // Count-exchange path selector (stable per group/handle); computed once and reused below.
     const bool count_mode = dispatch_push_count_active(ep_group, handle);
+    // Pull-native path selector (kPullPush): rebuild the recv-slot maps from NVLink-pulled count
+    // rows + topk instead of the uint16 AllGather + scan. Mutually exclusive with count_mode.
+    const bool pull_count = dispatch_pull_count_active(ep_group, handle);
 
     // Zero the entire preprocessing zero region (routing, r2a, a2r, ler, ntfe) in one call.
     // Buffers are allocated at max_tokens capacity, so this clears beyond the active num_tokens
     // region — safe because allgather/preprocessing will overwrite the relevant portions.
     // Count mode only needs r2a cleared here; ntfe, LERM, and a2r are handled elsewhere
-    // (dispatch, the IPC table, and the count block below).
+    // (dispatch, the IPC table, and the count block below). Pull-count touches none of these
+    // buffers: dispatch_pull/combine_push never reference r2a/a2r/LERM, and the one buffer they
+    // do share (num_tokens_for_experts) is written by dispatch before combine reads it, so a
+    // host-side zero here is never observed.
     if (count_mode) {
         const int padded_max_tokens = nccl_ep::align(max_tokens, 16);
         CUDA_CHECK(cudaMemsetAsync(
             handle->ht.rdma_to_attn_map, 0, (size_t)nNodes * padded_max_tokens * sizeof(bool), stream));
-    } else {
+    } else if (!pull_count) {
         CUDA_CHECK(cudaMemsetAsync(
             handle->ht.preprocessing_block, 0, handle->ht.preprocessing_zero_region_size, stream));
     }
@@ -3612,7 +3839,8 @@ ncclResult_t ncclEpUpdateHandle(
             stream));
     }
 
-    const bool use_topk_idx_scan = em_pull && ep_group->ht_buffers.global_topk_idx != nullptr;
+    // Fused pull-count pushes count + topk during dispatch and skips the AllGather-backed scan.
+    const bool use_topk_idx_scan = em_pull && !pull_count && ep_group->ht_buffers.global_topk_idx != nullptr;
 
     // The routing bitmap is not allocated under pull (the scan reads global_topk_idx),
     // so resolve the send pointer only on the bitmap path.
@@ -3621,7 +3849,9 @@ ncclResult_t ncclEpUpdateHandle(
     // Count mode skips the bitmap here too, using a count AllGather instead, same as pull
     // dispatch (which scans the order-preserving uint16 topk map).
     // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
-    if (!count_mode && !use_topk_idx_scan) {
+    // Pull modes (scan-topk or pull-count) never build the bitmap and do not allocate
+    // global_routing_map, so skip it for any em_pull path.
+    if (!count_mode && !use_topk_idx_scan && !em_pull) {
         uint8_t* local_routing_send_ptr = global_routing_map + (max_tokens * routing_row_bytes) * ep_group->rank;
         // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
         // ncclAllGather below ships max_tokens rows and stale tail bits would otherwise
@@ -3795,6 +4025,11 @@ ncclResult_t ncclEpUpdateHandle(
 
     if (count_mode) {
         return ht_update_handle_count_mode(
+            ep_group, handle, out_is_int64, padded_out_counts, out_offsets, recv_total_counter,
+            per_expert_counts_device, max_recv_tpr, stream);
+    }
+    if (pull_count) {
+        return ht_update_handle_pull_count_mode(
             ep_group, handle, out_is_int64, padded_out_counts, out_offsets, recv_total_counter,
             per_expert_counts_device, max_recv_tpr, stream);
     }
@@ -4550,6 +4785,14 @@ ncclResult_t ncclEpDispatch(
         const bool em_permute_active = em_local_permute_enabled(group, handle);
         // Count-exchange path selector (stable per group/handle); computed once and reused below.
         const bool count_mode = dispatch_push_count_active(group, handle);
+        // Pull-count: the recv-map rebuild always runs inside dispatch_pull's MAP warp group.
+        // Requested layout outputs make UpdateHandle gather count rows ahead of dispatch.
+        const bool pull_count_dispatch = dispatch_pull_count_active(group, handle);
+        // Only forward rebuilds the recv-map (Phase 0 + Phase 1 MAP warps use a per-call atomic
+        // cursor, so re-running them on backward would reassign rows nondeterministically);
+        // backward reuses flat2em_slot_map/srcpos_map/recv_slot_to_src persisted from forward,
+        // same convention as count_lean_build below.
+        const bool pull_count_rebuild = pull_count_dispatch && forward_dispatch;
 
         if (rcv_x_zcopy && !em_permute_active) {
             NCCLCHECK(buildIntranodePtrArray<void>(group, recv_x, dispatch_output_token_ptrs));
@@ -5116,6 +5359,87 @@ ncclResult_t ncclEpDispatch(
                             group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs);
                     }
                 }
+                // Pull-count: the recv-map rebuild (Phase 0 + Phase 1) runs inside this dispatch
+                // launch's MAP warp group, never in UpdateHandle, so the cursors/flags it claims
+                // through need a fresh per-call zero here.
+                const uint8_t* const* pull_meta_ptrs = nullptr;
+                int pull_topk_off_bytes = 0;
+                int32_t* pull_rank_cursor = nullptr;
+                int32_t* pull_expert_cursor = nullptr;
+                int32_t* pull_layout_ready = nullptr;
+                int32_t* pull_layout_slot_base = nullptr;
+                int32_t* pull_layout_expert_base = nullptr;
+                if (pull_count_rebuild) {
+                    const size_t count_row_ints =
+                        static_cast<size_t>(lsa_ranks) + static_cast<size_t>(group->config.num_experts);
+                    pull_meta_ptrs = reinterpret_cast<const uint8_t* const*>(group->ht_buffers.pull_meta_ptrs);
+                    pull_topk_off_bytes = static_cast<int>(count_row_ints * sizeof(int32_t));
+                    pull_rank_cursor = group->ht_buffers.pull_recv_cursor;
+                    pull_expert_cursor = group->ht_buffers.pull_recv_cursor + lsa_ranks;
+                    pull_layout_ready = group->ht_buffers.pull_layout_ready;
+                    pull_layout_slot_base = group->ht_buffers.pull_map_layout;
+                    pull_layout_expert_base = group->ht_buffers.pull_map_layout + lsa_ranks;
+                    // +1: the phantom-row fixup's grid arrival counter (trailing slot).
+                    CUDA_CHECK(cudaMemsetAsync(
+                        pull_rank_cursor, 0,
+                        static_cast<size_t>(lsa_ranks + group->num_local_experts + 1) * sizeof(int32_t), stream));
+                }
+                // Pull-count builds recv_slot_to_src/srcpos_map in-kernel (the scan never runs),
+                // so their FLAT-slot capacity must be recomputed here to match HtBlockLayout's
+                // sizing of those handle buffers exactly (single-LSA-team only: rdma_team_size == 1).
+                const int pull_flat_recv_capacity = pull_count_dispatch
+                    ? static_cast<int>(std::min<size_t>(
+                          static_cast<size_t>(group->max_recv_tokens),
+                          static_cast<size_t>(group->config.max_dispatch_tokens_per_rank) *
+                              static_cast<size_t>(lsa_ranks) * static_cast<size_t>(group->rdma_team_size)))
+                    : 0;
+                // Caller's padded per-expert offsets/counts + recv_total, wired from this call's
+                // layout_info when provided; the MAP warps publish them post-build (receiver-local).
+                // Only wired on the rebuild pass (forward): backward reuses the persisted maps and
+                // never re-runs the MAP warps that would publish these.
+                void* pull_caller_offsets = nullptr;
+                void* pull_caller_counts = nullptr;
+                void* pull_caller_recv_total = nullptr;
+                bool pull_caller_out_is_int64 = true;
+                if (pull_count_rebuild) {
+                    const ncclEpTensor_t* caller_offsets_tensor =
+                        layout_info ? tensor_ptr(layout_info->expert_offsets) : nullptr;
+                    const ncclEpTensor_t* caller_counts_tensor =
+                        layout_info ? tensor_ptr(layout_info->expert_counters) : nullptr;
+                    auto check_pull_caller_tensor = [&](const ncclEpTensor_t* t) {
+                        EP_HOST_ASSERT(t->ndim == 1 && "tensor must be 1D");
+                        EP_HOST_ASSERT((t->datatype == ncclInt32 || t->datatype == ncclInt64) && "tensor must be ncclInt32 or ncclInt64");
+                        EP_HOST_ASSERT(
+                            t->sizes[0] >= static_cast<size_t>(group->num_local_experts) &&
+                            "tensor size must be >= num_local_experts");
+                        EP_HOST_ASSERT(t->data != nullptr && "tensor data must not be null");
+                    };
+                    if (caller_offsets_tensor) check_pull_caller_tensor(caller_offsets_tensor);
+                    if (caller_counts_tensor) check_pull_caller_tensor(caller_counts_tensor);
+                    if (caller_offsets_tensor && caller_counts_tensor)
+                        EP_HOST_ASSERT(
+                            caller_offsets_tensor->datatype == caller_counts_tensor->datatype &&
+                            "expert_offsets and expert_counters must share dtype");
+                    pull_caller_offsets = caller_offsets_tensor ? caller_offsets_tensor->data : nullptr;
+                    pull_caller_counts = caller_counts_tensor ? caller_counts_tensor->data : nullptr;
+                    const ncclEpTensor_t* recv_total_tensor =
+                        layout_info ? tensor_ptr(layout_info->recv_total_counter) : nullptr;
+                    pull_caller_out_is_int64 =
+                        caller_counts_tensor  ? (caller_counts_tensor->datatype == ncclInt64)
+                        : caller_offsets_tensor ? (caller_offsets_tensor->datatype == ncclInt64)
+                        : recv_total_tensor      ? (recv_total_tensor->datatype == ncclInt64)
+                                                  : true;
+                    if (recv_total_tensor) {
+                        EP_HOST_ASSERT(recv_total_tensor->ndim == 1 && "recv_total_counter must be 1D");
+                        EP_HOST_ASSERT(recv_total_tensor->sizes[0] >= 1 && "recv_total_counter size must be >= 1");
+                        EP_HOST_ASSERT((recv_total_tensor->datatype == ncclInt32 || recv_total_tensor->datatype == ncclInt64) &&
+                               "recv_total_counter must be ncclInt32 or ncclInt64");
+                        EP_HOST_ASSERT(recv_total_tensor->data != nullptr && "recv_total_counter data must not be null");
+                        EP_HOST_ASSERT((recv_total_tensor->datatype == ncclInt64) == pull_caller_out_is_int64 &&
+                               "recv_total_counter dtype must match expert_counters/offsets");
+                    }
+                    pull_caller_recv_total = recv_total_tensor ? recv_total_tensor->data : nullptr;
+                }
                 NCCLCHECK(nccl_ep::ht::launch_dispatch_pull(
                     recv_x->data,
                     deliver_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
@@ -5145,7 +5469,28 @@ ncclResult_t ncclEpDispatch(
                     group->ht_buffers.combine_grid_barrier_counter,  // head gate (idle during dispatch)
                     group->ht_buffers.dispatch_grid_barrier_counter, // tail elect-last-block
                     stream,
-                    nccl_ep_env_flag_on(group->env.ht_unfused_sync)));
+                    nccl_ep_env_flag_on(group->env.ht_unfused_sync),
+                    pull_meta_ptrs,
+                    pull_topk_off_bytes,
+                    pull_rank_cursor,
+                    pull_expert_cursor,
+                    pull_layout_ready,
+                    group->lsa_rank,
+                    group->max_recv_tokens,
+                    pull_flat_recv_capacity,
+                    static_cast<int>(handle->ht.dispatch_output_per_expert_alignment),
+                    group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
+                    pull_count_rebuild ? handle->ht.dispatch_push_count.own_row : nullptr,
+                    pull_count_rebuild ? static_cast<const uint16_t*>(handle->ht.topk_idx) : nullptr,
+                    pull_count_rebuild ? group->ht_buffers.pull_meta_staging : nullptr,
+                    pull_layout_slot_base,
+                    pull_layout_expert_base,
+                    pull_count_rebuild && !handle->ht.dispatch_push_count.fused_meta_dispatch
+                        ? handle->ht.dispatch_push_count.cached_cnt_rows : nullptr,
+                    pull_caller_offsets,
+                    pull_caller_counts,
+                    pull_caller_recv_total,
+                    pull_caller_out_is_int64));
             } else {
                 // Count mode: the permute builds the flat2em rows inline from the
                 // MAP-written LERM (FWD only; BWD reuses the rows persisted by the FWD
