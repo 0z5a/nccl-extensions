@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nccl-cp"
+version = "0.1.0.dev1"
+description = "NCCL context-parallel group communication"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["torch>=2.12"]
+
+[tool.setuptools]
+packages = ["nccl.cp"]
+package-dir = { "nccl.cp" = "src" }
+
+[tool.setuptools.package-data]
+"nccl.cp" = ["*.cpp", "*.cu", "*.h", "*.pyi", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Keep the existing internal import grouping.
+"src/*.py" = ["I001"]

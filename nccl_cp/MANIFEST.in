@@ -1,0 +1,8 @@
+include LICENSE NOTICE README.md
+recursive-include src *.py *.pyi *.cpp *.cu *.h
+include src/py.typed
+recursive-include tests *.py
+include CMakeLists.txt Makefile
+recursive-include tools *.py *.sh
+recursive-include cmake *.cmake
+recursive-include examples *.py

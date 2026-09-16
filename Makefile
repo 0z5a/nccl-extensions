@@ -8,6 +8,13 @@
 .DEFAULT_GOAL := all
 
 EXTENSIONS := nccl_ep nccl_m2n
+NCCL_EXTENSIONS_BUILD_CP ?= 0
+ifeq ($(NCCL_EXTENSIONS_BUILD_CP),1)
+EXTENSIONS += nccl_cp
+endif
+CMAKE ?= cmake
+NCCL_CP_CMAKE_FLAGS ?=
+NCCL_CP_BUILDDIR ?= $(BUILDDIR)/nccl_cp
 
 .PHONY: all clean nccl-submodule
 
@@ -50,3 +57,16 @@ nccl-submodule:
 	fi
 	$(MAKE) -C $(NCCL_SUBMODULE_HOME) -j src.build \
 		BUILDDIR=$(ABS_NCCL_BUILDDIR)
+
+
+.PHONY: nccl_cp.build nccl_cp.stage nccl_cp.clean
+nccl_cp.build: $(NCCL_BUILD_PREREQUISITE)
+	$(CMAKE) -S "$(REPO_ROOT)/nccl_cp" -B "$(NCCL_CP_BUILDDIR)" -G "Unix Makefiles" \
+		-DNCCL_HOME="$(ABS_NCCL_HOME)" $(NCCL_CP_CMAKE_FLAGS)
+	$(CMAKE) --build "$(NCCL_CP_BUILDDIR)" --parallel
+
+nccl_cp.stage: nccl_cp.build
+	$(CMAKE) -E copy_directory "$(NCCL_CP_BUILDDIR)/python/nccl/cp" "$(REPO_ROOT)/python/nccl/cp"
+
+nccl_cp.clean:
+	@if [ -f "$(NCCL_CP_BUILDDIR)/CMakeCache.txt" ]; then $(CMAKE) --build "$(NCCL_CP_BUILDDIR)" --target clean; fi
