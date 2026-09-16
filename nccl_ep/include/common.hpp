@@ -163,6 +163,23 @@ __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ((a + b - 1) / b) * b;
 }
 
+// Expert / rank index arithmetic of the LL dispatch protocol, kept next to the
+// header layout it addresses so other device headers and host code can reuse it.
+__host__ __device__ __forceinline__ int getLocalExpertIdx(int expertIdx, int numLocalExperts) {
+    return (expertIdx >= 0) ? expertIdx % numLocalExperts : -1;
+}
+
+// Sender's slot relative to the receiver around the rank ring, in [0, numRanks).
+// Relative indexing distributes the NVLink staging addresses across receivers.
+__host__ __device__ __forceinline__ int relativeRankSlot(int senderRank, int receiverRank, int numRanks) {
+    return (senderRank >= receiverRank) ? (senderRank - receiverRank)
+                                         : (senderRank - receiverRank + numRanks);
+}
+
+__host__ __device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExperts) {
+    return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
+}
+
 // Per-hop routing entry in the dispatch message header.
 // Rank-major carries the topk weight on the wire so the receiver can write
 // outRecvTopkWeights without an extra round-trip. Expert-major omits it,
@@ -200,7 +217,7 @@ static_assert(offsetof(DispatchHdr<NCCL_EP_LAYOUT_EXPERT_MAJOR>, rtr) == 4, "une
 // Dispatch header wire size: token_id prefix through last rtr entry, rounded up
 // to int4 (16-byte) boundary for vectorized RDMA access.
 template <ncclEpLayout_t kLayout>
-__host__ __device__ __forceinline__ size_t get_dispatch_hdr_sz(int num_topk) {
+__host__ __device__ __forceinline__ constexpr size_t get_dispatch_hdr_sz(int num_topk) {
     const size_t base_sz =
         offsetof(DispatchHdr<kLayout>, rtr) + static_cast<size_t>(num_topk) * sizeof(DispatchRouter<kLayout>);
     return align<size_t>(base_sz, sizeof(int4));
