@@ -137,18 +137,59 @@ traffic. Configuration does not convert tensors. A slot can reuse a larger byte
 capacity, but token/domain capacities must match; use another slot for different
 bounds.
 
-A layout lists token identities in tensor row order, using integer IDs or
-half-open `TokenRange(start, stop)` intervals:
+### Handle input and output layouts
+
+Both layouts are host-side `Sequence[int | TokenRange]` descriptions. Each integer
+identifies one token occurrence; `TokenRange(start, stop)` describes the half-open
+interval `[start, stop)` in ascending order. IDs are shared across the group and
+identify token occurrences, not vocabulary entries. They carry no tensor data.
+
+| Argument | What this rank declares | Tensor row mapping |
+|---|---|---|
+| `local_input_layout` | Tokens owned by this rank, in local input order | Cast input and reduce output |
+| `local_output_layout` | Tokens this rank requests, in the desired result order | Valid cast output prefix and valid reduce input prefix |
+
+`local_input_layout` describes **every row of the supplied cast input**, in
+axis-0 order. Its expanded token count must equal both the cast input row count
+and the reduce output row count. Each declared token ID belongs to exactly one
+rank in the group; IDs can be nonconsecutive and need not be numerically sorted.
+Include each input row even when no rank requests it. Rows unrequested by every
+rank do not appear in cast outputs, and their reduce output values stay unchanged.
+
+`local_output_layout` describes the **complete requested output**, including
+remote tokens and any locally owned tokens that should appear in the result.
+The caller does not need to know the remote owners: handle preparation resolves
+them from the input layouts exchanged across the group.
+
+For example, suppose this rank owns `[100, 101, 102]` and another owner declares
+`[200, 201]` in that order:
 
 ```python
 from nccl.cp import TokenRange
-local_input_layout = [TokenRange(100, 200), 300]
+
+local_input_layout = [TokenRange(100, 103)]
+local_output_layout = [100, 200, 101, 201]
 ```
 
-IDs identify token occurrences, not vocabulary entries. Every token has exactly
-one owner; local layouts cannot repeat IDs. Output requests preserve input order
-within each source rank; different sources may interleave. The caller binds
-these identities to actual tensor contents.
+Cast writes rows for tokens `100, 200, 101, 201` in exactly that order. Reduce
+reads contributions in the same order and sends each back to its owner;
+this rank's accumulator rows still correspond to `100, 101, 102`. If no rank
+requests token `102`, its accumulator row is left unchanged.
+
+- Every requested ID must have exactly one owner. Neither local layout may
+  repeat an ID, including through overlapping ranges.
+- Requests from the same owner must preserve that owner's declared input order;
+  different owners may interleave. This is not a numeric sorting requirement.
+  In the example, requesting `101` before `100` is invalid.
+- The logical row count is the sum of interval lengths and individual IDs,
+  not the number of layout entries. The example has three input rows and four
+  output rows. Additional output buffer capacity is not listed in the layout.
+- `local_input_layout=[]` declares no owned rows: cast input and reduce output
+  have zero rows. The output layout may still request tokens owned by other ranks.
+- `local_output_layout=[]` requests no rows. The rank still participates in
+  matching calls and may have relay work.
+
+The caller keeps actual tensor rows consistent with these descriptions.
 
 `create_handle(group, local_input_layout, local_output_layout, *, stream)` exchanges
 layouts and prepares this rank's route and relay work. Changed ownership, requests
