@@ -623,7 +623,7 @@ void signal_peers(
   });
 }
 
-bool reclaim_workspace(ZeroCtaRuntime& runtime) {
+void reclaim_workspace(ZeroCtaRuntime& runtime) {
   TORCH_CHECK(runtime.signal_state != nullptr, "zero-CTA signal state is missing");
   std::lock_guard<std::mutex> lock(runtime.signal_state->mutex);
   auto& pending = runtime.signal_state->pending_reclaims;
@@ -631,7 +631,7 @@ bool reclaim_workspace(ZeroCtaRuntime& runtime) {
       pending.begin(), pending.end(), [&](const PendingReclaim& reclaim) {
         return reclaim.runtime_slot == runtime.runtime_slot_value;
       });
-  if (target == pending.end()) return false;
+  if (target == pending.end()) return;
 
   NvtxRange range("zero_cta_cpp.reclaim_workspace");
   const size_t count = static_cast<size_t>(target - pending.begin()) + 1;
@@ -649,7 +649,6 @@ bool reclaim_workspace(ZeroCtaRuntime& runtime) {
     pending.pop_front();
   }
   mark_gpu_completion(runtime, GpuCompletionMarker::kPeerPostProcessDone);
-  return true;
 }
 
 at::Tensor workspace_view(
@@ -752,16 +751,14 @@ std::shared_ptr<at::cuda::CUDAEvent> record_event(
   return event;
 }
 
-void wait_for_hierarchical_workspace_reclaim_before_pack(
+void wait_for_workspace_reclaim_before_pack(
     ZeroCtaRuntime& runtime,
     at::cuda::CUDAStream process_stream) {
   c10::cuda::CUDAStreamGuard comm_stream_guard(*runtime.comm_stream);
-  if (!reclaim_workspace(runtime)) return;
+  reclaim_workspace(runtime);
 
-  // The pack kernel writes the shared send workspace.  Waiting only on the
-  // communication stream is insufficient when consecutive collectives use
-  // different caller streams: the new pack could otherwise overwrite the
-  // workspace before the previous post-process and peer reclaim complete.
+  // Another slot may have dequeued this reclaim before its GPU work completes.
+  // Always fence the comm stream before pack overwrites the shared workspace.
   auto workspace_ready = record_event(*runtime.comm_stream);
   workspace_ready->block(process_stream);
 }
@@ -808,11 +805,12 @@ PendingCollective enqueue_direct(
       token_elements,
       per_token_bytes,
       input.scalar_type());
+  const auto process_stream = at::cuda::getCurrentCUDAStream();
+  wait_for_workspace_reclaim_before_pack(runtime, process_stream);
   at::cuda::CUDAEvent pack_ready(cudaEventDisableTiming);
   launch_pack(input, send_buffer, plan, pack_ready);
 
   c10::cuda::CUDAStreamGuard comm_stream_guard(*runtime.comm_stream);
-  reclaim_workspace(runtime);
   pack_ready.block(*runtime.comm_stream);
   mark_gpu_completion(runtime, GpuCompletionMarker::kPackReady);
   {
@@ -838,7 +836,7 @@ PendingCollective enqueue_hierarchical_cast(
     const ZeroCtaPlan& plan,
     const HierarchicalViews& buffers) {
   const auto process_stream = at::cuda::getCurrentCUDAStream();
-  wait_for_hierarchical_workspace_reclaim_before_pack(runtime, process_stream);
+  wait_for_workspace_reclaim_before_pack(runtime, process_stream);
   at::cuda::CUDAEvent pack_ready(cudaEventDisableTiming);
   launch_pack(input, buffers.node_send_buffer, plan, pack_ready);
 
@@ -879,7 +877,7 @@ PendingCollective enqueue_hierarchical_reduce(
     const ZeroCtaPlan& plan,
     const HierarchicalViews& buffers) {
   const auto process_stream = at::cuda::getCurrentCUDAStream();
-  wait_for_hierarchical_workspace_reclaim_before_pack(runtime, process_stream);
+  wait_for_workspace_reclaim_before_pack(runtime, process_stream);
   at::cuda::CUDAEvent pack_ready(cudaEventDisableTiming);
   launch_pack(input, buffers.raw_send_buffer, plan, pack_ready);
 
