@@ -1145,6 +1145,28 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     size_t combine_token_aligned = skip_token_staging ? 0 : align_ipc(expert_input_token_sz);
     size_t combine_prob_aligned = align_ipc(expert_input_prob_sz);
 
+    struct StagingSegment {
+        const char* name;
+        size_t size;
+    };
+    const StagingSegment staging_segments[] = {
+        {"dispatch token", dispatch_token_aligned},
+        {"dispatch probability", dispatch_prob_aligned},
+        {"dispatch scaling factor", dispatch_sf_aligned},
+        {"combine token", combine_token_aligned},
+        {"combine probability", combine_prob_aligned},
+    };
+    for (const StagingSegment& segment : staging_segments) {
+        if ((segment.size & 255) != 0) {
+            std::fprintf(
+                stderr,
+                "NCCL EP: HT %s staging segment size is not 256-byte aligned (%zu bytes)\n",
+                segment.name,
+                segment.size);
+            return ncclInternalError;
+        }
+    }
+
     size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned +
                      combine_prob_aligned;
     {
@@ -1155,6 +1177,13 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.ipc_mega_buffer_size = mega_sz;
 
     uint8_t* mega_base = static_cast<uint8_t*>(ep_group->ht_buffers.ipc_mega_buffer);
+    if ((reinterpret_cast<uintptr_t>(mega_base) & 255) != 0) {
+        std::fprintf(
+            stderr,
+            "NCCL EP: HT staging mega-buffer is not 256-byte aligned (%p)\n",
+            static_cast<void*>(mega_base));
+        return ncclInternalError;
+    }
     ep_group->ht_buffers.ipc_dispatch_token_offset = 0;
     ep_group->ht_buffers.expert_output_token = skip_token_staging ? nullptr : mega_base;
 
@@ -1277,6 +1306,14 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             NCCL_CHECK_RESULT(
                 ncclGetPeerDevicePointer(ep_group->ht_buffers.intranode_mega_window, 0, peer_global, &peer_base));
             uint8_t* pb = static_cast<uint8_t*>(peer_base);
+            if ((reinterpret_cast<uintptr_t>(pb) & 255) != 0) {
+                std::fprintf(
+                    stderr,
+                    "NCCL EP: HT staging peer pointer for rank %d is not 256-byte aligned (%p)\n",
+                    peer_global,
+                    peer_base);
+                return ncclInternalError;
+            }
             ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
                 skip_token_staging ? nullptr : pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
