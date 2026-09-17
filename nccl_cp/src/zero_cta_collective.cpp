@@ -1086,18 +1086,16 @@ class ZeroCtaWork final : public c10d::Work {
       auto reclaim_signals = runtime_->peer_post_process_peers;
       auto reclaim_waits = runtime_->peer_post_process_peers;
       if (reduce && runtime_->hierarchical()) {
-        // Reduce post-process reads only the local receive window. Notify its
-        // actual writers and wait only for receive windows populated by us.
-        reclaim_signals = plan_->remote_data_waits;
-        reclaim_waits.clear();
-        for (int peer = 0; peer < runtime_->world_size; ++peer) {
-          if (peer != runtime_->rank && plan_->send_token_counts[peer] > 0) {
-            ncclWaitSignalDesc_t desc{};
-            desc.opCnt = 1;
-            desc.peer = peer;
-            reclaim_waits.push_back(desc);
+        // Routes and byte strides can change on the next collective. Fence
+        // every same-lane peer before reusing the receive window.
+        reclaim_signals.clear();
+        for (const auto& peer : runtime_->peer_post_process_peers) {
+          if (peer.peer % runtime_->nvl_domain_size_value ==
+              runtime_->rank % runtime_->nvl_domain_size_value) {
+            reclaim_signals.push_back(peer);
           }
         }
+        reclaim_waits = reclaim_signals;
       }
       runtime_->signal_state->pending_reclaims.push_back(
           PendingReclaim{
