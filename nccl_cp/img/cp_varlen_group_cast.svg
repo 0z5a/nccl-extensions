@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1660" height="1250" viewBox="0 0 1660 1250" role="img" aria-labelledby="title description">
+<title id="title">Variable-length causal attention with three documents and four CP ranks</title>
+<desc id="description">Three packed documents contain 4000, 8000, and 12000 tokens. Each is split into eight equal chunks assigned to ranks 0, 1, 2, 3, 3, 2, 1, 0. Attention is causal within each document, with no cross-document attention. The communication panel shows rank 2 receiving 3000 KV tokens from rank 0, 3000 from rank 1, and 6000 from rank 3, while keeping 6000 local KV tokens. It requests token ranges [0, 3000), [4000, 10000), and [12000, 21000).</desc>
+<defs><style>text {font-family: Arial, Helvetica, sans-serif;} .mono {font-family: "DejaVu Sans Mono", Menlo, monospace;}</style>
+<marker id="arrow0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#b95665"/></marker>
+<marker id="arrow1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#bb7a2f"/></marker>
+<marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#287f79"/></marker>
+<marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#496fad"/></marker>
+</defs>
+<rect x="0" y="0" width="1660" height="1250" fill="#ffffff"/>
+<text x="56" y="53" font-size="35" fill="#27313b" font-weight="600">Packed variable-length causal attention</text>
+<text x="56" y="91" font-size="23" fill="#657384">3 documents · 4 CP ranks · selective KV group_cast</text>
+<rect x="56" y="117" width="28" height="24" fill="#f2c1c7" stroke="#b95665" stroke-width="1.5" rx="4"/>
+<text x="96" y="137" font-size="21" fill="#27313b">CP rank 0</text>
+<rect x="253" y="117" width="28" height="24" fill="#f7d09a" stroke="#bb7a2f" stroke-width="1.5" rx="4"/>
+<text x="293" y="137" font-size="21" fill="#27313b">CP rank 1</text>
+<rect x="450" y="117" width="28" height="24" fill="#a8d5d1" stroke="#287f79" stroke-width="1.5" rx="4"/>
+<text x="490" y="137" font-size="21" fill="#27313b">CP rank 2</text>
+<rect x="647" y="117" width="28" height="24" fill="#a9bfe7" stroke="#496fad" stroke-width="1.5" rx="4"/>
+<text x="687" y="137" font-size="21" fill="#27313b">CP rank 3</text>
+<text x="927" y="136" font-size="21" fill="#657384">Each document is split into 8 equal chunks.</text>
+<text x="56" y="195" font-size="25" fill="#27313b" font-weight="600">01   Document-local causal masks</text>
+<text x="927" y="195" font-size="25" fill="#27313b" font-weight="600">02   group_cast into rank 2</text>
+<text x="927" y="235" font-size="21" fill="#657384">Three peers supply the requested remote KV ranges.</text>
+<text x="488" y="240" font-size="23" fill="#27313b" text-anchor="middle">K / V tokens</text>
+<rect x="128" y="332" width="720" height="720" fill="#f3f5f8" stroke="#596575" stroke-width="1.6"/>
+<rect x="128" y="253" width="120" height="27" fill="#eef1f5" stroke="#d8dee7" stroke-width="1"/>
+<text x="188" y="273" font-size="18" fill="#27313b" text-anchor="middle">Doc 0 · 4k</text>
+<rect x="128" y="332" width="120" height="120" fill="#ffffff" stroke="#758294" stroke-width="1.2"/>
+<rect x="128" y="286" width="15" height="17" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="332" width="16" height="15" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 332 H128 L143 347 H128 Z" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="143" y="286" width="15" height="17" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="347" width="16" height="15" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 347 H143 L158 362 H128 Z" fill="#f7d09a" stroke="#ffffff" stroke-width="0.65" />
+<rect x="158" y="286" width="15" height="17" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="362" width="16" height="15" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 362 H158 L173 377 H128 Z" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.65" />
+<rect x="173" y="286" width="15" height="17" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="377" width="16" height="15" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 377 H173 L188 392 H128 Z" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="188" y="286" width="15" height="17" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="392" width="16" height="15" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 392 H188 L203 407 H128 Z" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="203" y="286" width="15" height="17" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="407" width="16" height="15" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 407 H203 L218 422 H128 Z" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.65" />
+<rect x="218" y="286" width="15" height="17" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="422" width="16" height="15" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 422 H218 L233 437 H128 Z" fill="#f7d09a" stroke="#ffffff" stroke-width="0.65" />
+<rect x="233" y="286" width="15" height="17" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="437" width="16" height="15" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M128 437 H233 L248 452 H128 Z" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.65" />
+<path d="M128 332 L248 452 H128 Z" fill="none" stroke="#3d4856" stroke-width="1.8" />
+<rect x="248" y="253" width="240" height="27" fill="#eef1f5" stroke="#d8dee7" stroke-width="1"/>
+<text x="368" y="273" font-size="18" fill="#27313b" text-anchor="middle">Doc 1 · 8k</text>
+<rect x="248" y="452" width="240" height="240" fill="#ffffff" stroke="#758294" stroke-width="1.2"/>
+<rect x="248" y="286" width="30" height="17" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="452" width="16" height="30" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 452 H248 L278 482 H248 Z" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="278" y="286" width="30" height="17" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="482" width="16" height="30" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 482 H278 L308 512 H248 Z" fill="#f7d09a" stroke="#ffffff" stroke-width="0.65" />
+<rect x="308" y="286" width="30" height="17" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="512" width="16" height="30" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 512 H308 L338 542 H248 Z" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.65" />
+<rect x="338" y="286" width="30" height="17" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="542" width="16" height="30" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 542 H338 L368 572 H248 Z" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="368" y="286" width="30" height="17" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="572" width="16" height="30" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 572 H368 L398 602 H248 Z" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="398" y="286" width="30" height="17" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="602" width="16" height="30" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 602 H398 L428 632 H248 Z" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.65" />
+<rect x="428" y="286" width="30" height="17" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="632" width="16" height="30" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 632 H428 L458 662 H248 Z" fill="#f7d09a" stroke="#ffffff" stroke-width="0.65" />
+<rect x="458" y="286" width="30" height="17" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="662" width="16" height="30" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M248 662 H458 L488 692 H248 Z" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.65" />
+<path d="M248 452 L488 692 H248 Z" fill="none" stroke="#3d4856" stroke-width="1.8" />
+<rect x="488" y="253" width="360" height="27" fill="#eef1f5" stroke="#d8dee7" stroke-width="1"/>
+<text x="668" y="273" font-size="18" fill="#27313b" text-anchor="middle">Doc 2 · 12k</text>
+<rect x="488" y="692" width="360" height="360" fill="#ffffff" stroke="#758294" stroke-width="1.2"/>
+<rect x="488" y="286" width="45" height="17" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="692" width="16" height="45" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 692 H488 L533 737 H488 Z" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="533" y="286" width="45" height="17" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="737" width="16" height="45" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 737 H533 L578 782 H488 Z" fill="#f7d09a" stroke="#ffffff" stroke-width="0.65" />
+<rect x="578" y="286" width="45" height="17" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="782" width="16" height="45" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 782 H578 L623 827 H488 Z" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.65" />
+<rect x="623" y="286" width="45" height="17" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="827" width="16" height="45" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 827 H623 L668 872 H488 Z" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="668" y="286" width="45" height="17" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="872" width="16" height="45" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 872 H668 L713 917 H488 Z" fill="#a9bfe7" stroke="#ffffff" stroke-width="0.65" />
+<rect x="713" y="286" width="45" height="17" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="917" width="16" height="45" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 917 H713 L758 962 H488 Z" fill="#a8d5d1" stroke="#ffffff" stroke-width="0.65" />
+<rect x="758" y="286" width="45" height="17" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="962" width="16" height="45" fill="#f7d09a" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 962 H758 L803 1007 H488 Z" fill="#f7d09a" stroke="#ffffff" stroke-width="0.65" />
+<rect x="803" y="286" width="45" height="17" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<rect x="99" y="1007" width="16" height="45" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.5"/>
+<path d="M488 1007 H803 L848 1052 H488 Z" fill="#f2c1c7" stroke="#ffffff" stroke-width="0.65" />
+<path d="M488 692 L848 1052 H488 Z" fill="none" stroke="#3d4856" stroke-width="1.8" />
+<text x="128" y="324" font-size="17" fill="#27313b" text-anchor="middle" class="mono">0</text>
+<text x="88" y="338" font-size="17" fill="#27313b" text-anchor="end" class="mono">0</text>
+<text x="248" y="324" font-size="17" fill="#27313b" text-anchor="middle" class="mono">4000</text>
+<text x="88" y="458" font-size="17" fill="#27313b" text-anchor="end" class="mono">4000</text>
+<text x="488" y="324" font-size="17" fill="#27313b" text-anchor="middle" class="mono">12000</text>
+<text x="88" y="698" font-size="17" fill="#27313b" text-anchor="end" class="mono">12000</text>
+<text x="848" y="324" font-size="17" fill="#27313b" text-anchor="middle" class="mono">24000</text>
+<text x="88" y="1058" font-size="17" fill="#27313b" text-anchor="end" class="mono">24000</text>
+<text x="20" y="692" font-size="23" fill="#27313b" text-anchor="middle" transform="rotate(-90 20 692)">Q tokens</text>
+<text x="650" y="461" font-size="23" fill="#788596" text-anchor="middle">No cross-document</text>
+<text x="650" y="494" font-size="23" fill="#788596" text-anchor="middle">attention</text>
+<text x="736" y="769" font-size="18" fill="#788596" text-anchor="middle">Future KV</text>
+<text x="736" y="797" font-size="18" fill="#788596" text-anchor="middle">masked</text>
+<text x="128" y="1088" font-size="20" fill="#27313b">Local zigzag ownership within each document</text>
+<rect x="128" y="1103" width="90" height="31" fill="#f2c1c7" stroke="#ffffff" stroke-width="1"/>
+<text x="173" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 0</text>
+<rect x="218" y="1103" width="90" height="31" fill="#f7d09a" stroke="#ffffff" stroke-width="1"/>
+<text x="263" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 1</text>
+<rect x="308" y="1103" width="90" height="31" fill="#a8d5d1" stroke="#ffffff" stroke-width="1"/>
+<text x="353" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 2</text>
+<rect x="398" y="1103" width="90" height="31" fill="#a9bfe7" stroke="#ffffff" stroke-width="1"/>
+<text x="443" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 3</text>
+<rect x="488" y="1103" width="90" height="31" fill="#a9bfe7" stroke="#ffffff" stroke-width="1"/>
+<text x="533" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 3</text>
+<rect x="578" y="1103" width="90" height="31" fill="#a8d5d1" stroke="#ffffff" stroke-width="1"/>
+<text x="623" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 2</text>
+<rect x="668" y="1103" width="90" height="31" fill="#f7d09a" stroke="#ffffff" stroke-width="1"/>
+<text x="713" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 1</text>
+<rect x="758" y="1103" width="90" height="31" fill="#f2c1c7" stroke="#ffffff" stroke-width="1"/>
+<text x="803" y="1126" font-size="18" fill="#27313b" text-anchor="middle">rank 0</text>
+<text x="128" y="1160" font-size="18" fill="#657384">Mask color: Q-compute rank. Axis bands: Q/KV owner.</text>
+<rect x="927" y="313" width="301" height="172" fill="#ffffff" stroke="#b95665" stroke-width="1.8" rx="10"/>
+<rect x="928" y="314" width="299" height="47" fill="#f2c1c7" rx="9"/>
+<text x="946" y="346" font-size="24" fill="#27313b" font-weight="600">Rank 0</text>
+<text x="1207" y="345" font-size="17" fill="#27313b" text-anchor="end">3,000 tokens</text>
+<text x="946" y="394" font-size="20" fill="#27313b" class="mono">[0, 500)</text>
+<text x="946" y="426" font-size="20" fill="#27313b" class="mono">[4000, 5000)</text>
+<text x="946" y="458" font-size="20" fill="#27313b" class="mono">[12000, 13500)</text>
+<rect x="927" y="521" width="301" height="172" fill="#ffffff" stroke="#bb7a2f" stroke-width="1.8" rx="10"/>
+<rect x="928" y="522" width="299" height="47" fill="#f7d09a" rx="9"/>
+<text x="946" y="554" font-size="24" fill="#27313b" font-weight="600">Rank 1</text>
+<text x="1207" y="553" font-size="17" fill="#27313b" text-anchor="end">3,000 tokens</text>
+<text x="946" y="602" font-size="20" fill="#27313b" class="mono">[500, 1000)</text>
+<text x="946" y="634" font-size="20" fill="#27313b" class="mono">[5000, 6000)</text>
+<text x="946" y="666" font-size="20" fill="#27313b" class="mono">[13500, 15000)</text>
+<rect x="927" y="729" width="301" height="172" fill="#ffffff" stroke="#496fad" stroke-width="1.8" rx="10"/>
+<rect x="928" y="730" width="299" height="47" fill="#a9bfe7" rx="9"/>
+<text x="946" y="762" font-size="24" fill="#27313b" font-weight="600">Rank 3</text>
+<text x="1207" y="761" font-size="17" fill="#27313b" text-anchor="end">6,000 tokens</text>
+<text x="946" y="810" font-size="20" fill="#27313b" class="mono">[1500, 2500)</text>
+<text x="946" y="842" font-size="20" fill="#27313b" class="mono">[7000, 9000)</text>
+<text x="946" y="874" font-size="20" fill="#27313b" class="mono">[16500, 19500)</text>
+<rect x="1292" y="395" width="310" height="495" fill="#f2faf9" stroke="#287f79" stroke-width="2.2" rx="12"/>
+<rect x="1293" y="396" width="308" height="64" fill="#a8d5d1" rx="11"/>
+<text x="1447" y="438" font-size="29" fill="#27313b" font-weight="600" text-anchor="middle">Rank 2</text>
+<text x="1313" y="498" font-size="20" fill="#657384">Already local</text>
+<text x="1313" y="533" font-size="24" fill="#27313b" font-weight="600">6,000 KV tokens</text>
+<path d="M1313 557 H1581" fill="none" stroke="#c9dfdc" stroke-width="1" />
+<text x="1313" y="594" font-size="20" fill="#657384">Receives from peers</text>
+<text x="1313" y="629" font-size="24" fill="#27313b" font-weight="600">12,000 KV tokens</text>
+<path d="M1313 653 H1581" fill="none" stroke="#c9dfdc" stroke-width="1" />
+<text x="1313" y="690" font-size="21" fill="#27313b" font-weight="600">Requested KV</text>
+<text x="1313" y="727" font-size="19" fill="#27313b" class="mono">[0, 3000)</text>
+<text x="1313" y="763" font-size="19" fill="#27313b" class="mono">[4000, 10000)</text>
+<text x="1313" y="799" font-size="19" fill="#27313b" class="mono">[12000, 21000)</text>
+<text x="1313" y="857" font-size="21" fill="#287f79" font-weight="600">18,000 tokens total</text>
+<path d="M1228 399 H1258 V575 H1284" fill="none" stroke="#b95665" stroke-width="3" marker-end="url(#arrow0)"/>
+<path d="M1228 607 H1284" fill="none" stroke="#bb7a2f" stroke-width="3" marker-end="url(#arrow1)"/>
+<path d="M1228 815 H1258 V639 H1284" fill="none" stroke="#496fad" stroke-width="3" marker-end="url(#arrow3)"/>
+<text x="927" y="945" font-size="23" fill="#27313b" font-weight="600">Required KV prefix per document</text>
+<rect x="927" y="966" width="675" height="37" fill="#eef1f5"/>
+<text x="943" y="991" font-size="18" fill="#27313b" font-weight="600">Rank</text>
+<text x="1026" y="991" font-size="18" fill="#27313b" font-weight="600">Doc 0</text>
+<text x="1209" y="991" font-size="18" fill="#27313b" font-weight="600">Doc 1</text>
+<text x="1402" y="991" font-size="18" fill="#27313b" font-weight="600">Doc 2</text>
+<path d="M927 1040 H1602" fill="none" stroke="#e1e6ec" stroke-width="1" />
+<text x="943" y="1028" font-size="18" fill="#27313b" font-weight="600">0</text>
+<text x="1026" y="1028" font-size="16" fill="#27313b" class="mono">[0, 4000)</text>
+<text x="1209" y="1028" font-size="16" fill="#27313b" class="mono">[4000, 12000)</text>
+<text x="1402" y="1028" font-size="16" fill="#27313b" class="mono">[12000, 24000)</text>
+<path d="M927 1077 H1602" fill="none" stroke="#e1e6ec" stroke-width="1" />
+<text x="943" y="1065" font-size="18" fill="#27313b" font-weight="600">1</text>
+<text x="1026" y="1065" font-size="16" fill="#27313b" class="mono">[0, 3500)</text>
+<text x="1209" y="1065" font-size="16" fill="#27313b" class="mono">[4000, 11000)</text>
+<text x="1402" y="1065" font-size="16" fill="#27313b" class="mono">[12000, 22500)</text>
+<rect x="927" y="1077" width="675" height="37" fill="#e7f4f2"/>
+<path d="M927 1114 H1602" fill="none" stroke="#e1e6ec" stroke-width="1" />
+<text x="943" y="1102" font-size="18" fill="#27313b" font-weight="600">2</text>
+<text x="1026" y="1102" font-size="16" fill="#27313b" class="mono">[0, 3000)</text>
+<text x="1209" y="1102" font-size="16" fill="#27313b" class="mono">[4000, 10000)</text>
+<text x="1402" y="1102" font-size="16" fill="#27313b" class="mono">[12000, 21000)</text>
+<path d="M927 1151 H1602" fill="none" stroke="#e1e6ec" stroke-width="1" />
+<text x="943" y="1139" font-size="18" fill="#27313b" font-weight="600">3</text>
+<text x="1026" y="1139" font-size="16" fill="#27313b" class="mono">[0, 2500)</text>
+<text x="1209" y="1139" font-size="16" fill="#27313b" class="mono">[4000, 9000)</text>
+<text x="1402" y="1139" font-size="16" fill="#27313b" class="mono">[12000, 19500)</text>
+<path d="M56 1180 H1604" fill="none" stroke="#dce3eb" stroke-width="1" />
+<text x="56" y="1210" font-size="20" fill="#657384">24,000 packed tokens; 6,000 owned per rank. Token IDs are global, and ranges are half-open.</text>
+<text x="56" y="1239" font-size="20" fill="#657384">The attention kernel enforces document boundaries and causality; group_cast moves only requested KV tokens.</text>
+</svg>

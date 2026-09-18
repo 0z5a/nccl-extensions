@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1540" viewBox="0 0 1800 1540" role="img" aria-labelledby="title desc">
+<title id="title">NIC load balancing based on Node 0, CP ranks 0 through 7, in the supplied Magi MSA CP32 plot</title>
+<desc id="desc">Source: Clipboard_Screenshot_1788424789.png, identical to the README workload image cp32_shared_kv_prefixes_9_docs.png. Magi MSA CP32 min_heap, CSV row 1, sample_id 1, chunk 512, 196608 tokens and nine sequences. The orange Forward remote TX bars for ranks 0 through 7 are estimated at 82.6, 64.9, 60.3, 96.8, 73.2, 53.5, 89.6, and 111.1 MB, rounded to 0.1 MB. Their sum is approximately 632.0 MB and the ideal node-local mean is 79.0 MB per sender. Reassigning 64.1 MB locally balances the modeled send queues. The source excludes self-copy but does not separate intra-node and inter-node TX; this is a per-NIC load model derived from those bars, not measured NIC traffic or measured optimized results. Equal-bandwidth ideal network-phase time changes from 111.1/B to 79.0/B, before adding redistribution and routing overhead.</desc>
+<defs>
+<marker id="network" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#D76A2B"/></marker>
+<marker id="balanced" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#087F83"/></marker>
+<pattern id="idle" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="#EDF1F6"/><path d="M-2 2 L2 -2 M0 8 L8 0 M6 10 L10 6" stroke="#D3DDE8" stroke-width="1.2"/></pattern>
+<style>text {font-family:Arial,Helvetica,sans-serif;fill:#172B43;}</style>
+</defs>
+<rect x="0" y="0" width="1800.000" height="1540" rx="0" fill="#FFFFFF" stroke="none" stroke-width="1"/>
+<text x="56" y="66" font-size="40" font-weight="700" text-anchor="start" style="fill:#172B43" >NIC load balancing for Node 0 · CP ranks 0–7</text>
+<text x="56" y="105" font-size="22" font-weight="400" text-anchor="start" style="fill:#607086" >Source: orange Forward remote TX bars • CSV row 1 / sample_id 1 • read from the supplied plot</text>
+<rect x="56" y="132" width="1688.000" height="48" rx="10" fill="#EEE6FC" stroke="none" stroke-width="1"/>
+<text x="78" y="164" font-size="23" font-weight="700" text-anchor="start" style="fill:#7950BC" >Node 0 total ≈ 632.0 MB</text>
+<text x="541" y="164" font-size="23" font-weight="700" text-anchor="start" style="fill:#7950BC" >Ideal target ≈ 79.0 MB / NIC</text>
+<text x="1065" y="164" font-size="20" font-weight="400" text-anchor="start" style="fill:#7950BC" >Proposed balance; optimized values are not measured.</text>
+<rect x="56" y="204" width="828.000" height="602" rx="18" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.5"/>
+<rect x="76" y="224" width="40.000" height="40" rx="10" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="96" y="252" font-size="23" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >A</text>
+<text x="133" y="253" font-size="27" font-weight="700" text-anchor="start" style="fill:#172B43" >Before: Node 0’s original TX profile</text>
+<text x="82" y="294" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >Image-derived estimates; rounded to 0.1 MB.</text>
+<text x="87" y="334" font-size="17" font-weight="700" text-anchor="start" style="fill:#607086" >Rank / NIC</text>
+<text x="241" y="334" font-size="17" font-weight="700" text-anchor="start" style="fill:#607086" >Modeled send queue</text>
+<text x="626" y="334" font-size="17" font-weight="700" text-anchor="middle" style="fill:#607086" >TX (MB)</text>
+<rect x="766" y="348" width="93.000" height="371" rx="12" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="817" y="532" font-size="18" font-weight="600" text-anchor="middle" style="fill:#607086" transform="rotate(-90 817 532)">Modeled network TX</text>
+<rect x="81" y="352" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="375" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 0 / NIC 0</text>
+<rect x="241" y="355" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="355" width="239.540" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="376" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >82.6</text>
+<path d="M683 369 L758 369" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="399" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="422" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 1 / NIC 1</text>
+<rect x="241" y="402" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="402" width="188.210" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="423" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >64.9</text>
+<path d="M683 416 L758 416" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="446" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="469" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 2 / NIC 2</text>
+<rect x="241" y="449" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="449" width="174.870" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="470" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >60.3</text>
+<path d="M683 463 L758 463" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="493" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="516" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 3 / NIC 3</text>
+<rect x="241" y="496" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="496" width="280.720" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="517" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >96.8</text>
+<path d="M683 510 L758 510" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="540" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="563" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 4 / NIC 4</text>
+<rect x="241" y="543" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="543" width="212.280" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="564" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >73.2</text>
+<path d="M683 557 L758 557" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="587" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="610" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 5 / NIC 5</text>
+<rect x="241" y="590" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="590" width="155.150" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="611" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >53.5</text>
+<path d="M683 604 L758 604" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="634" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="657" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 6 / NIC 6</text>
+<rect x="241" y="637" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="637" width="259.840" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="658" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >89.6</text>
+<path d="M683 651 L758 651" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<rect x="81" y="681" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="148" y="704" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 7 / NIC 7</text>
+<rect x="241" y="684" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="241" y="684" width="322.190" height="28" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="626" y="705" font-size="23" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >111.1</text>
+<path d="M683 698 L758 698" fill="none" stroke="#D76A2B" stroke-width="2.5" stroke-linecap="round" marker-end="url(#network)"/>
+<path d="M470.1 348 L470.1 718" fill="none" stroke="#087F83" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 4"/>
+<path d="M92 728 L119 728" fill="none" stroke="#087F83" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 4"/>
+<text x="131" y="733" font-size="15" font-weight="400" text-anchor="start" style="fill:#607086" >Dashed line: Node 0 mean ≈ 79.0 MB</text>
+<rect x="80" y="750" width="780.000" height="36" rx="8" fill="#FFF3E9" stroke="none" stroke-width="1"/>
+<text x="98" y="777" font-size="22" font-weight="700" text-anchor="start" style="fill:#D76A2B" >Total modeled TX: ≈ 632.0 MB</text>
+<text x="537" y="777" font-size="19" font-weight="400" text-anchor="start" style="fill:#607086" >Peak: ≈ 111.1 MB</text>
+<rect x="916" y="204" width="828.000" height="602" rx="18" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.5"/>
+<rect x="936" y="224" width="40.000" height="40" rx="10" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="956" y="252" font-size="23" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >B</text>
+<text x="993" y="253" font-size="27" font-weight="700" text-anchor="start" style="fill:#172B43" >After: balance to Node 0’s mean</text>
+<text x="942" y="294" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >Same modeled total, evenly shared across all eight NICs.</text>
+<text x="947" y="334" font-size="17" font-weight="700" text-anchor="start" style="fill:#607086" >Rank / NIC</text>
+<text x="1101" y="334" font-size="17" font-weight="700" text-anchor="start" style="fill:#607086" >Modeled send queue</text>
+<text x="1486" y="334" font-size="17" font-weight="700" text-anchor="middle" style="fill:#607086" >TX (MB)</text>
+<rect x="1626" y="348" width="93.000" height="371" rx="12" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1677" y="532" font-size="18" font-weight="600" text-anchor="middle" style="fill:#607086" transform="rotate(-90 1677 532)">Modeled network TX</text>
+<rect x="941" y="352" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="375" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 0 / NIC 0</text>
+<rect x="1101" y="355" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="355" width="229.100" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="1486" y="376" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 369 L1618 369" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="399" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="422" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 1 / NIC 1</text>
+<rect x="1101" y="402" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="402" width="188.210" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<rect x="1289.21" y="402" width="40.890" height="28" rx="2" fill="#7950BC" stroke="none" stroke-width="1"/>
+<text x="1486" y="423" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 416 L1618 416" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="446" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="469" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 2 / NIC 2</text>
+<rect x="1101" y="449" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="449" width="174.870" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<rect x="1275.87" y="449" width="54.230" height="28" rx="2" fill="#7950BC" stroke="none" stroke-width="1"/>
+<text x="1486" y="470" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 463 L1618 463" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="493" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="516" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 3 / NIC 3</text>
+<rect x="1101" y="496" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="496" width="229.100" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="1486" y="517" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 510 L1618 510" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="540" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="563" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 4 / NIC 4</text>
+<rect x="1101" y="543" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="543" width="212.280" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<rect x="1313.28" y="543" width="16.820" height="28" rx="2" fill="#7950BC" stroke="none" stroke-width="1"/>
+<text x="1486" y="564" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 557 L1618 557" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="587" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="610" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 5 / NIC 5</text>
+<rect x="1101" y="590" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="590" width="155.150" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<rect x="1256.15" y="590" width="73.950" height="28" rx="2" fill="#7950BC" stroke="none" stroke-width="1"/>
+<text x="1486" y="611" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 604 L1618 604" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="634" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="657" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 6 / NIC 6</text>
+<rect x="1101" y="637" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="637" width="229.100" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="1486" y="658" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 651 L1618 651" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="941" y="681" width="134.000" height="34" rx="7" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1008" y="704" font-size="16" font-weight="600" text-anchor="middle" style="fill:#172B43" >Rank 7 / NIC 7</text>
+<rect x="1101" y="684" width="336.400" height="28" rx="4" fill="#F1F4F8" stroke="none" stroke-width="1"/>
+<rect x="1101" y="684" width="229.100" height="28" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="1486" y="705" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >79.0</text>
+<path d="M1543 698 L1618 698" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="950" y="721" width="18.000" height="12" rx="2" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="978" y="733" font-size="15" font-weight="400" text-anchor="start" style="fill:#607086" >Kept on original GPU</text>
+<rect x="1251" y="721" width="18.000" height="12" rx="2" fill="#7950BC" stroke="none" stroke-width="1"/>
+<text x="1279" y="733" font-size="15" font-weight="400" text-anchor="start" style="fill:#607086" >Received through local D2D</text>
+<rect x="940" y="750" width="780.000" height="36" rx="8" fill="#E8F7F4" stroke="none" stroke-width="1"/>
+<text x="958" y="777" font-size="22" font-weight="700" text-anchor="start" style="fill:#087F83" >Total modeled TX: ≈ 632.0 MB</text>
+<text x="1397" y="777" font-size="19" font-weight="400" text-anchor="start" style="fill:#607086" >Same total, balanced lanes</text>
+<rect x="56" y="826" width="1688.000" height="158" rx="14" fill="#E8F7F4" stroke="none" stroke-width="1"/>
+<text x="79" y="862" font-size="20" font-weight="700" text-anchor="start" style="fill:#087F83" >LOCAL D2D REDISTRIBUTION</text>
+<text x="1708" y="862" font-size="23" font-weight="700" text-anchor="end" style="fill:#087F83" >≈ 64.1 MB moved within Node 0</text>
+<rect x="79" y="881" width="573.000" height="69" rx="9" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1"/>
+<text x="96" y="906" font-size="18" font-weight="600" text-anchor="start" style="fill:#607086" >Surplus sent by ranks (MB)</text>
+<text x="96" y="934" font-size="19" font-weight="700" text-anchor="start" style="fill:#087F83" >R0: 3.6 · R3: 17.8 · R6: 10.6 · R7: 32.1</text>
+<path d="M672 916 L1001 916" fill="none" stroke="#087F83" stroke-width="4" stroke-linecap="round" marker-end="url(#balanced)"/>
+<rect x="738" y="890" width="192.000" height="40" rx="6" fill="#E8F7F4" stroke="none" stroke-width="1"/>
+<text x="834" y="916" font-size="23" font-weight="700" text-anchor="middle" style="fill:#087F83" >D2D / NVLink</text>
+<rect x="1021" y="881" width="699.000" height="69" rx="9" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1039" y="906" font-size="18" font-weight="600" text-anchor="start" style="fill:#607086" >Deficits filled on ranks (MB)</text>
+<text x="1039" y="934" font-size="19" font-weight="700" text-anchor="start" style="fill:#7950BC" >R1: 14.1 · R2: 18.7 · R4: 5.8 · R5: 25.5</text>
+<text x="79" y="973" font-size="18" font-weight="400" text-anchor="start" style="fill:#607086" >Preserve token identities and destinations; use the Node 0 mean, not the 32-rank mean.</text>
+<rect x="56" y="1005" width="1688.000" height="373" rx="14" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="80" y="1044" font-size="20" font-weight="700" text-anchor="start" style="fill:#172B43" >IDEAL SEND PHASE</text>
+<text x="376" y="1044" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >Time = payload / B. Equal NIC bandwidth B (MB/s); no shared network bottleneck.</text>
+<path d="M191.0 1094 L191.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="191.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >0</text>
+<path d="M367.0 1094 L367.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="367.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >40/B</text>
+<path d="M543.0 1094 L543.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="543.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >80/B</text>
+<path d="M719.0 1094 L719.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="719.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >120/B</text>
+<text x="91" y="1114" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 0</text>
+<rect x="554.44" y="1100" width="125.400" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1100" width="363.440" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1140" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 1</text>
+<rect x="476.56000000000006" y="1126" width="203.280" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1126" width="285.560" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1166" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 2</text>
+<rect x="456.32" y="1152" width="223.520" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1152" width="265.320" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1192" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 3</text>
+<rect x="616.9200000000001" y="1178" width="62.920" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1178" width="425.920" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1218" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 4</text>
+<rect x="513.08" y="1204" width="166.760" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1204" width="322.080" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1244" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 5</text>
+<rect x="426.4" y="1230" width="253.440" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1230" width="235.400" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1270" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 6</text>
+<rect x="585.24" y="1256" width="94.600" height="16" rx="3" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<rect x="191" y="1256" width="394.240" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="91" y="1296" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 7</text>
+<rect x="191" y="1282" width="488.840" height="16" rx="3" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<path d="M679.84 1094 L679.84 1304" fill="none" stroke="#D76A2B" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 4"/>
+<text x="98" y="1332" font-size="23" font-weight="700" text-anchor="start" style="fill:#D76A2B" >≈ 111.1/B · 71.1% ideal utilization</text>
+<rect x="99" y="1345" width="27.000" height="15" rx="2" fill="url(#idle)" stroke="none" stroke-width="1"/>
+<text x="138" y="1360" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >Idle while other NICs are still transmitting</text>
+<path d="M1051.0 1094 L1051.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="1051.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >0</text>
+<path d="M1227.0 1094 L1227.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="1227.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >40/B</text>
+<path d="M1403.0 1094 L1403.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="1403.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >80/B</text>
+<path d="M1579.0 1094 L1579.0 1301" fill="none" stroke="#D8E1EB" stroke-width="1" stroke-linecap="round"/>
+<text x="1579.0" y="1088" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >120/B</text>
+<text x="951" y="1114" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 0</text>
+<rect x="1051" y="1100" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1140" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 1</text>
+<rect x="1051" y="1126" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1166" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 2</text>
+<rect x="1051" y="1152" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1192" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 3</text>
+<rect x="1051" y="1178" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1218" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 4</text>
+<rect x="1051" y="1204" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1244" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 5</text>
+<rect x="1051" y="1230" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1270" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 6</text>
+<rect x="1051" y="1256" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="951" y="1296" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >NIC 7</text>
+<rect x="1051" y="1282" width="347.600" height="16" rx="3" fill="#087F83" stroke="none" stroke-width="1"/>
+<path d="M1398.6 1094 L1398.6 1304" fill="none" stroke="#087F83" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 4"/>
+<text x="958" y="1332" font-size="23" font-weight="700" text-anchor="start" style="fill:#087F83" >≈ 79.0/B · 100% ideal utilization</text>
+<text x="1602" y="1200" font-size="18" font-weight="700" text-anchor="middle" style="fill:#087F83" >Finished at</text>
+<text x="1602" y="1228" font-size="18" font-weight="400" text-anchor="middle" style="fill:#087F83" >≈ 79.0/B</text>
+<text x="958" y="1360" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >Redistribution and routing time must be added</text>
+<text x="56" y="1415" font-size="22" font-weight="600" text-anchor="start" style="fill:#172B43" >Network-phase reduction in this model: ≈ 28.9%. Total time also includes D2D and routing overhead.</text>
+<text x="56" y="1453" font-size="19" font-weight="400" text-anchor="start" style="fill:#607086" >Source metric: Forward remote TX, excluding self-copy. The source does not separate intra-node from inter-node bytes.</text>
+<text x="56" y="1487" font-size="19" font-weight="400" text-anchor="start" style="fill:#607086" >These source-derived volumes model one sending NIC per rank; they are not direct NIC counters or measured optimized results.</text>
+<text x="56" y="1520" font-size="18" font-weight="400" text-anchor="start" style="fill:#607086" >Source image: Magi MSA CP32 min_heap · CSV row 1 / sample_id 1 · chunk 512 · 196,608 tokens · 9 documents.</text>
+</svg>

@@ -1,0 +1,240 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">
+<title id="title">Hierarchical group_cast: send shared KV once per destination node</title>
+<desc id="desc">One S-byte KV segment owned by source GPU 2, CP rank 2, is required by all eight GPUs on node 1, CP ranks 8 through 15. Flat delivery sends eight copies over the inter-node network, totaling 8S. Hierarchical delivery sends one S-byte copy to GPU 2, CP rank 10, on the destination node; the other seven GPUs obtain the data over NVLink, totaling 7S of local payload. Inter-node payload falls from 8S to S, an 87.5 percent reduction. Across three destination nodes the corresponding totals are 24S and 3S. This is ideal shared-payload accounting, not a measured speedup.</desc>
+<defs>
+<marker id="network" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#D76A2B"/></marker>
+<marker id="local" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#087F83"/></marker>
+<style>text {font-family:Arial,Helvetica,sans-serif;fill:#172B43;} .mono {font-family:Menlo,Consolas,monospace;}</style>
+</defs>
+<rect x="0" y="0" width="1800" height="1280" rx="0" fill="#FFFFFF" stroke="none" stroke-width="1"/>
+<text x="56" y="66" font-size="40" font-weight="700" text-anchor="start" style="fill:#172B43" >Hierarchical communication: send shared KV once</text>
+<text x="56" y="106" font-size="23" font-weight="400" text-anchor="start" style="fill:#607086" >group_cast • one source segment • eight consumer GPUs per destination node</text>
+<rect x="56" y="132" width="1688" height="48" rx="10" fill="#EEE6FC" stroke="none" stroke-width="1"/>
+<text x="78" y="164" font-size="21" font-weight="700" text-anchor="start" style="fill:#7950BC" >Shared KV segment = S bytes</text>
+<text x="476" y="164" font-size="21" font-weight="400" text-anchor="start" style="fill:#7950BC" >Every destination GPU requests these same bytes.</text>
+<path d="M1200 157 H1244" fill="none" stroke="#D76A2B" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#network)"/>
+<text x="1255" y="164" font-size="18" font-weight="400" text-anchor="start" style="fill:#607086" >Network</text>
+<path d="M1394 157 H1438" fill="none" stroke="#087F83" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<text x="1449" y="164" font-size="18" font-weight="400" text-anchor="start" style="fill:#607086" >NVLink</text>
+<rect x="1592" y="144.0" width="30" height="24" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1607.0" y="161" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<text x="1632" y="164" font-size="18" font-weight="400" text-anchor="start" style="fill:#607086" >Same KV</text>
+<rect x="56" y="204" width="828" height="662" rx="18" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.5"/>
+<rect x="76" y="224" width="40" height="40" rx="10" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="96" y="252" font-size="23" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >A</text>
+<text x="133" y="253" font-size="29" font-weight="700" text-anchor="start" style="fill:#172B43" >Flat per-rank delivery</text>
+<text x="82" y="294" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >Send the same KV separately to every consumer.</text>
+<rect x="82" y="326" width="222" height="456" rx="12" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="102" y="357" font-size="18" font-weight="700" text-anchor="start" style="fill:#172B43" >SOURCE NODE 0</text>
+<text x="102" y="384" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >8 GPUs / 8 NICs</text>
+<rect x="106" y="438" width="170" height="128" rx="12" fill="#FFFFFF" stroke="#7950BC" stroke-width="2"/>
+<text x="191" y="473" font-size="24" font-weight="700" text-anchor="middle" style="fill:#172B43" >GPU 2</text>
+<text x="191" y="501" font-size="18" font-weight="400" text-anchor="middle" style="fill:#607086" >CP rank 2</text>
+<rect x="129" y="520" width="124" height="29" rx="5" fill="#EEE6FC" stroke="none" stroke-width="1"/>
+<text x="191" y="541" font-size="17" font-weight="700" text-anchor="middle" style="fill:#7950BC" >KV · S bytes</text>
+<path d="M276 492 H323" fill="none" stroke="#D76A2B" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<rect x="282" y="479" width="39" height="26" rx="4" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="301" y="498" font-size="12" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >NIC</text>
+<text x="192" y="605" font-size="19" font-weight="400" text-anchor="middle" style="fill:#607086" >One owner</text>
+<rect x="103" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="113" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >0</text>
+<rect x="128" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="138" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >1</text>
+<rect x="153" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="163" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >3</text>
+<rect x="178" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="188" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >4</text>
+<rect x="203" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="213" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >5</text>
+<rect x="228" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="238" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >6</text>
+<rect x="253" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="263" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >7</text>
+<text x="193" y="747" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >Other source GPUs</text>
+<rect x="606" y="326" width="258" height="456" rx="12" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="624" y="357" font-size="18" font-weight="700" text-anchor="start" style="fill:#172B43" >DESTINATION NODE 1</text>
+<text x="624" y="379" font-size="16" font-weight="400" text-anchor="start" style="fill:#607086" >All 8 GPUs need this KV</text>
+<text x="472" y="357" font-size="18" font-weight="400" text-anchor="middle" style="fill:#607086" >Inter-node network</text>
+<text x="472" y="391" font-size="29" font-weight="700" text-anchor="middle" style="fill:#D76A2B" >8 copies × S</text>
+<path d="M324 492 C396 492 480 410 638 410" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="397.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="415" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 456 638 456" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="443.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="461" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 502 638 502" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="489.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="507" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 548 638 548" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="535.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="553" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 594 638 594" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="581.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="599" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 640 638 640" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="627.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="645" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 686 638 686" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="673.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="691" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<path d="M324 492 C396 492 480 732 638 732" fill="none" stroke="#D76A2B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.86" marker-end="url(#network)"/>
+<rect x="549" y="719.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="567.0" y="737" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="393" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="415" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 0 · rank 8</text>
+<rect x="789" y="399.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="415" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="439" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="461" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 1 · rank 9</text>
+<rect x="789" y="445.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="461" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="485" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="507" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 2 · rank 10</text>
+<rect x="789" y="491.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="507" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="531" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="553" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 3 · rank 11</text>
+<rect x="789" y="537.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="553" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="577" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="599" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 4 · rank 12</text>
+<rect x="789" y="583.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="599" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="623" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="645" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 5 · rank 13</text>
+<rect x="789" y="629.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="645" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="669" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="691" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 6 · rank 14</text>
+<rect x="789" y="675.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="691" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="640" y="715" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="652" y="737" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 7 · rank 15</text>
+<rect x="789" y="721.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="803.0" y="737" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<text x="735" y="766" font-size="15" font-weight="400" text-anchor="middle" style="fill:#607086" >8 consumers receive 8 copies</text>
+<rect x="80" y="801" width="780" height="44" rx="8" fill="#FFF3E9" stroke="none" stroke-width="1"/>
+<text x="99" y="831" font-size="24" font-weight="700" text-anchor="start" style="fill:#D76A2B" >Inter-node: 8S</text>
+<text x="391" y="831" font-size="21" font-weight="400" text-anchor="start" style="fill:#607086" >No local fan-out</text>
+<rect x="916" y="204" width="828" height="662" rx="18" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.5"/>
+<rect x="936" y="224" width="40" height="40" rx="10" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="956" y="252" font-size="23" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >B</text>
+<text x="993" y="253" font-size="29" font-weight="700" text-anchor="start" style="fill:#172B43" >Hierarchical delivery</text>
+<text x="942" y="294" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >Send once across nodes; distribute locally.</text>
+<rect x="942" y="326" width="222" height="456" rx="12" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="962" y="357" font-size="18" font-weight="700" text-anchor="start" style="fill:#172B43" >SOURCE NODE 0</text>
+<text x="962" y="384" font-size="17" font-weight="400" text-anchor="start" style="fill:#607086" >8 GPUs / 8 NICs</text>
+<rect x="966" y="438" width="170" height="128" rx="12" fill="#FFFFFF" stroke="#7950BC" stroke-width="2"/>
+<text x="1051" y="473" font-size="24" font-weight="700" text-anchor="middle" style="fill:#172B43" >GPU 2</text>
+<text x="1051" y="501" font-size="18" font-weight="400" text-anchor="middle" style="fill:#607086" >CP rank 2</text>
+<rect x="989" y="520" width="124" height="29" rx="5" fill="#EEE6FC" stroke="none" stroke-width="1"/>
+<text x="1051" y="541" font-size="17" font-weight="700" text-anchor="middle" style="fill:#7950BC" >KV · S bytes</text>
+<path d="M1136 492 H1183" fill="none" stroke="#D76A2B" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<rect x="1142" y="479" width="39" height="26" rx="4" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="1161" y="498" font-size="12" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >NIC</text>
+<text x="1052" y="605" font-size="19" font-weight="400" text-anchor="middle" style="fill:#607086" >One owner</text>
+<rect x="963" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="973" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >0</text>
+<rect x="988" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="998" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >1</text>
+<rect x="1013" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="1023" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >3</text>
+<rect x="1038" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="1048" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >4</text>
+<rect x="1063" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="1073" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >5</text>
+<rect x="1088" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="1098" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >6</text>
+<rect x="1113" y="695" width="20" height="26" rx="3" fill="#E4EAF1" stroke="none" stroke-width="1"/>
+<text x="1123" y="713" font-size="12" font-weight="400" text-anchor="middle" style="fill:#607086" >7</text>
+<text x="1053" y="747" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >Other source GPUs</text>
+<rect x="1466" y="326" width="258" height="456" rx="12" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="1484" y="357" font-size="18" font-weight="700" text-anchor="start" style="fill:#172B43" >DESTINATION NODE 1</text>
+<text x="1484" y="379" font-size="16" font-weight="400" text-anchor="start" style="fill:#607086" >All 8 GPUs need this KV</text>
+<path d="M1184 492 C1274 492 1345 502 1498 502" fill="none" stroke="#D76A2B" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#network)"/>
+<rect x="1326" y="487.0" width="36" height="26" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1344.0" y="505" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<text x="1332" y="357" font-size="18" font-weight="400" text-anchor="middle" style="fill:#607086" >Inter-node network</text>
+<text x="1332" y="391" font-size="29" font-weight="700" text-anchor="middle" style="fill:#087F83" >1 copy × S</text>
+<text x="1332" y="551" font-size="16" font-weight="400" text-anchor="middle" style="fill:#607086" >Same local GPU index</text>
+<text x="1332" y="576" font-size="19" font-weight="700" text-anchor="middle" style="fill:#172B43" >GPU 2 → GPU 2</text>
+<path d="M1687 502 H1706" fill="none" stroke="#087F83" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M1706 410 V732" fill="none" stroke="#087F83" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M1706 410 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<path d="M1706 456 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<path d="M1706 548 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<path d="M1706 594 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<path d="M1706 640 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<path d="M1706 686 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<path d="M1706 732 H1688" fill="none" stroke="#087F83" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#local)"/>
+<text x="1335" y="680" font-size="19" font-weight="700" text-anchor="middle" style="fill:#087F83" >7 additional copies</text>
+<text x="1335" y="706" font-size="18" font-weight="400" text-anchor="middle" style="fill:#607086" >stay inside node 1</text>
+<rect x="1500" y="393" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="415" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 0 · rank 8</text>
+<rect x="1649" y="399.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="415" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="439" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="461" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 1 · rank 9</text>
+<rect x="1649" y="445.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="461" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="485" width="188" height="34" rx="7" fill="#EEE6FC" stroke="#7950BC" stroke-width="2"/>
+<text x="1512" y="507" font-size="16" font-weight="700" text-anchor="start" style="fill:#172B43" >GPU 2 · rank 10</text>
+<rect x="1649" y="491.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="507" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="531" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="553" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 3 · rank 11</text>
+<rect x="1649" y="537.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="553" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="577" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="599" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 4 · rank 12</text>
+<rect x="1649" y="583.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="599" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="623" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="645" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 5 · rank 13</text>
+<rect x="1649" y="629.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="645" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="669" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="691" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 6 · rank 14</text>
+<rect x="1649" y="675.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="691" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<rect x="1500" y="715" width="188" height="34" rx="7" fill="#FFFFFF" stroke="#D8E1EB" stroke-width="1.2"/>
+<text x="1512" y="737" font-size="16" font-weight="400" text-anchor="start" style="fill:#172B43" >GPU 7 · rank 15</text>
+<rect x="1649" y="721.0" width="28" height="22" rx="5" fill="#EEE6FC" stroke="#7950BC" stroke-width="1.4"/>
+<text x="1663.0" y="737" font-size="16" font-weight="700" text-anchor="middle" style="fill:#7950BC" >S</text>
+<text x="1595" y="766" font-size="15" font-weight="700" text-anchor="middle" style="fill:#7950BC" >GPU 2 / rank 10 is the relay</text>
+<rect x="940" y="801" width="780" height="44" rx="8" fill="#E8F7F4" stroke="none" stroke-width="1"/>
+<text x="959" y="831" font-size="24" font-weight="700" text-anchor="start" style="fill:#087F83" >Inter-node: S</text>
+<text x="1219" y="831" font-size="24" font-weight="700" text-anchor="start" style="fill:#087F83" >NVLink fan-out: 7S</text>
+<rect x="56" y="893" width="1688" height="235" rx="14" fill="#F5F8FC" stroke="#D8E1EB" stroke-width="1"/>
+<text x="82" y="934" font-size="20" font-weight="700" text-anchor="start" style="fill:#172B43" >INTER-NODE PAYLOAD</text>
+<text x="366" y="934" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >Same segment, same consumers, fewer bytes across the network</text>
+<text x="83" y="989" font-size="23" font-weight="700" text-anchor="start" style="fill:#172B43" >Flat</text>
+<text x="83" y="1047" font-size="23" font-weight="700" text-anchor="start" style="fill:#172B43" >Hierarchical</text>
+<rect x="321" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="377.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="438" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="494.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="555" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="611.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="672" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="728.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="789" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="845.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="906" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="962.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="1023" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="1079.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="1140" y="962" width="113" height="36" rx="5" fill="#D76A2B" stroke="none" stroke-width="1"/>
+<text x="1196.5" y="987" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<rect x="321" y="1020" width="113" height="36" rx="5" fill="#087F83" stroke="none" stroke-width="1"/>
+<text x="377.5" y="1045" font-size="18" font-weight="700" text-anchor="middle" style="fill:#FFFFFF" >S</text>
+<text x="1280" y="989" font-size="27" font-weight="700" text-anchor="start" style="fill:#D76A2B" >8S</text>
+<text x="461" y="1047" font-size="27" font-weight="700" text-anchor="start" style="fill:#087F83" >S</text>
+<text x="1535" y="987" font-size="47" font-weight="700" text-anchor="middle" style="fill:#087F83" >−87.5%</text>
+<text x="1535" y="1022" font-size="22" font-weight="400" text-anchor="middle" style="fill:#087F83" >inter-node bytes</text>
+<text x="1535" y="1055" font-size="20" font-weight="400" text-anchor="middle" style="fill:#607086" >1/8 as much traffic</text>
+<text x="83" y="1099" font-size="22" font-weight="600" text-anchor="start" style="fill:#172B43" >Per destination node: 8S → S.  For CP32 with 3 destination nodes: 24S → 3S.</text>
+<text x="56" y="1170" font-size="22" font-weight="600" text-anchor="start" style="fill:#172B43" >Exact 8× reduction assumes all 8 destination ranks request the same KV segment.</text>
+<text x="56" y="1204" font-size="19" font-weight="400" text-anchor="start" style="fill:#607086" >Partial overlap gives a smaller saving. Payload only; excludes protocol overhead and local packing.</text>
+<text x="56" y="1243" font-size="20" font-weight="400" text-anchor="start" style="fill:#607086" >group_reduce reverses the pattern: reduce within each node, then send one reduced segment back.</text>
+</svg>

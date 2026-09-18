@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="880" viewBox="0 0 1240 880" role="img" aria-labelledby="title description">
+  <title id="title">Token layouts for causal KV communication</title>
+  <desc id="description">Causal-attention example with 8192 tokens. CP rank 0 owns Q and KV tokens 0 through 4095, and CP rank 1 owns tokens 4096 through 8191. Each query attends only to keys at or before its own position. Across its local queries, rank 1 needs KV tokens 0 through 8191, so it retains its local KV and fetches tokens 0 through 4095 from rank 0.</desc>
+  <defs>
+    <pattern id="grid" width="25" height="25" patternUnits="userSpaceOnUse">
+      <path d="M 25 0 H 0 V 25" fill="none" stroke="#e9edf1" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#2869bd"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #27313b; }
+      .muted { fill: #667383; }
+      .mono { font-family: 'DejaVu Sans Mono', Menlo, monospace; }
+      .blue { fill: #2869bd; }
+      .outline { stroke: #39434e; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect width="1240" height="880" fill="#fff"/>
+  <text x="48" y="54" font-size="30" font-weight="600">Token layouts for causal KV communication</text>
+  <text x="48" y="89" font-size="20" class="muted">Rank 1 keeps its local KV and fetches the earlier KV tokens [0, 4096) from rank 0.</text>
+
+  <!-- Valid attention lies on or below the diagonal: key position k &lt;= query position q. -->
+  <rect x="40" y="119" width="658" height="669" fill="url(#grid)"/>
+  <text x="415" y="147" text-anchor="middle" font-size="23">K / V tokens</text>
+  <text x="290" y="181" text-anchor="middle" font-size="18">CP rank 0</text>
+  <text x="540" y="181" text-anchor="middle" font-size="18">CP rank 1</text>
+  <rect x="165" y="194" width="250" height="20" fill="#fff5d9" class="outline"/>
+  <rect x="415" y="194" width="250" height="20" fill="#f9dddd" class="outline"/>
+  <text x="165" y="238" text-anchor="middle" font-size="16" class="mono">0</text>
+  <text x="415" y="238" text-anchor="middle" font-size="16" class="mono">4096</text>
+  <text x="665" y="238" text-anchor="middle" font-size="16" class="mono">8192</text>
+
+  <text x="69" y="505" text-anchor="middle" font-size="23" transform="rotate(-90 69 505)">Q tokens</text>
+  <text x="130" y="260" text-anchor="end" font-size="16" class="mono">0</text>
+  <text x="130" y="510" text-anchor="end" font-size="16" class="mono">4096</text>
+  <text x="130" y="760" text-anchor="end" font-size="16" class="mono">8192</text>
+  <rect x="144" y="255" width="14" height="250" fill="#fff5d9"/>
+  <rect x="144" y="505" width="14" height="250" fill="#f9dddd"/>
+
+  <rect x="165" y="255" width="500" height="500" fill="#f6f8fa"/>
+  <path d="M165 255 L415 505 H165 Z" fill="#fff5d9"/>
+  <rect x="165" y="505" width="250" height="250" fill="#fff5d9"/>
+  <path d="M415 505 L665 755 H415 Z" fill="#f9dddd"/>
+  <rect x="165" y="255" width="500" height="500" fill="none" class="outline"/>
+  <path d="M165 255 L665 755 M415 505 V755" fill="none" class="outline"/>
+  <path d="M165 505 H415 L665 755 H165 Z" fill="none" stroke="#2869bd" stroke-width="3"/>
+
+  <text x="265" y="438" text-anchor="middle" font-size="21" font-weight="600">Rank 0</text>
+  <text x="265" y="468" text-anchor="middle" font-size="17" class="muted">Local attention</text>
+  <text x="530" y="356" text-anchor="middle" font-size="22" class="muted">Causally masked</text>
+  <text x="530" y="391" text-anchor="middle" font-size="20" class="muted mono">k &gt; q</text>
+  <text x="290" y="608" text-anchor="middle" font-size="24" font-weight="600">Remote KV</text>
+  <text x="290" y="647" text-anchor="middle" font-size="20" class="mono">[0, 4096)</text>
+  <text x="290" y="685" text-anchor="middle" font-size="17" class="muted">Fetched from rank 0</text>
+  <text x="499" y="664" text-anchor="middle" font-size="22" font-weight="600">Local KV</text>
+  <text x="513" y="697" text-anchor="middle" font-size="18" class="mono">[4096, 8192)</text>
+  <text x="525" y="729" text-anchor="middle" font-size="16" class="muted">Causal attention</text>
+  <text x="415" y="790" text-anchor="middle" font-size="18" class="blue">Blue outline: rank 1's causal attention</text>
+
+  <!-- Ownership and handle layouts use the same half-open intervals. -->
+  <rect x="738" y="144" width="23" height="23" fill="#fff5d9" class="outline"/>
+  <text x="773" y="163" font-size="18">CP rank 0</text>
+  <rect x="983" y="144" width="23" height="23" fill="#f9dddd" class="outline"/>
+  <text x="1018" y="163" font-size="18">CP rank 1</text>
+
+  <text x="738" y="235" font-size="21" font-weight="600">Before communication</text>
+  <text x="738" y="276" font-size="18">Rank 0 owns</text>
+  <text x="894" y="276" font-size="18" class="mono">[0, 4096)</text>
+  <text x="738" y="312" font-size="18">Rank 1 owns</text>
+  <text x="894" y="312" font-size="18" class="mono">[4096, 8192)</text>
+
+  <path d="M738 344 H1188" stroke="#e0e5ea"/>
+  <text x="738" y="384" font-size="21" font-weight="600">Rank 1 handle</text>
+  <text x="738" y="423" font-size="17" class="muted mono">local_input_layout</text>
+  <text x="738" y="452" font-size="19" class="mono">[TokenRange(4096, 8192)]</text>
+  <text x="738" y="494" font-size="17" class="muted mono">local_output_layout</text>
+  <text x="738" y="523" font-size="19" class="mono">[TokenRange(0, 8192)]</text>
+
+  <path d="M738 555 H1188" stroke="#e0e5ea"/>
+  <text x="738" y="595" font-size="21" font-weight="600">group_cast</text>
+  <rect x="738" y="622" width="132" height="60" rx="8" fill="#fff5d9" class="outline"/>
+  <text x="804" y="659" text-anchor="middle" font-size="21">Rank 0</text>
+  <rect x="1056" y="622" width="132" height="60" rx="8" fill="#f9dddd" class="outline"/>
+  <text x="1122" y="659" text-anchor="middle" font-size="21">Rank 1</text>
+  <path d="M883 652 H1043" fill="none" stroke="#2869bd" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="963" y="716" text-anchor="middle" font-size="19" class="blue mono">KV [0, 4096)</text>
+  <text x="963" y="747" text-anchor="middle" font-size="18" class="muted">4,096 remote tokens transferred</text>
+
+  <path d="M48 810 H1192" stroke="#e0e5ea"/>
+  <text x="48" y="847" font-size="18" class="muted">Causal attention: k ≤ q. Rank 1's queries collectively need KV [0, 8192); each query sees only its prefix.</text>
+</svg>

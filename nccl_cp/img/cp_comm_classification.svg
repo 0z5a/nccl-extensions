@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1160" viewBox="0 0 1600 1160" role="img" aria-labelledby="title description">
+<title id="title">CP communication patterns: KV communication and Q communication</title>
+<desc id="description">Comparison of stationary data, transferred attention inputs, computation location, use cases, and forward and backward group-cast and group-reduce operations. KV communication keeps Q on its owner and moves KV; backward reduces dKV. Q communication keeps KV on its owner, moves Q, merges partial outputs with LSE, and reduces dQ during training. Decoding CP uses only the Q-communication forward pass.</desc>
+<style>text {font-family: Arial, Helvetica, sans-serif;} .mono {font-family: "DejaVu Sans Mono", Menlo, monospace;}</style>
+<rect x="0" y="0" width="1600" height="1160" fill="#ffffff"/>
+<text x="56" y="59" font-size="36" fill="#27313b" font-weight="600">CP Communication Patterns</text>
+<text x="56" y="99" font-size="23" fill="#657384">Data placement and collective operations across forward and backward passes</text>
+<rect x="56" y="140" width="1488" height="856" fill="#ffffff" stroke="#dce3eb" stroke-width="1"/>
+<rect x="56" y="140" width="284" height="856" fill="#f6f8fa"/>
+<rect x="340" y="140" width="602" height="86" fill="#fff2ce"/>
+<rect x="942" y="140" width="602" height="86" fill="#e2efff"/>
+<text x="80" y="191" font-size="21" fill="#27313b" font-weight="600">Primary classification</text>
+<text x="368" y="182" font-size="29" fill="#27313b" font-weight="600">KV Communication</text>
+<text x="368" y="212" font-size="19" fill="#75613b">Bring KV to the Q owner</text>
+<text x="970" y="182" font-size="29" fill="#27313b" font-weight="600">Q Communication</text>
+<text x="970" y="212" font-size="19" fill="#3c618e">Bring Q to the KV owners</text>
+<text x="80" y="263.0" font-size="22" fill="#27313b" font-weight="600">Stationary data</text>
+<text x="368" y="263.0" font-size="23" fill="#27313b">Q</text>
+<text x="970" y="263.0" font-size="23" fill="#27313b">KV shards / KV cache</text>
+<path d="M56 284 L1544 284" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<text x="80" y="321.0" font-size="22" fill="#27313b" font-weight="600">Transferred input</text>
+<text x="368" y="321.0" font-size="23" fill="#27313b">KV shards</text>
+<text x="970" y="321.0" font-size="23" fill="#27313b">Q</text>
+<path d="M56 342 L1544 342" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<text x="80" y="382.0" font-size="22" fill="#27313b" font-weight="600">Attention compute</text>
+<text x="368" y="382.0" font-size="23" fill="#27313b">Q-owning rank</text>
+<text x="970" y="382.0" font-size="23" fill="#27313b">KV-owning rank</text>
+<path d="M56 406 L1544 406" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<text x="80" y="445.0" font-size="22" fill="#27313b" font-weight="600">Use cases</text>
+<text x="368" y="445.0" font-size="23" fill="#27313b">Training</text>
+<text x="970" y="445.0" font-size="23" fill="#27313b">Training / Decoding CP</text>
+<path d="M56 468 L1544 468" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<rect x="56" y="468" width="1488" height="40" fill="#eaf0f6"/>
+<text x="80" y="496" font-size="19" fill="#455a70" font-weight="600">FORWARD</text>
+<text x="80" y="563" font-size="23" fill="#27313b" font-weight="600">Group cast</text>
+<text x="368" y="552" font-size="23" fill="#27313b" class="mono">group_cast(KV)</text>
+<text x="368" y="585" font-size="20" fill="#657384">Transfer the KV shards required by local Q.</text>
+<text x="970" y="552" font-size="23" fill="#27313b" class="mono">group_cast(Q)</text>
+<text x="970" y="585" font-size="20" fill="#657384">Omit when Q is already replicated.</text>
+<path d="M56 608 L1544 608" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<text x="80" y="673" font-size="23" fill="#27313b" font-weight="600">Group reduce</text>
+<text x="368" y="657" font-size="24" fill="#27313b">No cross-rank reduction</text>
+<text x="368" y="694" font-size="20" fill="#657384">Local LSE merge when processing KV in stages.</text>
+<text x="970" y="650" font-size="21" fill="#27313b" class="mono">group_reduce(partial_out, partial_lse,</text>
+<text x="970" y="682" font-size="21" fill="#27313b" class="mono">    reduce_op=&quot;lse&quot;)</text>
+<text x="970" y="712" font-size="19" fill="#657384">LSE-weighted merge at the Q owner.</text>
+<rect x="56" y="728" width="1488" height="40" fill="#eaf0f6"/>
+<text x="80" y="756" font-size="19" fill="#455a70" font-weight="600">BACKWARD</text>
+<text x="1520" y="756" font-size="19" fill="#455a70" text-anchor="end">Training only · Decoding CP has no backward pass</text>
+<text x="80" y="835" font-size="23" fill="#27313b" font-weight="600">Group cast</text>
+<text x="368" y="822" font-size="23" fill="#27313b" class="mono">group_cast(KV)</text>
+<text x="368" y="858" font-size="20" fill="#657384">Fetch the required KV shards again.</text>
+<text x="970" y="806" font-size="21" fill="#27313b" class="mono">group_cast(Q, O, dO, LSE,</text>
+<text x="970" y="838" font-size="21" fill="#27313b" class="mono">    cast_lse=True)</text>
+<text x="970" y="875" font-size="20" fill="#657384">Use complete O and final merged LSE.</text>
+<path d="M56 894 L1544 894" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<text x="80" y="950" font-size="23" fill="#27313b" font-weight="600">Group reduce</text>
+<text x="368" y="936" font-size="21" fill="#27313b" class="mono">group_reduce(dKV, reduce_op=&quot;sum&quot;)</text>
+<text x="368" y="975" font-size="20" fill="#657384">Accumulate dQ locally.</text>
+<text x="970" y="936" font-size="21" fill="#27313b" class="mono">group_reduce(dQ, reduce_op=&quot;sum&quot;)</text>
+<text x="970" y="975" font-size="20" fill="#657384">Accumulate dK/dV locally.</text>
+<path d="M56 226 L1544 226" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M340 140 L340 468" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M340 508 L340 728" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M340 768 L340 996" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M942 140 L942 468" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M942 508 L942 728" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M942 768 L942 996" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M56 996 L1544 996" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M56 140 L1544 140" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M56 140 L56 996" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<path d="M1544 140 L1544 996" stroke="#dce3eb" stroke-width="1" fill="none"/>
+<text x="56" y="1044" font-size="22" fill="#27313b" font-weight="600">Decoding CP</text>
+<text x="220" y="1044" font-size="21" fill="#27313b">KV cache stays stationary; Q and partial results are communicated. Forward pass only.</text>
+<text x="56" y="1087" font-size="20" fill="#657384">API labels are schematic. See the README for supported arguments and implementation status.</text>
+<text x="56" y="1120" font-size="20" fill="#657384">O and LSE in backward are the complete forward results, not per-shard partials.</text>
+</svg>
