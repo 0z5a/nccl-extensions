@@ -73,10 +73,10 @@
 
   <path d="M738 344 H1188" stroke="#e0e5ea"/>
   <text x="738" y="384" font-size="21" font-weight="600">Rank 1 handle</text>
-  <text x="738" y="423" font-size="17" class="muted mono">local_input_layout</text>
-  <text x="738" y="452" font-size="19" class="mono">[TokenRange(4096, 8192)]</text>
-  <text x="738" y="494" font-size="17" class="muted mono">local_output_layout</text>
-  <text x="738" y="523" font-size="19" class="mono">[TokenRange(0, 8192)]</text>
+  <text x="738" y="423" font-size="17" class="muted mono">local_owned_layout</text>
+  <text x="738" y="452" font-size="19" class="mono">[RowRange(4096, 8192)]</text>
+  <text x="738" y="494" font-size="17" class="muted mono">local_required_layout</text>
+  <text x="738" y="523" font-size="19" class="mono">[RowRange(0, 8192)]</text>
 
   <path d="M738 555 H1188" stroke="#e0e5ea"/>
   <text x="738" y="595" font-size="21" font-weight="600">group_cast</text>

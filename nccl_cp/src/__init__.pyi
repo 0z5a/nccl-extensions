@@ -23,7 +23,7 @@ from .collectives import group_reduce_explicit_async as group_reduce_explicit_as
 from .group import CpConfig as CpConfig
 from .group import CpGroup as CpGroup
 from .group import create_group as create_group
-from .routing import TokenRange as TokenRange
+from .routing import RowRange as RowRange
 from .work import WorkWithPostProcessFn as WorkWithPostProcessFn
 
 __all__: list[str]

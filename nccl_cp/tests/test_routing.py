@@ -1,7 +1,7 @@
 import pytest
 from nccl.cp.routing import (
     Route,
-    TokenRange,
+    RowRange,
     layout_intervals,
     local_route,
     peer_segments,
@@ -24,7 +24,7 @@ def test_local_lists_and_ordered_pairing():
 
 
 def test_compact_ranges_and_unused_tokens():
-    assert layout_intervals([TokenRange(0, 3), 3, TokenRange(9, 9)]) == ((0, 4),)
+    assert layout_intervals([RowRange(0, 3), 3, RowRange(9, 9)]) == ((0, 4),)
     route = local_route(0, [(((0, 4),), ((1, 3),))])
     assert route == Route((1, 2, 1), (2,), ((), (0,), ()), (0,))
     assert sum(e.n_tokens for e in validate_routes([route])) == 2

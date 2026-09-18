@@ -238,7 +238,7 @@ def _topology_reason(profiles, nvl: int):
 class Handle:
     """Reusable rank-local route; close() drops its plan reference, not workspace.
 
-    Caller contract: reuse only while token identities and axis-0 row order
+    Caller contract: reuse only while row identities and axis-0 row order
     still match the prepared layouts. Returned list properties are copies;
     editing them does not update the plan. Keep this handle and all submitted
     tensors alive until GPU work completes, and only then close/release them.
@@ -359,13 +359,18 @@ class Handle:
         self.close()
 
 
-def create_handle(group: CpGroup, local_input_layout: Layout, local_output_layout: Layout, *,
+def create_handle(group: CpGroup, local_owned_layout: Layout, local_required_layout: Layout, *,
                   stream: StreamSpec) -> Handle:
     """Prepare the rank-local route and zero-CTA plans before data calls.
 
+    local_owned_layout describes this rank's owned rows: cast input and reduce
+    output. local_required_layout describes all rows this rank needs, including
+    any local rows: cast output and reduce input. Row IDs can represent tokens,
+    heads, or other caller-defined axis-0 units.
+
     Caller contract: all ranks, including empty/relay-only ranks, prepare the
-    same logical communication in matching order. Layout IDs describe token
-    occurrences and tensor row order, not vocabulary values. Shared descriptors
+    same logical communication in matching order. Layout IDs describe global
+    row identities and tensor row order, not local offsets. Shared descriptors
     are validated here, but their correspondence to actual tensor contents is
     the caller's responsibility. A changed mapping requires a new handle.
     max_layout_tokens bounds owned rows per rank; requests may contain at most
@@ -390,7 +395,7 @@ def create_handle(group: CpGroup, local_input_layout: Layout, local_output_layou
         with torch.cuda.stream(selected) if selected is not None else nullcontext():
             layout = None
             try:
-                layout = layout_intervals(local_input_layout), layout_intervals(local_output_layout)
+                layout = layout_intervals(local_owned_layout), layout_intervals(local_required_layout)
             except (TypeError, ValueError) as exc:
                 error = error or str(exc)
             existing = None
@@ -474,15 +479,15 @@ def _validate_tensors(input, output, route: Route, group, reduce: bool,
     if not isinstance(input, torch.Tensor) or not isinstance(output, torch.Tensor):
         raise TypeError("input and output must both be tensors")
     if input.layout != torch.strided or output.layout != torch.strided or input.ndim < 1:
-        raise ValueError("input/output must be strided tensors with a token dimension")
+        raise ValueError("input/output must be strided tensors with a row dimension")
     rows = (route.output_rows, route.input_rows) if reduce else (route.input_rows, route.output_rows)
     # The cast receive buffer (and reverse reduce input) may reserve extra
-    # token rows. Plans/segments use logical route counts, never this capacity.
+    # rows. Plans/segments use logical route counts, never this capacity.
     input_rows_ok = input.shape[0] >= rows[0] if reduce else input.shape[0] == rows[0]
     output_rows_ok = output.shape[0] == rows[1] if reduce else output.shape[0] >= rows[1]
     if not input_rows_ok or not output_rows_ok or tuple(input.shape[1:]) != tuple(output.shape[1:]):
         raise ValueError(
-            "Tensor shapes must match the route and per-token payload shape; "
+            "Tensor shapes must match the route and per-row payload shape; "
             "cast output/reduce input may have extra trailing rows but cannot be smaller than the route"
         )
     if input.dtype != output.dtype or input.device != output.device:
@@ -507,7 +512,7 @@ def _execute(group, input, output, route: Route, handle: Handle | None, reduce: 
              *, async_op: bool = False) -> WorkWithPostProcessFn | None:
     """Submit a flat route using cached peer segments, without control traffic.
 
-    Caller contract: match operation/handle order and per-token shape/dtype
+    Caller contract: match operation/handle order and per-row shape/dtype
     across ranks. A local argument error is not broadcast to peers; recovery
     must be coordinated by the application rather than ignored on one rank.
     Use one fixed stream per native slot and serialize host submissions with
@@ -553,7 +558,7 @@ def group_cast(
 
     Args:
         handle (Handle): Route and execution plans returned by create_handle.
-            Its input/output layouts describe this rank's tensor row order;
+            Its owned/required layouts describe this rank's tensor row order;
             its CpGroup supplies the ProcessGroup, backend and runtime slot.
         input (torch.Tensor): Local source tensor shaped
             [input_seqlen, *payload_shape], with input_seqlen equal to
@@ -564,7 +569,7 @@ def group_cast(
             sum(handle.output_split_size_list) <= output_capacity. Only the
             valid prefix is written; extra trailing rows keep their existing
             values and are not sent or zeroed. Must have the same dtype,
-            device and per-token shape as input. The supplied storage is
+            device and per-row shape as input. The supplied storage is
             written directly; None and automatic output allocation are not
             part of this interface.
         stream (StreamSpec): torch.cuda.Stream or a nonnegative raw CUDA
@@ -633,8 +638,8 @@ def group_reduce(
     """Group reduce interface using a prepared handle; accumulate sums.
 
     Args:
-        handle (Handle): The prepared cast route used in reverse. Its output
-            layout describes grad_input; its input layout describes grad_output.
+        handle (Handle): The prepared cast route used in reverse. Its required
+            layout describes grad_input; its owned layout describes grad_output.
         grad_input (torch.Tensor): Local contributions shaped
             [input_capacity, *payload_shape], where
             sum(handle.output_split_size_list) <= input_capacity. Only the
@@ -644,7 +649,7 @@ def group_reduce(
         grad_output (torch.Tensor): Required, caller-allocated accumulator
             shaped [output_seqlen, *payload_shape], with output_seqlen equal
             to sum(handle.input_split_size_list). Must have the same dtype,
-            device and per-token shape as grad_input. The result is the
+            device and per-row shape as grad_input. The result is the
             initial grad_output plus the sum of received contributions.
             Rows without contributions retain their initial values. Zero the
             buffer before calling when a plain sum is required; None, output
@@ -878,7 +883,7 @@ def group_cast_explicit(
         caller-owned input/output must remain alive until GPU completion.
 
         Caller contract: supply identical global lists/CpConfig/backend policy,
-        matching operation order and compatible per-token shape/dtype on all
+        matching operation order and compatible per-row shape/dtype on all
         ranks. NVL domain placement and peer access must be valid. Use one
         fixed stream per native runtime slot and serialize submissions with
         preparation/teardown. A local native prerequisite failure raises;

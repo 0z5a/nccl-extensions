@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from nccl.cp import (
     CpConfig,
+    RowRange,
     close_runtime,
     create_group,
     create_handle,
@@ -34,9 +35,12 @@ cp_config = CpConfig(max_per_peer_slot=2, payload_shape=(4,), dtype=torch.float3
                      nvl_domain_size=args.nvl_domain_size)
 cp_group = create_group(nccl_group, cp_config)
 # All group members prepare matching layouts/order. The tensors below must
-# contain the described token rows, including the correct payload width.
+# contain the described communication rows, including the correct payload width.
 handle = create_handle(
-    cp_group, list(range(2 * rank, 2 * rank + 2)), list(range(2 * world)), stream=stream,
+    cp_group,
+    local_owned_layout=[RowRange(2 * rank, 2 * rank + 2)],
+    local_required_layout=[RowRange(0, 2 * world)],
+    stream=stream,
 )
 input = torch.arange(2 * rank, 2 * rank + 2, device="cuda", dtype=torch.float32)[:, None].expand(-1, 4).contiguous()
 output = torch.empty((2 * world, 4), device="cuda")

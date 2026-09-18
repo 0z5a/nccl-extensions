@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1570" viewBox="0 0 1240 1570" role="img" aria-labelledby="title description">
+<title id="title">Decoding CP with group_cast and group_reduce</title>
+<desc id="description">Two DCP ranks process the same batch of four decode queries. Each request has 8192 KV positions, 4096 per rank. KV stays local and its positions may be interleaved. This NCCL CP example uses tensors produced directly in [heads,batch,D] layout. Rank 0 initially owns Q heads 0 through 3 and rank 1 owns heads 4 through 7. Both Q tensors have shape [4,4,D]. AllGather along axis 0 produces the same Q [8,4,D] on both ranks. Each rank attends to its local KV shard, producing partial output [8,4,D] and LSE [8,4]. LSE-weighted reduction across KV shards returns output heads 0 through 3 to rank 0 and heads 4 through 7 to rank 1, both [4,4,D]. Each communication row is one head, with payload [batch,D]. Rank 0 handle owns RowRange(0,4); rank 1 owns RowRange(4,8); both request RowRange(0,8). No reshape or transpose is needed. group_cast expresses the Q AllGather and the proposed group_reduce(reduce_type="lse") expresses the output merge and scatter separately for each query and head. This is a forward-only inference schematic; LSE reduction is not implemented in the current NCCL CP API.</desc>
+<defs>
+<style>text {font-family:Arial,Helvetica,sans-serif;fill:#27313b} .mono {font-family:'DejaVu Sans Mono',Menlo,monospace}</style>
+<marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#2869bd"/></marker>
+<marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#7952aa"/></marker>
+</defs>
+<rect width="1240" height="1570" fill="#ffffff"/>
+<text x="48" y="54" font-size="29" text-anchor="start" font-weight="600">Decoding CP with group_cast and group_reduce</text>
+<text x="48" y="89" font-size="20" text-anchor="start" style="fill:#667383">Same batch on both ranks · 4 requests × 1 decode token · 8 Q heads in the DCP group</text>
+<text x="48" y="117" font-size="18" text-anchor="start" style="fill:#667383">Q starts split by head (TP); KV stays split by sequence (DCP). This example uses [heads, batch, D].</text>
+<rect x="48" y="139" width="544" height="268" rx="12" fill="#fffbef" stroke="#dfc783" stroke-width="1.5"/>
+<text x="68" y="175" font-size="23" text-anchor="start" font-weight="600">DCP rank 0 · initial Q</text>
+<text x="568" y="175" font-size="18" text-anchor="end" class="mono">[4, 4, D]</text>
+<text x="161" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q0</text>
+<text x="271" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q1</text>
+<text x="381" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q2</text>
+<text x="491" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q3</text>
+<text x="68" y="230" font-size="17" text-anchor="start">H0</text>
+<rect x="108" y="213" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="161" y="230" font-size="14" text-anchor="middle">D values</text>
+<rect x="218" y="213" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="271" y="230" font-size="14" text-anchor="middle">D values</text>
+<rect x="328" y="213" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="381" y="230" font-size="14" text-anchor="middle">D values</text>
+<rect x="438" y="213" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="491" y="230" font-size="14" text-anchor="middle">D values</text>
+<text x="68" y="257" font-size="17" text-anchor="start">H1</text>
+<rect x="108" y="240" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="161" y="257" font-size="14" text-anchor="middle">D values</text>
+<rect x="218" y="240" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="271" y="257" font-size="14" text-anchor="middle">D values</text>
+<rect x="328" y="240" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="381" y="257" font-size="14" text-anchor="middle">D values</text>
+<rect x="438" y="240" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="491" y="257" font-size="14" text-anchor="middle">D values</text>
+<text x="68" y="284" font-size="17" text-anchor="start">H2</text>
+<rect x="108" y="267" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="161" y="284" font-size="14" text-anchor="middle">D values</text>
+<rect x="218" y="267" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="271" y="284" font-size="14" text-anchor="middle">D values</text>
+<rect x="328" y="267" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="381" y="284" font-size="14" text-anchor="middle">D values</text>
+<rect x="438" y="267" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="491" y="284" font-size="14" text-anchor="middle">D values</text>
+<text x="68" y="311" font-size="17" text-anchor="start">H3</text>
+<rect x="108" y="294" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="161" y="311" font-size="14" text-anchor="middle">D values</text>
+<rect x="218" y="294" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="271" y="311" font-size="14" text-anchor="middle">D values</text>
+<rect x="328" y="294" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="381" y="311" font-size="14" text-anchor="middle">D values</text>
+<rect x="438" y="294" width="106" height="23" rx="3" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="491" y="311" font-size="14" text-anchor="middle">D values</text>
+<text x="68" y="345" font-size="18" text-anchor="start">Same q0–q3; owns Q heads [0, 4).</text>
+<rect x="68" y="362" width="504" height="31" rx="6" fill="#eff8f6" stroke="#a8cec5" stroke-width="1.5"/>
+<text x="320" y="383" font-size="17" text-anchor="middle" style="fill:#23776c">Local KV: 4,096 positions / request · stays here</text>
+<rect x="648" y="139" width="544" height="268" rx="12" fill="#fff4f4" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="668" y="175" font-size="23" text-anchor="start" font-weight="600">DCP rank 1 · initial Q</text>
+<text x="1168" y="175" font-size="18" text-anchor="end" class="mono">[4, 4, D]</text>
+<text x="761" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q0</text>
+<text x="871" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q1</text>
+<text x="981" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q2</text>
+<text x="1091" y="205" font-size="16" text-anchor="middle" style="fill:#667383">q3</text>
+<text x="668" y="230" font-size="17" text-anchor="start">H4</text>
+<rect x="708" y="213" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="761" y="230" font-size="14" text-anchor="middle">D values</text>
+<rect x="818" y="213" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="871" y="230" font-size="14" text-anchor="middle">D values</text>
+<rect x="928" y="213" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="981" y="230" font-size="14" text-anchor="middle">D values</text>
+<rect x="1038" y="213" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1091" y="230" font-size="14" text-anchor="middle">D values</text>
+<text x="668" y="257" font-size="17" text-anchor="start">H5</text>
+<rect x="708" y="240" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="761" y="257" font-size="14" text-anchor="middle">D values</text>
+<rect x="818" y="240" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="871" y="257" font-size="14" text-anchor="middle">D values</text>
+<rect x="928" y="240" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="981" y="257" font-size="14" text-anchor="middle">D values</text>
+<rect x="1038" y="240" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1091" y="257" font-size="14" text-anchor="middle">D values</text>
+<text x="668" y="284" font-size="17" text-anchor="start">H6</text>
+<rect x="708" y="267" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="761" y="284" font-size="14" text-anchor="middle">D values</text>
+<rect x="818" y="267" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="871" y="284" font-size="14" text-anchor="middle">D values</text>
+<rect x="928" y="267" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="981" y="284" font-size="14" text-anchor="middle">D values</text>
+<rect x="1038" y="267" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1091" y="284" font-size="14" text-anchor="middle">D values</text>
+<text x="668" y="311" font-size="17" text-anchor="start">H7</text>
+<rect x="708" y="294" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="761" y="311" font-size="14" text-anchor="middle">D values</text>
+<rect x="818" y="294" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="871" y="311" font-size="14" text-anchor="middle">D values</text>
+<rect x="928" y="294" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="981" y="311" font-size="14" text-anchor="middle">D values</text>
+<rect x="1038" y="294" width="106" height="23" rx="3" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1091" y="311" font-size="14" text-anchor="middle">D values</text>
+<text x="668" y="345" font-size="18" text-anchor="start">Same q0–q3; owns Q heads [4, 8).</text>
+<rect x="668" y="362" width="504" height="31" rx="6" fill="#eff8f6" stroke="#a8cec5" stroke-width="1.5"/>
+<text x="920" y="383" font-size="17" text-anchor="middle" style="fill:#23776c">Local KV: 4,096 positions / request · stays here</text>
+<rect x="48" y="429" width="1144" height="248" rx="12" fill="#f7fbff" stroke="#bfd4ee" stroke-width="1.5"/>
+<text x="72" y="464" font-size="23" text-anchor="start" font-weight="600" style="fill:#2869bd">1  group_cast · distribute Q heads</text>
+<text x="1168" y="464" font-size="18" text-anchor="end" style="fill:#2869bd" class="mono">group_cast(q_handle, q_local, q_all)</text>
+<rect x="72" y="488" width="194" height="92" rx="10" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="169" y="523" font-size="22" text-anchor="middle" font-weight="600">DCP rank 0</text>
+<text x="169" y="553" font-size="19" text-anchor="middle">Heads 0–3</text>
+<rect x="974" y="488" width="194" height="92" rx="10" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1071" y="523" font-size="22" text-anchor="middle" font-weight="600">DCP rank 1</text>
+<text x="1071" y="553" font-size="19" text-anchor="middle">Heads 4–7</text>
+<text x="620" y="506" font-size="19" text-anchor="middle" style="fill:#2869bd" class="mono">Q[0:4, :, :]  →  rank 1</text>
+<path d="M290 521 H950" fill="none" stroke="#2869bd" stroke-width="3" marker-end="url(#blue)"/>
+<text x="620" y="550" font-size="19" text-anchor="middle" style="fill:#2869bd" class="mono">rank 0  ←  Q[4:8, :, :]</text>
+<path d="M950 565 H290" fill="none" stroke="#2869bd" stroke-width="3" marker-end="url(#blue)"/>
+<text x="72" y="613" font-size="20" text-anchor="start" font-weight="600">Rank 0 now has Q [8, 4, D]</text>
+<rect x="72" y="627" width="240" height="33" rx="5" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="192" y="649" font-size="17" text-anchor="middle">q0–q3 · heads 0–3</text>
+<rect x="318" y="627" width="240" height="33" rx="5" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="438" y="649" font-size="17" text-anchor="middle">q0–q3 · heads 4–7</text>
+<text x="672" y="613" font-size="20" text-anchor="start" font-weight="600">Rank 1 now has Q [8, 4, D]</text>
+<rect x="672" y="627" width="240" height="33" rx="5" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="792" y="649" font-size="17" text-anchor="middle">q0–q3 · heads 0–3</text>
+<rect x="918" y="627" width="240" height="33" rx="5" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1038" y="649" font-size="17" text-anchor="middle">q0–q3 · heads 4–7</text>
+<text x="48" y="721" font-size="23" text-anchor="start" font-weight="600">2  Local attention · same Q, different KV shards</text>
+<rect x="48" y="741" width="544" height="151" rx="12" fill="#fffbef" stroke="#dfc783" stroke-width="1.5"/>
+<text x="320" y="776" font-size="22" text-anchor="middle" font-weight="600">Q [8, 4, D]  ×  KV shard 0</text>
+<text x="320" y="812" font-size="21" text-anchor="middle">Partial O0 [8, 4, D] + LSE0 [8, 4]</text>
+<text x="320" y="842" font-size="17" text-anchor="middle" style="fill:#667383">Each query attends only to its own request’s cache.</text>
+<text x="320" y="871" font-size="18" text-anchor="middle">All 8 Q heads compute on this shard.</text>
+<rect x="648" y="741" width="544" height="151" rx="12" fill="#fff4f4" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="920" y="776" font-size="22" text-anchor="middle" font-weight="600">Q [8, 4, D]  ×  KV shard 1</text>
+<text x="920" y="812" font-size="21" text-anchor="middle">Partial O1 [8, 4, D] + LSE1 [8, 4]</text>
+<text x="920" y="842" font-size="17" text-anchor="middle" style="fill:#667383">Each query attends only to its own request’s cache.</text>
+<text x="920" y="871" font-size="18" text-anchor="middle">All 8 Q heads compute on this shard.</text>
+<rect x="48" y="915" width="1144" height="295" rx="12" fill="#fbf8ff" stroke="#d5c6e8" stroke-width="1.5"/>
+<text x="72" y="950" font-size="23" text-anchor="start" font-weight="600" style="fill:#7952aa">3  group_reduce · LSE-weighted merge to each head owner</text>
+<text x="72" y="980" font-size="19" text-anchor="start" style="fill:#7952aa" class="mono">group_reduce(..., input_lse=partial_lse, reduce_type=&quot;lse&quot;)</text>
+<rect x="72" y="1003" width="194" height="92" rx="10" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="169" y="1038" font-size="22" text-anchor="middle" font-weight="600">DCP rank 0</text>
+<text x="169" y="1068" font-size="19" text-anchor="middle">Heads 0–3</text>
+<rect x="974" y="1003" width="194" height="92" rx="10" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="1071" y="1038" font-size="22" text-anchor="middle" font-weight="600">DCP rank 1</text>
+<text x="1071" y="1068" font-size="19" text-anchor="middle">Heads 4–7</text>
+<text x="620" y="1020" font-size="19" text-anchor="middle" style="fill:#7952aa">O0 + LSE0 for heads 4–7  →  rank 1</text>
+<path d="M290 1036 H950" fill="none" stroke="#7952aa" stroke-width="3" marker-end="url(#purple)"/>
+<text x="620" y="1068" font-size="19" text-anchor="middle" style="fill:#7952aa">rank 0  ←  O1 + LSE1 for heads 0–3</text>
+<path d="M950 1084 H290" fill="none" stroke="#7952aa" stroke-width="3" marker-end="url(#purple)"/>
+<rect x="72" y="1120" width="496" height="43" rx="7" fill="#fff5d9" stroke="#dfc783" stroke-width="1.5"/>
+<text x="320" y="1148" font-size="19" text-anchor="middle" font-weight="600">Rank 0: final O[0:4, :, :]  [4, 4, D]</text>
+<rect x="672" y="1120" width="496" height="43" rx="7" fill="#f9dddd" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="920" y="1148" font-size="19" text-anchor="middle" font-weight="600">Rank 1: final O[4:8, :, :]  [4, 4, D]</text>
+<text x="72" y="1191" font-size="18" text-anchor="start">Merge across KV shards for each (query, head), including the owner’s local contribution.</text>
+<text x="48" y="1253" font-size="23" text-anchor="start" font-weight="600">NCCL CP handle layouts · one head per axis-0 row</text>
+<text x="48" y="1284" font-size="18" text-anchor="start" style="fill:#667383">row_id = head     ·     payload_shape = (batch_size, D)     ·     no reshape / transpose</text>
+<rect x="48" y="1304" width="544" height="181" rx="12" fill="#fffbef" stroke="#dfc783" stroke-width="1.5"/>
+<text x="68" y="1337" font-size="22" text-anchor="start" font-weight="600">Rank 0 q_handle</text>
+<text x="68" y="1368" font-size="17" text-anchor="start" style="fill:#667383" class="mono">local_owned_layout</text>
+<text x="68" y="1394" font-size="20" text-anchor="start" class="mono">[RowRange(0, 4)]</text>
+<text x="68" y="1427" font-size="17" text-anchor="start" style="fill:#667383" class="mono">local_required_layout</text>
+<text x="68" y="1453" font-size="20" text-anchor="start" class="mono">[RowRange(0, 8)]</text>
+<rect x="648" y="1304" width="544" height="181" rx="12" fill="#fff4f4" stroke="#e2b1b1" stroke-width="1.5"/>
+<text x="668" y="1337" font-size="22" text-anchor="start" font-weight="600">Rank 1 q_handle</text>
+<text x="668" y="1368" font-size="17" text-anchor="start" style="fill:#667383" class="mono">local_owned_layout</text>
+<text x="668" y="1394" font-size="20" text-anchor="start" class="mono">[RowRange(4, 8)]</text>
+<text x="668" y="1427" font-size="17" text-anchor="start" style="fill:#667383" class="mono">local_required_layout</text>
+<text x="668" y="1453" font-size="20" text-anchor="start" class="mono">[RowRange(0, 8)]</text>
+<text x="48" y="1519" font-size="19" text-anchor="start" font-weight="600">Forward inference only. Both ranks receive their own final output heads.</text>
+<text x="48" y="1550" font-size="17" text-anchor="start" style="fill:#667383">Design adapter for vLLM’s standard DCP flow; NCCL CP LSE reduction is not yet implemented.</text>
+</svg>

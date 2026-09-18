@@ -48,10 +48,14 @@ $$
 
 The weights are computed across participating KV shards for each query and
 attention head. Q distribution can be omitted when Q is already replicated on
-the participating ranks. The LSE-weighted output merge requires additional
-logic beyond NCCL CP's current sum reduction.
+the participating ranks. In the schematic API,
+`group_reduce(..., reduce_type="lse")` performs this LSE-weighted merge
+internally. This LSE mode is not yet implemented in the current backend.
 
 ![Q communication in the forward pass](img/q_comm_fwd.png)
+
+See the [decoding CP example](#two-rank-decoding-context-parallelism-q-communication)
+for a forward-only Q-distribution and output-merge flow.
 
 **Backward.** Send Q, the complete forward output O, dO and the final merged LSE
 to the KV-owning ranks that participated in the forward pass. Each rank computes
@@ -106,15 +110,20 @@ can therefore be a subset of the full CP communication group, hence the name
 
 *Source: [MagiAttention — Group Collective Primitives](https://sandai-org.github.io/MagiAttention/docs/main/blog/magi_attn.html#group-collective-primitives).*
 
-### Token layouts and communication plans
+### Row layouts and communication plans
 
-Each rank uses a `list[TokenRange]` to describe the tokens it owns before
-communication (`local_input_layout`), and another to describe the tokens it
-needs (`local_output_layout`). The requested layout can include tokens to fetch
-from other ranks and any locally owned tokens needed in the result. These
-tokens can represent Q or KV, depending on the higher-level CP implementation.
+In most CP scenarios, rows correspond to the token dimension. In decoding
+context parallelism (DCP), rows can instead correspond to the head dimension.
 
-`create_handle` combines the ownership and request layouts across ranks to
+Each rank uses a `list[RowRange]` to describe the tensor rows it owns before
+communication (`local_owned_layout`), and another to describe the rows it needs
+(`local_required_layout`), including both remote and required local rows.
+`RowRange` identifies global row IDs along tensor axis 0. The application
+defines what a row represents: a Q or KV token in `[tokens, heads, D]` layout,
+or one head across the batch in `[heads, batch, D]` layout. The remaining
+dimensions form each row's `payload_shape`.
+
+`create_handle` combines the owned and required layouts across ranks to
 generate a reusable CP communication execution plan, recorded in a handle.
 Passing that handle to `group_cast` or `group_reduce` executes the corresponding
 prepared communication plan. The handle abstracts execution details, allowing
@@ -130,8 +139,8 @@ Pseudocode on rank 1:
 ```python
 handle = create_handle(
     group,
-    local_input_layout=[TokenRange(4096, 8192)],
-    local_output_layout=[TokenRange(0, 8192)],
+    local_owned_layout=[RowRange(4096, 8192)],
+    local_required_layout=[RowRange(0, 8192)],
     stream=stream,
 )
 group_cast(handle, kv_local, kv_full, stream=stream)
@@ -358,9 +367,9 @@ config = CpConfig(
     nvl_domain_size=ranks_per_domain,  # Supplied by the application.
 )
 group = create_group(nccl_group, config)
-handle = create_handle(group, local_input_layout, local_output_layout, stream=stream)
+handle = create_handle(group, local_owned_layout, local_required_layout, stream=stream)
 
-with torch.no_grad(), torch.cuda.stream(stream):
+with torch.no_grad():
     group_cast(handle, input, output, stream=stream)
     grad_output.zero_()  # Omit when accumulating into existing values.
     group_reduce(handle, grad_input, grad_output, stream=stream)
@@ -383,60 +392,64 @@ and `CpGroup.cp_config` expose those objects.
 
 | `CpConfig` field | Configuration | Meaning |
 |---|---|---|
-| `max_per_peer_slot` | Required | Native peer-slot capacity C, in token rows |
-| `payload_shape` | Required | Per-token dimensions; `()` describes a scalar |
+| `max_per_peer_slot` | Required | Native peer-slot capacity C, in communication rows |
+| `payload_shape` | Required | Per-row dimensions, excluding axis 0; `()` describes a scalar |
 | `dtype` | Required | Storage dtype used to size capacity |
-| `max_per_token_bytes` | Derived | B = `prod(payload_shape) * dtype.itemsize` |
-| `max_layout_tokens` | C | Owned-token bound per rank for handle metadata; independent of workspace capacity |
+| `max_per_token_bytes` | Derived | Per-row bytes B = `prod(payload_shape) * dtype.itemsize` |
+| `max_layout_tokens` | C | Owned-row bound per rank for handle metadata; independent of workspace capacity |
 | `runtime_slot` | `0` | Workspace slot within the ProcessGroup |
 | `nvl_domain_size` | Set explicitly for the communicator | Ranks per NVL domain |
 | `backend` | `"auto"` | Prepare zero-CTA when eligible; `"all2allv"` selects flat |
 
 For `num_heads=32`, `head_dim=128` and BF16, B is 8192 bytes. Size C/B for the largest intended
 traffic. Configuration does not convert tensors. A slot can reuse a larger byte
-capacity, but token/domain capacities must match; use another slot for different
+capacity, but row/domain capacities must match; use another slot for different
 bounds.
 
-### Handle input and output layouts
+### Handle owned and required layouts
 
-Both layouts are host-side `Sequence[int | TokenRange]` descriptions. Each integer
-identifies one token occurrence; `TokenRange(start, stop)` describes the half-open
-interval `[start, stop)` in ascending order. IDs are shared across the group and
-identify token occurrences, not vocabulary entries. They carry no tensor data.
+Both layouts are host-side `Sequence[int | RowRange]` descriptions. Each integer
+identifies one global communication row; `RowRange(start, stop)` describes the
+half-open ID interval `[start, stop)` in ascending order. IDs are shared across
+the group and are independent of local tensor offsets. A row can represent a
+token, a head, or another application-defined unit. Layouts carry no tensor data.
 
-| Argument | What this rank declares | Tensor row mapping |
-|---|---|---|
-| `local_input_layout` | Tokens owned by this rank, in local input order | Cast input and reduce output |
-| `local_output_layout` | Tokens this rank requests, in the desired result order | Valid cast output prefix and valid reduce input prefix |
+| Argument | What this rank declares | `group_cast` | `group_reduce` |
+|---|---|---|---|
+| `local_owned_layout` | Rows owned by this rank, in local storage order | Input: owned rows | Output: reduced contributions accumulated at their owner |
+| `local_required_layout` | Rows this rank needs, including required local rows, in the desired order | Output: required rows | Input: local contributions for the required rows |
 
-`local_input_layout` describes **every row of the supplied cast input**, in
-axis-0 order. Its expanded token count must equal both the cast input row count
-and the reduce output row count. Each declared token ID belongs to exactly one
+For `local_required_layout`, only the valid prefix of the cast output or reduce
+input buffer is described by the layout; extra buffer capacity is excluded.
+
+`local_owned_layout` describes **every row of the supplied cast input**, in
+axis-0 order. Its expanded row count must equal both the cast input row count
+and the reduce output row count. Each declared row ID belongs to exactly one
 rank in the group; IDs can be nonconsecutive and need not be numerically sorted.
 Include each input row even when no rank requests it. Rows unrequested by every
 rank do not appear in cast outputs, and their reduce output values stay unchanged.
 
-`local_output_layout` describes the **complete requested output**, including
-remote tokens and any locally owned tokens that should appear in the result.
+`local_required_layout` describes the **complete requested output**, including
+remote rows and any locally owned rows that should appear in the result.
 The caller does not need to know the remote owners: handle preparation resolves
-them from the input layouts exchanged across the group.
+them from the owned layouts exchanged across the group.
 
 For example, suppose this rank owns `[100, 101, 102]` and another owner declares
 `[200, 201]` in that order:
 
 ```python
-from nccl.cp import TokenRange
+from nccl.cp import RowRange
 
-local_input_layout = [TokenRange(100, 103)]
-local_output_layout = [100, 200, 101, 201]
+local_owned_layout = [RowRange(100, 103)]
+local_required_layout = [100, 200, 101, 201]
 ```
 
-Cast writes rows for tokens `100, 200, 101, 201` in exactly that order. Reduce
+Cast writes rows with IDs `100, 200, 101, 201` in exactly that order. Reduce
 reads contributions in the same order and sends each back to its owner;
 this rank's accumulator rows still correspond to `100, 101, 102`. If no rank
-requests token `102`, its accumulator row is left unchanged.
+requires row `102`, its accumulator row is left unchanged.
 
-- Every requested ID must have exactly one owner. Neither local layout may
+- Every required ID must have exactly one owner. Neither local layout may
   repeat an ID, including through overlapping ranges.
 - Requests from the same owner must preserve that owner's declared input order;
   different owners may interleave. This is not a numeric sorting requirement.
@@ -444,14 +457,14 @@ requests token `102`, its accumulator row is left unchanged.
 - The logical row count is the sum of interval lengths and individual IDs,
   not the number of layout entries. The example has three input rows and four
   output rows. Additional output buffer capacity is not listed in the layout.
-- `local_input_layout=[]` declares no owned rows: cast input and reduce output
-  have zero rows. The output layout may still request tokens owned by other ranks.
-- `local_output_layout=[]` requests no rows. The rank still participates in
+- `local_owned_layout=[]` declares no owned rows: cast input and reduce output
+  have zero rows. The required layout may still include rows owned by other ranks.
+- `local_required_layout=[]` requests no rows. The rank still participates in
   matching calls and may have relay work.
 
 The caller keeps actual tensor rows consistent with these descriptions.
 
-`create_handle(group, local_input_layout, local_output_layout, *, stream)` exchanges
+`create_handle(group, local_owned_layout, local_required_layout, *, stream)` exchanges
 layouts and prepares this rank's route and relay work. Changed ownership, requests
 or row order require a new handle. Preparation/uploads run outside CUDA Graph capture.
 
@@ -465,12 +478,12 @@ Each rank computes its own four lists and the relay metadata it needs.
 ## Tensor and Reduction Contract
 
 Input/output are required caller-owned tensors with matching dtype, device and
-per-token shape. CP never allocates or replaces the output buffer.
+per-row shape. CP never allocates or replaces the output buffer.
 
 | Operation | Input rows | Output rows |
 |---|---|---|
-| Cast | Exactly the local input layout | At least the local output layout |
-| Reduce | At least the local output layout | Exactly the local input layout |
+| Cast | Exactly the local owned layout | At least the local required layout |
+| Reduce | At least the local required layout | Exactly the local owned layout |
 
 Cast writes the valid output prefix and leaves trailing capacity unchanged.
 Reduce ignores the input tail and **adds** contributions to existing output.
@@ -565,7 +578,7 @@ does not complete it. These are not Python coroutines.
 
 Caller responsibilities:
 
-- Match operation order, routes and per-token formats across ranks, including
+- Match operation order, routes and per-row formats across ranks, including
   empty/relay-only ranks. CP does not negotiate them in data calls.
 - Keep one fixed stream per native slot and serialize submissions with preparation
   and teardown. Order producers before communication and consumers after completion;
@@ -637,7 +650,7 @@ token positions. `dout_local` is the output gradient supplied by later layers.
 import torch
 import torch.distributed as dist
 from nccl.cp import (
-    CpConfig, TokenRange, create_group, create_handle,
+    CpConfig, RowRange, create_group, create_handle,
     group_cast, group_reduce,
 )
 
@@ -655,8 +668,8 @@ config = CpConfig(
 group = create_group(nccl_group, config)
 handle = create_handle(
     group,
-    local_input_layout=[TokenRange(q_start, q_stop)],  # Owned K/V tokens.
-    local_output_layout=[TokenRange(0, q_stop)],      # Required K/V prefix.
+    local_owned_layout=[RowRange(q_start, q_stop)],  # Owned K/V tokens.
+    local_required_layout=[RowRange(0, q_stop)],      # Required K/V prefix.
 )
 
 # Rank 0 needs 4,096 KV tokens; rank 1 needs 8,192.
@@ -695,14 +708,117 @@ clear them again before another iteration unless accumulation is intended.
 
 The same flow extends to packed variable-length samples and larger CP groups.
 Each rank can describe multiple disjoint owned and required token ranges with
-`list[TokenRange]`, as in the [packed variable-length example](#packed-variable-length-samples).
+`list[RowRange]`, as in the [packed variable-length example](#packed-variable-length-samples).
 Different CP load-balancing algorithms can assign tokens differently; the
 application translates each assignment and its attention dependencies into
-`local_input_layout` and `local_output_layout`. `create_handle` derives the
+`local_owned_layout` and `local_required_layout`. `create_handle` derives the
 communication plan from these layouts, while the `group_cast` / attention /
 `group_reduce` flow stays the same. Recreate the handle when the token layouts
 change. The attention kernels remain responsible for document boundaries and
 causal masks.
+
+### Two-rank decoding context parallelism: Q communication
+
+The [vLLM DCP process](https://vllm.ai/blog/2026-08-07-decode-context-parallelism#41-decode-context-parallelism-process)
+processes the same batch on every rank in a DCP group. In its standard path,
+each rank initially has different Q heads from tensor parallelism (TP).
+[AllGather along the head dimension](https://github.com/vllm-project/vllm/blob/017dced6a6fd3cf430e4686a47b354da1cadfbf5/vllm/v1/attention/backends/flash_attn.py#L1529)
+gives every rank the same Q for the group's heads. Each rank computes against
+its own sequence shard of the KV cache. The partial outputs are then
+[LSE-weighted and ReduceScattered by head](https://github.com/vllm-project/vllm/blob/017dced6a6fd3cf430e4686a47b354da1cadfbf5/vllm/v1/attention/ops/dcp.py#L470),
+so each rank receives its original head slice of the final output.
+
+Consider a batch of four requests, each contributing one decode query at
+position 8191 of an 8,192-token context. The two-rank DCP group covers eight
+Q heads: four per rank before communication. Each rank keeps 4,096 KV positions
+per request, covering the KV head(s) used by these Q heads. KV stays local;
+only Q and partial-result information move. Cache positions may be interleaved
+according to vLLM's cache layout; they need not form contiguous halves.
+For this schematic, the cache includes the current step's K/V.
+This NCCL CP example uses tensors produced directly in `[heads, batch, D]`
+layout for Q and attention outputs.
+
+| DCP rank | Q before communication | Q used for local attention | Final output |
+|---|---|---|---|
+| 0 | Same 4 queries, heads `[0, 4)` | All 8 heads, shape `[8, 4, D]` | Heads `[0, 4)`, shape `[4, 4, D]` |
+| 1 | Same 4 queries, heads `[4, 8)` | All 8 heads, shape `[8, 4, D]` | Heads `[4, 8)`, shape `[4, 4, D]` |
+
+![Decoding CP with group_cast and group_reduce: group_cast distributes Q heads, local attention uses stationary KV shards, and group_reduce merges partial outputs with LSE weights back to each head owner; both head-range handles are shown](img/cp_decode_q_communication.png)
+
+The following **design pseudocode** expresses this flow with NCCL CP primitives.
+It follows vLLM's communication flow with a head-major tensor layout for this
+example. NCCL CP routes along axis 0: each row is one head, with a
+`[batch_size, head_dim]` payload. `RowRange` therefore identifies head IDs
+here, independently of KV-cache positions. Rank 0 owns heads `[0, 4)`, rank 1
+owns `[4, 8)`, and both request `[0, 8)`. The reverse route merges each head
+back to its owner, separately for every query in the batch.
+
+Assume a two-rank `group` configured with
+`payload_shape=(batch_size, head_dim)` and the Q/output dtype. `q_local` is
+already contiguous with shape `[4, 4, head_dim]` on both ranks, in
+`[local_heads, batch, D]` order. Q and attention output use the same head
+dimension in this example. The caller-provided `decode_attention` kernel
+accepts Q in `[heads, batch, D]` order and produces contiguous `partial_out`
+shaped `[8, 4, head_dim]` and natural-log `partial_lse` shaped `[8, 4]`.
+`kv_positions_local` describes the cache positions for each request.
+Stream and lifetime handling are omitted.
+
+```python
+import torch
+import torch.distributed as dist
+from nccl.cp import RowRange, create_handle, group_cast, group_reduce
+
+local_token_count = 4096
+batch_size, local_num_heads = 4, 4
+num_heads = 2 * local_num_heads
+head_dim = q_local.shape[-1]
+rank = dist.get_rank(nccl_group)
+
+q_handle = create_handle(
+    group,
+    local_owned_layout=[RowRange(rank * local_num_heads, (rank + 1) * local_num_heads)],
+    local_required_layout=[RowRange(0, num_heads)],
+)
+q_all = torch.empty(
+    (num_heads, batch_size, head_dim), dtype=q_local.dtype, device=q_local.device,
+)
+out_local = torch.zeros_like(q_local)  # [local_heads, batch, D].
+
+with torch.no_grad():
+    # 1. group_cast: distribute each rank's Q heads to both ranks.
+    group_cast(q_handle, q_local, q_all)  # Same [8, 4, D] on both ranks.
+
+    # 2. All group heads attend to this rank's stationary KV shard.
+    partial_out, partial_lse = decode_attention(
+        q_all, k_cache_local, v_cache_local,
+        q_position=2 * local_token_count - 1,
+        kv_positions=kv_positions_local,
+    )
+
+    # 3. group_reduce: LSE-weighted merge back to each head owner.
+    group_reduce(
+        q_handle, partial_out, out_local,
+        input_lse=partial_lse,
+        reduce_type="lse",
+    )
+    # out_local is [4, 4, D]: this rank's 4 heads for all 4 queries.
+```
+
+In this design, `group_reduce(..., reduce_type="lse")` handles LSE normalization
+and weighted summation across KV shards separately for each query and head.
+Rank 0 receives heads `[0, 4)` and rank 1 receives heads `[4, 8)` for all four
+queries. Each result includes contributions from both KV shards, including
+the owner's local contribution. This is entirely inference's forward pass.
+
+**Implementation note:** the current Python API uses `reduce_op="sum"` and
+does not yet implement LSE reduction. `reduce_type="lse"` above describes the
+intended interface rather than a currently executable call.
+
+For more ranks, update the head ownership ranges. A different batch size changes
+the per-head payload shape to `(batch_size, head_dim)`; head IDs stay the same
+if ownership is unchanged. Each `(query, head)` merge includes its participating
+KV shards. vLLM's optional MLA Q-replication path can skip the Q AllGather;
+the LSE-weighted output merge is still needed.
 
 ## Tests
 

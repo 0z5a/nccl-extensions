@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from nccl.cp import (
     CpConfig,
-    TokenRange,
+    RowRange,
     group_cast,
     group_cast_explicit,
     group_reduce,
@@ -271,11 +271,11 @@ def main():
         expect_error(lambda: create_handle(group, duplicated_owner, requested[rank], stream=stream))
 
         # Metadata overflow is reported within the single handle exchange.
-        oversized = [TokenRange(0, 5)] if rank == 0 else owned[rank]
+        oversized = [RowRange(0, 5)] if rank == 0 else owned[rank]
         expect_error(lambda: create_handle(group, oversized, requested[rank], stream=stream))
-        oversized_request = [TokenRange(0, 4 * world + 1)] if rank == 0 else requested[rank]
+        oversized_request = [RowRange(0, 4 * world + 1)] if rank == 0 else requested[rank]
         expect_error(lambda: create_handle(group, owned[rank], oversized_request, stream=stream))
-        out_of_int64 = [TokenRange((1 << 63) - 1, 1 << 63)] if rank == 0 else owned[rank]
+        out_of_int64 = [RowRange((1 << 63) - 1, 1 << 63)] if rank == 0 else owned[rank]
         expect_error(lambda: create_handle(group, out_of_int64, requested[rank], stream=stream))
         oversized_group = create_group(nccl_group, replace(
             cp_config, payload_shape=(1,) * 10000 if rank == 0 else (6,)))
@@ -302,11 +302,14 @@ def main():
         torch.testing.assert_close(untouched, torch.full_like(input, 3), rtol=0, atol=0)
         close_handle(unused)
 
-        # Equivalent compact input layout; output lists retain rank-local ordering.
-        compact = [TokenRange(tokens[0], tokens[0] + 3)] if (tokens := owned[rank]) else []
+        # Equivalent compact owned layout; required lists retain rank-local ordering.
+        compact = [RowRange(tokens[0], tokens[0] + 3)] if (tokens := owned[rank]) else []
         if rank == 0:
             compact.append(99)
-        replacement = create_handle(group, compact, requested[rank], stream=stream)
+        replacement = create_handle(
+            group, local_owned_layout=compact,
+            local_required_layout=requested[rank], stream=stream,
+        )
         original_runtime_id = handle._native.runtime.runtime_id() if handle._native is not None else None
         replacement.group_cast(input, output, stream=stream)
         if replacement.backend == "zero_cta" and original_runtime_id is not None:

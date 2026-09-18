@@ -46,6 +46,9 @@ def test_lazy_import_without_jit(tmp_path):
 import sys
 import nccl.cp
 assert "create_handle" in nccl.cp.__all__
+assert "RowRange" in nccl.cp.__all__
+from nccl.cp import RowRange
+assert RowRange(4, 8).start == 4
 assert "torch" not in sys.modules
 from nccl.cp import comm_meta, work, CpConfig, CpGroup, create_group
 from nccl.cp import zero_cta as backend

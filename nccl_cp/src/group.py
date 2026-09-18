@@ -18,18 +18,19 @@ if TYPE_CHECKING:
 class CpConfig:
     """Host configuration shared by all handles of a CP group.
 
-    max_per_peer_slot: Token-row capacity C reserved for each native peer slot.
-    max_layout_tokens: Maximum owned token rows per rank for handle metadata,
+    max_per_peer_slot: Row capacity C reserved for each native peer slot.
+    max_layout_tokens: Maximum owned rows per rank for handle metadata,
         for either backend. None resolves to C at configuration construction.
         Requests may contain up to world_size * max_layout_tokens rows. Use a
         larger value when flat routes must exceed the native workspace capacity.
         This sizes metadata only and does not enlarge native workspace.
-    payload_shape: One token's payload dimensions, excluding tensor axis 0.
+    payload_shape: One communication row's dimensions, excluding tensor axis 0.
+        A row can represent a token, a head, or another caller-defined unit.
         A tuple/list of nonnegative Python integers; () means one scalar.
     dtype: Storage dtype used to size the payload budget, not a conversion.
         Supported: float16, bfloat16, float32, float64. Use a description that
         covers the largest intended cast/reduce row.
-    max_per_token_bytes: Derived budget B = prod(payload_shape) * dtype.itemsize.
+    max_per_token_bytes: Derived per-row budget B = prod(payload_shape) * dtype.itemsize.
     runtime_slot: Nonnegative workspace slot within the underlying ProcessGroup.
     nvl_domain_size: Ranks per NVL domain; None resolves NVL_DOMAIN_SIZE when
         constructing this configuration (default 8).
@@ -40,7 +41,7 @@ class CpConfig:
     Caller contract: size C/B for the intended zero-CTA traffic and keep
     per-call payload formats compatible across communicating ranks. This
     configuration reserves capacity; it does not convert tensors or verify
-    their token contents. A reused native runtime may have a larger B.
+    their row contents. A reused native runtime may have a larger B.
     NVL domains must describe contiguous group-rank blocks with mutually
     device-accessible symmetric buffers. Preparation checks available peer
     identity/access information, not the application's placement intent.
@@ -57,7 +58,7 @@ class CpConfig:
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload_shape, (tuple, list)):
-            raise TypeError("payload_shape must be a tuple or list excluding the token axis")
+            raise TypeError("payload_shape must be a tuple or list excluding tensor axis 0")
         if any(type(size) is not int or size < 0 for size in self.payload_shape):
             raise ValueError("payload_shape dimensions must be nonnegative Python integers")
         if not isinstance(self.dtype, torch.dtype) or self.dtype not in (

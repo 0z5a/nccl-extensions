@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from nccl.cp import CpConfig, CpGroup, collectives, create_group
+from nccl.cp import CpConfig, CpGroup, RowRange, collectives, create_group
 
 
 def forbidden(*args, **kwargs):
@@ -128,7 +128,12 @@ def test_handle_reads_group_payload_and_selects_flat(monkeypatch, local_runtime,
     monkeypatch.setattr(collectives, "_probe_zero", forbidden)
     config = CpConfig(max_per_peer_slot=2, payload_shape=(128,), dtype=dtype)
     group = create_group(nccl_group, config)
-    handle = collectives.create_handle(group, [0, 1], [0, 1], stream=None)
+    handle = collectives.create_handle(
+        group,
+        local_owned_layout=[RowRange(0, 2)],
+        local_required_layout=[RowRange(0, 2)],
+        stream=None,
+    )
     assert handle.group is group and handle.nccl_group is nccl_group
     assert handle.backend == "all2allv" and "dtype" in handle.fallback_reason
 

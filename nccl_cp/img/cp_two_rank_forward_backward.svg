@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1340" viewBox="0 0 1240 1340" role="img" aria-labelledby="title description">
   <title id="title">Two-rank causal attention: handles, forward, and backward</title>
-  <desc id="description">One 8192-token causal document, with 4096 tokens per rank. Rank 0 owns Q/K/V [0,4096); its handle has input and output layouts [TokenRange(0,4096)]. Rank 1 owns Q/K/V [4096,8192); its handle input layout is [TokenRange(4096,8192)] and its output layout is [TokenRange(0,8192)]. Forward group_cast sends K and V [0,4096) from rank 0 to rank 1. Backward group_reduce sends rank 1's dK and dV contributions for [0,4096) back to rank 0 and adds its local contributions. Rank 1 retains its local dK/dV [4096,8192). dQ stays local. Each rank reuses its own handle for K, V, dK, and dV.</desc>
+  <desc id="description">One 8192-token causal document, with 4096 tokens per rank. Rank 0 owns Q/K/V [0,4096); its handle has owned and required layouts [RowRange(0,4096)]. Rank 1 owns Q/K/V [4096,8192); its handle owned layout is [RowRange(4096,8192)] and its required layout is [RowRange(0,8192)]. Forward group_cast sends K and V [0,4096) from rank 0 to rank 1. Backward group_reduce sends rank 1's dK and dV contributions for [0,4096) back to rank 0 and adds its local contributions. Rank 1 retains its local dK/dV [4096,8192). dQ stays local. Each rank reuses its own handle for K, V, dK, and dV.</desc>
   <defs>
     <pattern id="grid" width="25" height="25" patternUnits="userSpaceOnUse">
       <path d="M 25 0 H 0 V 25" fill="none" stroke="#e9edf1" stroke-width="1"/>
@@ -65,20 +65,20 @@
   <text x="742" y="204" font-size="23" text-anchor="start" font-weight="600">CP rank 0 handle</text>
   <text x="742" y="233" font-size="18" text-anchor="start">Owns Q / K / V  [0, 4096)</text>
   <path d="M742 248 H1172" stroke="#dfc783"/>
-  <text x="742" y="279" font-size="17" text-anchor="start" class="muted mono">local_input_layout</text>
-  <text x="742" y="308" font-size="19" text-anchor="start" class="mono">[TokenRange(0, 4096)]</text>
-  <text x="742" y="343" font-size="17" text-anchor="start" class="muted mono">local_output_layout</text>
-  <text x="742" y="372" font-size="19" text-anchor="start" class="mono">[TokenRange(0, 4096)]</text>
+  <text x="742" y="279" font-size="17" text-anchor="start" class="muted mono">local_owned_layout</text>
+  <text x="742" y="308" font-size="19" text-anchor="start" class="mono">[RowRange(0, 4096)]</text>
+  <text x="742" y="343" font-size="17" text-anchor="start" class="muted mono">local_required_layout</text>
+  <text x="742" y="372" font-size="19" text-anchor="start" class="mono">[RowRange(0, 4096)]</text>
   <text x="742" y="409" font-size="18" text-anchor="start" font-weight="600">4,096 owned → 4,096 required tokens</text>
   <text x="742" y="439" font-size="17" text-anchor="start" class="muted">Uses local KV; sends KV to rank 1.</text>
   <rect x="722" y="486" width="470" height="294" rx="12" fill="#fff4f4" stroke="#e2b1b1" stroke-width="1.5"/>
   <text x="742" y="520" font-size="23" text-anchor="start" font-weight="600">CP rank 1 handle</text>
   <text x="742" y="549" font-size="18" text-anchor="start">Owns Q / K / V  [4096, 8192)</text>
   <path d="M742 564 H1172" stroke="#e2b1b1"/>
-  <text x="742" y="595" font-size="17" text-anchor="start" class="muted mono">local_input_layout</text>
-  <text x="742" y="624" font-size="19" text-anchor="start" class="mono">[TokenRange(4096, 8192)]</text>
-  <text x="742" y="659" font-size="17" text-anchor="start" class="muted mono">local_output_layout</text>
-  <text x="742" y="688" font-size="19" text-anchor="start" class="mono">[TokenRange(0, 8192)]</text>
+  <text x="742" y="595" font-size="17" text-anchor="start" class="muted mono">local_owned_layout</text>
+  <text x="742" y="624" font-size="19" text-anchor="start" class="mono">[RowRange(4096, 8192)]</text>
+  <text x="742" y="659" font-size="17" text-anchor="start" class="muted mono">local_required_layout</text>
+  <text x="742" y="688" font-size="19" text-anchor="start" class="mono">[RowRange(0, 8192)]</text>
   <text x="742" y="725" font-size="18" text-anchor="start" font-weight="600">4,096 owned → 8,192 required tokens</text>
   <text x="742" y="755" font-size="17" text-anchor="start" class="muted">Keeps local KV; fetches earlier KV from rank 0.</text>
   <path d="M48 818 H1192" stroke="#e0e5ea"/>

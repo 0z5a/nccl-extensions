@@ -9,21 +9,22 @@ from itertools import accumulate
 
 
 @dataclass(frozen=True)
-class TokenRange:
-    """Half-open range of global token IDs [start, stop), in tensor row order.
+class RowRange:
+    """Half-open range of global row IDs [start, stop), in tensor axis-0 order.
 
-    Caller-assigned IDs identify token occurrences/rows, not vocabulary IDs.
-    Their relationship to tensor contents cannot be verified from metadata.
+    Caller-assigned IDs identify communication rows, such as tokens or heads.
+    They are not vocabulary IDs or local tensor offsets. The caller defines
+    each row's payload and keeps the layout consistent with tensor contents.
     """
     start: int
     stop: int
 
     def __post_init__(self):
         if type(self.start) is not int or type(self.stop) is not int or self.stop < self.start:
-            raise ValueError("TokenRange requires integer start <= stop")
+            raise ValueError("RowRange requires integer start <= stop")
 
 
-Layout = Sequence[int | TokenRange]
+Layout = Sequence[int | RowRange]
 Intervals = tuple[tuple[int, int], ...]
 
 
@@ -32,10 +33,10 @@ def layout_intervals(layout: Layout) -> Intervals:
     for value in layout:
         if type(value) is int:
             start, stop = value, value + 1
-        elif isinstance(value, TokenRange):
+        elif isinstance(value, RowRange):
             start, stop = value.start, value.stop
         else:
-            raise TypeError("Layouts contain integer token IDs or TokenRange values")
+            raise TypeError("Layouts contain integer row IDs or RowRange values")
         if start == stop:
             continue
         if ranges and ranges[-1][1] == start:
@@ -44,12 +45,12 @@ def layout_intervals(layout: Layout) -> Intervals:
             ranges.append((start, stop))
     ordered = sorted(ranges)
     if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
-        raise ValueError("A local layout must not repeat a token ID")
+        raise ValueError("A local layout must not repeat a row ID")
     return tuple(ranges)
 
 
 def expand_layout(layout: Intervals) -> tuple[int, ...]:
-    return tuple(token for start, stop in layout for token in range(start, stop))
+    return tuple(row for start, stop in layout for row in range(start, stop))
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,7 @@ def validate_layouts(layouts: Sequence[tuple[Intervals, Intervals]]) -> tuple[tu
             offset += stop - start
     ownership.sort()
     if any(left[1] > right[0] for left, right in zip(ownership, ownership[1:])):
-        raise ValueError("A token has more than one owner")
+        raise ValueError("A row has more than one owner")
     starts = [part[0] for part in ownership]
     for rank, (_, requested) in enumerate(layouts):
         last_position: dict[int, int] = {}
@@ -119,7 +120,7 @@ def validate_layouts(layouts: Sequence[tuple[Intervals, Intervals]]) -> tuple[tu
             while position < stop:
                 index = bisect_right(starts, position) - 1
                 if index < 0 or not ownership[index][0] <= position < ownership[index][1]:
-                    raise ValueError(f"rank {rank}: requested token {position} has no owner")
+                    raise ValueError(f"rank {rank}: requested row {position} has no owner")
                 first, end, owner, offset = ownership[index]
                 count = min(stop, end) - position
                 source_position = offset + position - first
@@ -207,7 +208,7 @@ def local_route(rank: int, layouts: Sequence[tuple[Intervals, Intervals]], *, bu
                     offset += stop - start
         ownership.sort()
         if any(left[1] > right[0] for left, right in zip(ownership, ownership[1:])):
-            raise ValueError("A token has more than one owner")
+            raise ValueError("A row has more than one owner")
     owner_starts = [item[0] for item in ownership]
     input_splits: list[int] = []
     destinations: list[list[int]] = []
@@ -229,7 +230,7 @@ def local_route(rank: int, layouts: Sequence[tuple[Intervals, Intervals]], *, bu
         while position < stop:
             index = bisect_right(owner_starts, position) - 1
             if index < 0 or not ownership[index][0] <= position < ownership[index][1]:
-                raise ValueError(f"Requested token {position} has no owner")
+                raise ValueError(f"Requested row {position} has no owner")
             first, end, peer, offset = ownership[index]
             count = min(stop, end) - position
             source_position = offset + position - first

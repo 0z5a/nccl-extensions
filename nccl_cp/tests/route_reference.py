@@ -48,7 +48,7 @@ def reference_local_route(rank: int, layouts: Sequence[tuple[Intervals, Interval
             offset += stop - start
     ownership.sort()
     if any(left[1] > right[0] for left, right in zip(ownership, ownership[1:])):
-        raise ValueError("A token has more than one owner")
+        raise ValueError("A row has more than one owner")
     owner_starts = [item[0] for item in ownership]
     requests = [sorted(pair[1]) for pair in layouts]
     request_starts = [[part[0] for part in request] for request in requests]
@@ -85,7 +85,7 @@ def reference_local_route(rank: int, layouts: Sequence[tuple[Intervals, Interval
         while position < stop:
             index = bisect_right(owner_starts, position) - 1
             if index < 0 or not ownership[index][0] <= position < ownership[index][1]:
-                raise ValueError(f"Requested token {position} has no owner")
+                raise ValueError(f"Requested row {position} has no owner")
             first, end, peer, offset = ownership[index]
             count = min(stop, end) - position
             source_position = offset + position - first
