@@ -4702,7 +4702,9 @@ void printUsage(const char* programName, int myRank) {
             "                             Ignored in LL mode.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --overflow-drop          HT: NCCL_EP_OVERFLOW_DROP instead of trapping on overflow\n");
-        printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
+        printf("  --max-num-sms <N>       Shared dispatch/combine SM fallback (0 = auto, default: 0)\n");
+        printf("  --dispatch-num-sms <N>  Dispatch SM budget (0 = inherit shared budget)\n");
+        printf("  --combine-num-sms <N>   Combine SM budget (0 = inherit shared budget)\n");
         printf("  --shuffle-sms <N> SMs for the token permutation (shuffle) kernels (0 = auto, default: 0)\n");
         printf("  --preprocess-num-sms <N> SMs for the preprocessing scan kernels (0 = auto, default: 0)\n");
         printf(
@@ -4775,6 +4777,8 @@ int main(int argc, char* argv[]) {
     bool overflow_drop = false;  // HT only; NCCL_EP_OVERFLOW_DROP instead of the library default (trap)
     bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
+    unsigned int dispatch_num_sms = NCCL_EP_AUTO;
+    unsigned int combine_num_sms = NCCL_EP_AUTO;
     bool ht_em_local_dup = false;
     bool ht_em_mode_explicit = false;
     bool ht_em_local_permute_explicit = false;
@@ -4820,6 +4824,8 @@ int main(int argc, char* argv[]) {
         {"zcopy", no_argument, 0, 'z'},
         {"max-num-sms", required_argument, 0, 'S'},
         {"ht-em-mode", required_argument, 0, 'm'},
+        {"dispatch-num-sms", required_argument, 0, 1006},
+        {"combine-num-sms", required_argument, 0, 1007},
         {"shuffle-sms", required_argument, 0, 'X'},
         {"preprocess-num-sms", required_argument, 0, 'P'},
         {"mask-test", no_argument, 0, 'T'},
@@ -4924,6 +4930,12 @@ int main(int argc, char* argv[]) {
             break;
         case 'S':
             max_num_sms = static_cast<unsigned int>(atoi(optarg));
+            break;
+        case 1006:
+            dispatch_num_sms = static_cast<unsigned int>(atoi(optarg));
+            break;
+        case 1007:
+            combine_num_sms = static_cast<unsigned int>(atoi(optarg));
             break;
         case 'm':
             ht_em_mode_explicit = true;
@@ -5327,10 +5339,14 @@ int main(int argc, char* argv[]) {
                                                   "expert-major");
         printf("  Ranks:           %d\n", nRanks);
         if (max_num_sms != NCCL_EP_AUTO) {
-            printf("  Max num SMs:     %u\n", max_num_sms);
+            printf("  Shared SMs:      %u\n", max_num_sms);
         } else {
-            printf("  Max num SMs:     auto\n");
+            printf("  Shared SMs:      auto\n");
         }
+        if (dispatch_num_sms == NCCL_EP_AUTO) printf("  Dispatch SMs:    inherit\n");
+        else printf("  Dispatch SMs:    %u\n", dispatch_num_sms);
+        if (combine_num_sms == NCCL_EP_AUTO) printf("  Combine SMs:     inherit\n");
+        else printf("  Combine SMs:     %u\n", combine_num_sms);
         printf("  Tokens:          %u\n", max_tokens_per_rank);
         if (include_uniform_less_than_max) {
             printf("  Sub-test:        Uniform tokens (num<max=%u)\n", num_dispatch_tokens);
@@ -5484,6 +5500,8 @@ int main(int argc, char* argv[]) {
     if (ht_em_local_dup) {
         setenv("NCCL_EP_HT_EM_LOCAL_DUP", "1", 1);
     }
+    config.dispatch_num_sms = dispatch_num_sms;
+    config.combine_num_sms = combine_num_sms;
     if (shuffle_sms != NCCL_EP_AUTO) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%u", shuffle_sms);

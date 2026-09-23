@@ -755,8 +755,8 @@ struct ncclEpGroup {
 
     // Resolved HT dispatch/combine tokens-per-chunk for this group. RDMA configs
     // default to HT_TOKENS_PER_CHUNK_RDMA_DEFAULT (64); LSA-only configs default to
-    // a grid-proportional size (NUM_OF_TOKENS_PER_GROUP * comm_num_sms, rounded up
-    // to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
+    // a dispatch-grid-proportional size (NUM_OF_TOKENS_PER_GROUP times the dispatch
+    // budget, rounded up to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
     int ht_tokens_per_chunk = 0;
 
     struct {
@@ -811,7 +811,8 @@ struct ncclEpGroup {
     // it (see ncclEpDispatch) without re-querying the device on every call.
     // NOTE: consumed by the EM pull-push path only for now; other EM modes do not yet use it.
     size_t device_smem_optin;
-    unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
+    unsigned int dispatch_num_sms; // Resolved dispatch SM budget.
+    unsigned int combine_num_sms;  // Resolved combine SM budget.
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce, push-combine reduce).
     unsigned int
         preprocess_num_sms; // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
@@ -936,7 +937,7 @@ struct ncclEpGroup {
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
           num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
-          last_ll_combine_warps_per_group(0), device_smem_optin(0), comm_num_sms(0), shuffle_sms(0),
+          last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
@@ -1432,10 +1433,12 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        // Dispatch uses one LSA barrier session per launched CTA. Keep the
-        // compile-time combine-tail session available when fewer CTAs are requested.
+        // Dispatch indexes one LSA barrier session per CTA with blockIdx.x.
+        // Combine synchronizes through a single tail CTA at the next session,
+        // so its SM budget does not increase the required session count.
+        // Keep the compile-time dispatch range available for specialized kernels.
         reqs.lsaBarrierCount =
-            std::max<int>(ep_group->comm_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
+            std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
         CUDACHECK_RET(cudaMalloc(
             reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
@@ -1591,7 +1594,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    int min_required_ctx = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+    // Only dispatch has dedicated cross-node warps per CTA. Combine selects
+    // channels from the resulting shared context pool, so its SM budget does
+    // not impose an additional per-CTA minimum here.
+    int min_required_ctx =
+        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
         fprintf(stderr,
@@ -1635,10 +1642,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
-        // One session per launched dispatch CTA plus the combine-tail session.
-        // This must follow the resolved SM count, not just the default grid size.
+        // Dispatch uses sessions [0, dispatch_num_sms); all combine CTAs rendezvous
+        // through one tail CTA at session dispatch_num_sms. Therefore
+        // combine_num_sms does not affect this resource count.
         reqs.lsaBarrierCount =
-            std::max<int>(ep_group->comm_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
+            std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -1858,31 +1866,51 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         &ep_group->max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, ep_group->cuda_device_id));
     ep_group->device_smem_optin = device_prop.sharedMemPerBlockOptin;
 
-    // Resolve SM counts for EP kernels (dispatch, combine, preprocessing)
-    if (in_config->max_num_sms == NCCL_EP_AUTO) {
-        if (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-            ep_group->comm_num_sms = NCCL_EP_HT_DFLT_NUM_SMS;
-        } else {
-            ep_group->comm_num_sms = ep_group->device_sm_count;
-        }
-        ep_group->shuffle_sms = ep_group->device_sm_count;
-        ep_group->preprocess_num_sms = ep_group->device_sm_count;
-    } else {
+    // Resolve the shared budget first. New operation-specific config fields
+    // inherit it when AUTO, preserving the V1/V2 behavior exactly.
+    const unsigned int default_comm_sms =
+        in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT ?
+            NCCL_EP_HT_DFLT_NUM_SMS :
+            ep_group->device_sm_count;
+    unsigned int shared_num_sms = default_comm_sms;
+    if (in_config->max_num_sms != NCCL_EP_AUTO) {
         if (in_config->max_num_sms > ep_group->device_sm_count) {
             fprintf(stderr, "Error: NCCL EP requires max_num_sms <= device_sm_count\n");
             return ncclInvalidUsage;
         }
-        ep_group->comm_num_sms = in_config->max_num_sms;
-        ep_group->shuffle_sms = in_config->max_num_sms;
-        // Preprocessing scan defaults to all device SMs, not the comm/max_num_sms budget, so a
-        // small comm budget does not throttle it (its cost scales inversely with block count).
-        // Overridable via NCCL_EP_PREPROCESS_NUM_SMS.
-        ep_group->preprocess_num_sms = ep_group->device_sm_count;
+        shared_num_sms = in_config->max_num_sms;
     }
+    // Resolve an operation-specific config value, inheriting the already
+    // resolved legacy/default budget when the new field is left as AUTO.
+    auto resolve_config_sms = [dev_sms = ep_group->device_sm_count](
+                                  const char* name, unsigned int requested, unsigned int fallback,
+                                  unsigned int* resolved) -> ncclResult_t {
+        if (requested == NCCL_EP_AUTO) {
+            *resolved = fallback;
+            return ncclSuccess;
+        }
+        if (requested > dev_sms) {
+            fprintf(stderr, "Error: NCCL EP requires %s <= device_sm_count (%u)\n", name, dev_sms);
+            return ncclInvalidUsage;
+        }
+        *resolved = requested;
+        return ncclSuccess;
+    };
+    NCCL_CHECK_RESULT(resolve_config_sms(
+        "dispatch_num_sms", in_config->dispatch_num_sms, shared_num_sms, &ep_group->dispatch_num_sms));
+    NCCL_CHECK_RESULT(resolve_config_sms(
+        "combine_num_sms", in_config->combine_num_sms, shared_num_sms, &ep_group->combine_num_sms));
+    ep_group->shuffle_sms =
+        in_config->max_num_sms == NCCL_EP_AUTO ? ep_group->device_sm_count : in_config->max_num_sms;
+    // Preprocessing defaults to all device SMs so a small communication budget
+    // does not throttle its scan kernels.
+    ep_group->preprocess_num_sms = ep_group->device_sm_count;
 
-    // Apply an env-provided SM-count override, validated against [1, device_sm_count].
-    // Out-of-range values are warned about and the resolved default is kept.
+    // Apply env overrides. Precedence is operation env > legacy shared env >
+    // operation config > legacy shared config > algorithm default.
     const unsigned int dev_sms = ep_group->device_sm_count;
+    // Apply one environment override without discarding the lower-precedence
+    // value when the override is invalid.
     auto apply_sms_override = [dev_sms, &env = ep_group->env](const ncclEpEnvVar& var, unsigned int& target) {
         if (!var.is_set) return;
         if (var.value.ul >= 1 && var.value.ul <= dev_sms) {
@@ -1890,30 +1918,38 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         } else {
             fprintf(stderr, "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n", var.name, var.value.ul,
                     dev_sms, target);
-            // Dump the full env configuration to help diagnose the misconfig.
             nccl_ep_env_print(env);
         }
     };
-    apply_sms_override(ep_group->env.comm_num_sms, ep_group->comm_num_sms);
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->dispatch_num_sms);
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->combine_num_sms);
+    apply_sms_override(ep_group->env.dispatch_num_sms, ep_group->dispatch_num_sms);
+    apply_sms_override(ep_group->env.combine_num_sms, ep_group->combine_num_sms);
     apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
 
-    // LL warp-group bound. Validate the RESOLVED comm SM count
+    // LL warp-group bound applies independently to both operation grids.
     if (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        // This reflects the current limitation of the LL backend
-        // TODO: validate that the limitation is valid and if need - relax it in a follow-up fix
         constexpr int llMaxWarpGroupsLimit = nccl_ep::ll::kLlDispatchMaxWarpGroups;
         const int num_experts = ep_group->config.num_experts;
-        const int sms = static_cast<int>(ep_group->comm_num_sms);
-        const int numWarpGroups = (num_experts + (sms - 1)) / sms;
-        if (numWarpGroups > llMaxWarpGroupsLimit) {
-            const int required_sms = (num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
-            fprintf(stderr,
-                    "Error: insufficient comm SM count for Low-Latency mode: %d SMs with %d "
-                    "experts gives %d warp groups (max %d). Need >= %d SMs -- raise "
-                    "ncclEpGroupConfig_t::max_num_sms or NCCL_EP_COMM_SMS.\n",
-                    sms, num_experts, numWarpGroups, llMaxWarpGroupsLimit, required_sms);
-            return ncclInvalidUsage;
+        const struct {
+            const char* operation;
+            unsigned int sms;
+        } budgets[] = {
+            {"dispatch", ep_group->dispatch_num_sms},
+            {"combine", ep_group->combine_num_sms},
+        };
+        for (const auto& budget : budgets) {
+            const int numWarpGroups = (num_experts + static_cast<int>(budget.sms) - 1) / budget.sms;
+            if (numWarpGroups > llMaxWarpGroupsLimit) {
+                const int required_sms = (num_experts + llMaxWarpGroupsLimit - 1) / llMaxWarpGroupsLimit;
+                fprintf(stderr,
+                        "Error: insufficient %s SM count for Low-Latency mode: %u SMs with %d "
+                        "experts gives %d warp groups (max %d). Need >= %d SMs.\n",
+                        budget.operation, budget.sms, num_experts, numWarpGroups,
+                        llMaxWarpGroupsLimit, required_sms);
+                return ncclInvalidUsage;
+            }
         }
     }
 
@@ -1977,8 +2013,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
+        // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
         ep_group->config.num_qp_per_rank =
-            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     }
 
     // Resolve timeout_cycles: env var > config field > compile-time default
@@ -2118,8 +2155,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     if (ht_mode) {
         // Resolve the dispatch/combine tokens-per-chunk for this group. RDMA
         // (multi-LSA-team) configs use the tuned 64-token default; LSA-only configs
-        // use a grid-proportional size so one chunk is one wave across all SMs
-        // (NUM_OF_TOKENS_PER_GROUP tokens per SM). Either may be overridden by
+        // use a dispatch-grid-proportional size so one chunk is one wave across
+        // the dispatch SMs (NUM_OF_TOKENS_PER_GROUP tokens per SM). This keeps
+        // combine grid tuning from changing dispatch scheduling. Either may be overridden by
         // NCCL_EP_TOKENS_PER_CHUNK. The chunk must be a multiple of 32 (warp width;
         // also covers the uint4 routing-map-load and token-group granularities), so
         // non-conforming values are rounded up with a warning.
@@ -2127,7 +2165,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         int chunk =
             (ep_group->rdma_team_size > 1) ?
                 HT_TOKENS_PER_CHUNK_RDMA_DEFAULT :
-                round_up_32(NCCL_EP_HT_COMBINE_TOK_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
+                round_up_32(
+                    NCCL_EP_HT_COMBINE_TOK_PER_GROUP * static_cast<int>(ep_group->dispatch_num_sms));
         if (ep_group->env.tokens_per_chunk.is_set && ep_group->env.tokens_per_chunk.value.ul > 0) {
             const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
             chunk = round_up_32(requested);
@@ -2847,11 +2886,11 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
         return ncclInvalidArgument;
     }
 
-    const int num_device_sms = static_cast<int>(ep_group->comm_num_sms);
+    const int num_device_sms = static_cast<int>(ep_group->dispatch_num_sms);
     if (num_device_sms <= 0) return ncclInvalidUsage;
     const int num_warp_groups = (ep_group->config.num_experts + num_device_sms - 1) / num_device_sms;
     if (num_warp_groups <= 0 || num_warp_groups > nccl_ep::ll::kLlDispatchMaxWarpGroups) {
-        fprintf(stderr, "ncclEpInitHandle: LL warp-group geometry is unsupported: num_experts=%u, comm_sms=%d, warp_groups=%d\n",
+        fprintf(stderr, "ncclEpInitHandle: LL warp-group geometry is unsupported: num_experts=%u, dispatch_sms=%d, warp_groups=%d\n",
                 ep_group->config.num_experts, num_device_sms, num_warp_groups);
         return ncclInvalidUsage;
     }
@@ -2859,7 +2898,7 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
     const int num_warps = num_warp_groups * num_warps_per_group;
     if (num_warps_per_group <= 0 || num_topk + nccl_ep::ll::kLlDispatchControlWarps > num_warps) {
         fprintf(stderr,
-                "ncclEpInitHandle: LL top-k geometry is unsupported: top-k=%d, num_experts=%u, comm_sms=%d, "
+                "ncclEpInitHandle: LL top-k geometry is unsupported: top-k=%d, num_experts=%u, dispatch_sms=%d, "
                 "warp_groups=%d, launched_warps=%d, forwarding_warps=%d\n",
                 num_topk, ep_group->config.num_experts, num_device_sms, num_warp_groups, num_warps,
                 std::max(0, num_warps - nccl_ep::ll::kLlDispatchControlWarps));
@@ -3842,7 +3881,7 @@ ncclResult_t ncclEpDispatch(
                 params.windows = group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.workspace = group->ep_workspace;
-                params.numDeviceSms = group->comm_num_sms;
+                params.numDeviceSms = group->dispatch_num_sms;
                 params.rankMask = group->mask_buffer;
                 params.asyncErrorFlag = group->async_error_flag;
                 params.timeoutCycles = group->timeout_cycles;
@@ -4341,7 +4380,7 @@ ncclResult_t ncclEpDispatch(
                     group->rdma_team_size,
                     recipe,
                     pass_direction,
-                    static_cast<int>(group->comm_num_sms),
+                    static_cast<int>(group->dispatch_num_sms),
                     group->max_dynamic_smem,
                     sf_bytes_per_token,
                     &group->env,
@@ -4640,8 +4679,8 @@ ncclResult_t ncclEpDispatch(
                     static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                     lsa_ranks,
                     // Pull is the dispatch, so it uses the dispatch SM budget
-                    // (comm_num_sms / NCCL_EP_COMM_SMS), not the shuffle budget.
-                    static_cast<int>(group->comm_num_sms),
+                    // (dispatch_num_sms), not the shuffle or combine budget.
+                    static_cast<int>(group->dispatch_num_sms),
                     0u,
                     recipe,
                     group->gin_config.d_dcomms,
@@ -4932,7 +4971,7 @@ ncclResult_t ncclEpCombine(
                 params.windows = handle->group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.workspace = handle->group->ep_workspace;
-                params.numDeviceSms = handle->group->comm_num_sms;
+                params.numDeviceSms = handle->group->combine_num_sms;
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.resolvedWarpsPerGroup = &handle->group->last_ll_combine_warps_per_group;
@@ -5196,8 +5235,8 @@ ncclResult_t ncclEpCombine(
                 group->lsa_rank,
                 static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                 team_size,
-                // Push combine is a comm kernel (NVLink push), so it uses the comm SM budget.
-                static_cast<int>(group->comm_num_sms),
+                // Push combine is a comm kernel (NVLink push), so it uses the combine SM budget.
+                static_cast<int>(group->combine_num_sms),
                 0u,
                 stream,
                 x->datatype,
@@ -5359,7 +5398,7 @@ ncclResult_t ncclEpCombine(
             params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
             params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
-            params.combine_barrier_offset = group->comm_num_sms;
+            params.combine_barrier_offset = group->dispatch_num_sms;
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
             const size_t combine_token_offset =
@@ -5428,7 +5467,7 @@ ncclResult_t ncclEpCombine(
                     group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
                     group->rdma_team_size, // num_lsa_teams (RDMA domain size)
                     backward_combine, // backward mode flag
-                    static_cast<int>(group->comm_num_sms),
+                    static_cast<int>(group->combine_num_sms),
                     group->max_dynamic_smem,
                     &group->env,
                     stream));
@@ -5630,4 +5669,11 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group) {
     return group == nullptr ? 0 : group->last_ll_combine_warps_per_group;
+}
+
+void ncclEpGroup_test_getSmBudgets(
+    ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms) {
+    if (group == nullptr) return;
+    if (dispatch_num_sms != nullptr) *dispatch_num_sms = group->dispatch_num_sms;
+    if (combine_num_sms != nullptr) *combine_num_sms = group->combine_num_sms;
 }

@@ -44,3 +44,6 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 // Returns the last LL combine launch's resolved warps-per-group, or zero when
 // that group has not launched LL combine.
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group);
+// Return the independently resolved dispatch and combine SM budgets.
+void ncclEpGroup_test_getSmBudgets(
+    ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms);

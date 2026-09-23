@@ -175,6 +175,77 @@ protected:
     }
 };
 
+TEST_F(LifecycleTest, ResolvesIndependentSmBudgetsAndEnvironmentPrecedence) {
+    int device = 0;
+    int device_sms = 0;
+    CUDA_ASSERT(cudaGetDevice(&device));
+    CUDA_ASSERT(cudaDeviceGetAttribute(&device_sms, cudaDevAttrMultiProcessorCount, device));
+    ASSERT_GE(device_sms, 8);
+
+    const char* old_comm_ptr = getenv("NCCL_EP_COMM_SMS");
+    const char* old_dispatch_ptr = getenv("NCCL_EP_DISPATCH_SMS");
+    const char* old_combine_ptr = getenv("NCCL_EP_COMBINE_SMS");
+    const bool had_comm = old_comm_ptr != nullptr;
+    const bool had_dispatch = old_dispatch_ptr != nullptr;
+    const bool had_combine = old_combine_ptr != nullptr;
+    const std::string old_comm = had_comm ? old_comm_ptr : "";
+    const std::string old_dispatch = had_dispatch ? old_dispatch_ptr : "";
+    auto restore_env = [](const char* name, bool was_set, const std::string& old_value) {
+        if (was_set) setenv(name, old_value.c_str(), 1);
+        else unsetenv(name);
+    };
+    const std::string old_combine = had_combine ? old_combine_ptr : "";
+    unsetenv("NCCL_EP_COMM_SMS");
+    unsetenv("NCCL_EP_DISPATCH_SMS");
+    unsetenv("NCCL_EP_COMBINE_SMS");
+
+    const unsigned int shared = static_cast<unsigned int>(std::min(device_sms, 8));
+    const unsigned int dispatch = shared - 1;
+    auto make_group = [&](unsigned int dispatch_cfg, unsigned int combine_cfg) {
+        ncclEpGroupConfig_t cfg = NCCL_EP_GROUP_CONFIG_INIT;
+        cfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+        cfg.num_experts = kNumExperts;
+        cfg.max_dispatch_tokens_per_rank = kNumTokens;
+        cfg.max_recv_tokens_per_rank = kMaxRecvSlots;
+        cfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+        cfg.rdma_buffer_size = NCCL_EP_AUTO;
+        cfg.num_qp_per_rank = NCCL_EP_AUTO;
+        cfg.num_channels = NCCL_EP_AUTO;
+        cfg.max_num_sms = shared;
+        cfg.dispatch_num_sms = dispatch_cfg;
+        cfg.combine_num_sms = combine_cfg;
+        ncclEpGroup_t group = nullptr;
+        EXPECT_EQ(ncclEpCreateGroup(&group, g_comm, &cfg), ncclSuccess);
+        return group;
+    };
+
+    // One operation-specific field does not change the other's shared fallback.
+    ncclEpGroup_t group = make_group(dispatch, NCCL_EP_AUTO);
+    unsigned int resolved_dispatch = 0, resolved_combine = 0;
+    ncclEpGroup_test_getSmBudgets(group, &resolved_dispatch, &resolved_combine);
+    EXPECT_EQ(resolved_dispatch, dispatch);
+    EXPECT_EQ(resolved_combine, shared);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+
+    const unsigned int env_shared = shared - 2;
+    const unsigned int env_dispatch = shared - 3;
+    const std::string env_shared_str = std::to_string(env_shared);
+    const std::string env_dispatch_str = std::to_string(env_dispatch);
+    const std::string invalid_str = std::to_string(device_sms + 1);
+    setenv("NCCL_EP_COMM_SMS", env_shared_str.c_str(), 1);
+    setenv("NCCL_EP_DISPATCH_SMS", env_dispatch_str.c_str(), 1);
+    setenv("NCCL_EP_COMBINE_SMS", invalid_str.c_str(), 1);
+    group = make_group(dispatch, shared - 1);
+    ncclEpGroup_test_getSmBudgets(group, &resolved_dispatch, &resolved_combine);
+    EXPECT_EQ(resolved_dispatch, env_dispatch);
+    EXPECT_EQ(resolved_combine, env_shared);
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+
+    restore_env("NCCL_EP_COMM_SMS", had_comm, old_comm);
+    restore_env("NCCL_EP_DISPATCH_SMS", had_dispatch, old_dispatch);
+    restore_env("NCCL_EP_COMBINE_SMS", had_combine, old_combine);
+
+}
 TEST_F(LifecycleTest, LlCombineFitsMockedSmallSharedMemoryAndPreservesResults) {
     constexpr int kLargeHidden = 7168;
     constexpr int kMockDynamicSmem = 100000;

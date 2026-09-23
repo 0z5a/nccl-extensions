@@ -370,16 +370,35 @@ workload. With `NCCL_EP_ENV_VERBOSE=true`, NCCL EP also prints the requested and
 selected pipeline configuration, SMEM usage, and device limit when an HT kernel
 configuration is first used.
 
-HT SM-count controls:
+Dispatch/combine SM-budget controls (LL and HT):
 
-```bash
-# Dispatch and combine default
-export NCCL_EP_COMM_SMS=16
+    # Legacy fallback: used by both operations unless overridden below
+    export NCCL_EP_COMM_SMS=16
 
-# Shuffle and preprocessing default to all device SMs
-export NCCL_EP_SHUFFLE_SMS=<number_of_sms>
-export NCCL_EP_PREPROCESS_NUM_SMS=<number_of_sms>
-```
+    # Independent operation overrides
+    export NCCL_EP_DISPATCH_SMS=12
+    export NCCL_EP_COMBINE_SMS=24
+
+    # Shuffle and preprocessing default to all device SMs
+    export NCCL_EP_SHUFFLE_SMS=<number_of_sms>
+    export NCCL_EP_PREPROCESS_NUM_SMS=<number_of_sms>
+
+Each operation resolves its budget independently. Precedence, highest first,
+is its operation-specific environment variable, NCCL_EP_COMM_SMS, its
+operation-specific ncclEpGroupConfig_t field, max_num_sms, then the
+algorithm default (all device SMs for LL and 16 for HT). Leaving both new
+fields and variables unset therefore preserves legacy behavior; setting one
+operation does not alter the other. Values must be in [1, device_sm_count]
+after resolution and must satisfy the LL warp-group geometry when LL is used.
+
+The budgets do not need to be multiples of 4 or 8; any positive integer within
+the device and LL geometry limits is supported. Combine commonly benefits from
+a larger budget than dispatch.
+An SM budget is the upper bound supplied to an operation launch-geometry
+
+calculation. It is not always the literal CUDA grid size: LL rounds the grid to
+its expert/warp-group geometry, while HT currently launches one communication
+CTA per budgeted SM. Shuffle and preprocessing kernels have separate budgets.
 
 By default EP guards its internal communication buffers so that neighboring
 dispatch/combine calls cannot corrupt each other's data; this is safe and needs
@@ -442,7 +461,7 @@ typedef struct {
                                                 //                  doesn't fit. No reallocation ever performed.
     unsigned int num_qp_per_rank;               // Queue pairs per rank (NCCL_EP_AUTO for auto)
     unsigned int num_channels;                  // Channels per rank (NCCL_EP_AUTO for auto)
-    unsigned int max_num_sms;                   // SM cap for EP kernels (NCCL_EP_AUTO for auto)
+    unsigned int max_num_sms;                   // Legacy fallback for both dispatch and combine
     ncclEpAllocConfig_t alloc;                  // Custom device-memory allocator (zero-init → cudaMalloc/cudaFree)
     unsigned int enable_mask;                   // Enable active-mask fault tolerance (LL only)
     uint64_t timeout_ns;                        // GPU-side wait-loop timeout (0 = default)
@@ -455,6 +474,8 @@ typedef struct {
                                                 //   eager mode with the expert-major layout;
                                                 //   see docs/documentation/eager_mode.md.
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
+    unsigned int dispatch_num_sms;              // Dispatch budget (AUTO inherits max_num_sms/default)
+    unsigned int combine_num_sms;               // Combine budget (AUTO inherits max_num_sms/default)
 } ncclEpGroupConfig_t;
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.

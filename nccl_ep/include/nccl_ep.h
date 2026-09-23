@@ -72,7 +72,7 @@ extern "C" {
 //       .tokens = my_tokens,
 //   };
 // ============================================================================
-#define NCCL_EP_API_VERSION 2
+#define NCCL_EP_API_VERSION 3
 #define NCCL_EP_MAGIC 0xC00FFFEEu
 
 #define NCCL_EP_STRUCT_INIT(type_, magic_) \
@@ -300,8 +300,8 @@ typedef struct {
     // Number of channels per rank (NCCL_EP_AUTO for auto).
     // In high throughput collectives, each channel occupies 2 SMs
     unsigned int num_channels;
-    // Maximum number of SMs to use for EP kernels (dispatch, combine, preprocessing).
-    // Default: NCCL_EP_AUTO — algorithm-dependent default.
+    // Shared maximum number of SMs for dispatch and combine. Retained as the
+    // fallback for dispatch_num_sms/combine_num_sms. Default: NCCL_EP_AUTO.
     unsigned int max_num_sms;
     // Device memory allocator; zero-init (all NULL) uses cudaMalloc/cudaFree.
     ncclEpAllocConfig_t alloc;
@@ -331,6 +331,10 @@ typedef struct {
     // handle's num_topk against it.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
+    // Dispatch SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
+    unsigned int dispatch_num_sms;
+    // Combine SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
+    unsigned int combine_num_sms;
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -347,11 +351,14 @@ typedef struct {
 #define NCCL_EP_GROUP_CONFIG_V2_LAST_FIELD padding_v2
 #define NCCL_EP_GROUP_CONFIG_V2_SIZE 112u
 
-#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 2
+#define NCCL_EP_GROUP_CONFIG_V3_LAST_FIELD combine_num_sms
+#define NCCL_EP_GROUP_CONFIG_V3_SIZE 120u
+#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 3
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 1);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 2);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 3);
 
 // Opaque type forward declaration
 typedef struct ncclEpGroup* ncclEpGroup_t;

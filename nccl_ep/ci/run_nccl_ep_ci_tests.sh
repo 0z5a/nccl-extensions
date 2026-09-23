@@ -117,6 +117,12 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # Token-distribution variants stay at the canonical LL batch size (cover the variant axis,
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
+# Independent LL dispatch/combine grids must remain correct when unequal and
+# not divisible by 4 or 8. Combine commonly benefits from the larger budget.
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+  --dispatch-num-sms 21 --combine-num-sms 23 --validate
+
 
 # Exact LL top-k specialization at the dispatch geometry boundary (31 forwarding
 # warps plus one control warp). Keep this targeted smoke test at the canonical
@@ -167,6 +173,12 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
   EP_BENCH_HIDDEN=7168
   run_ep_bench_layout_size_sweep high-throughput fl em
   run_ep_bench_variants high-throughput 4096
+  # Independent HT dispatch/combine grids, including non-multiple budgets and
+  # barrier-session separation.
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+    --dispatch-num-sms 15 --combine-num-sms 17 --validate
+
   run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
     --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
     --validate --dispatch-only --zcopy --dispatch-quantization scales-forward \
