@@ -19,6 +19,8 @@
 #include "common.hpp"
 #include "ll_ep_smem.cuh"
 #include "ll_ep_adapter.cuh"
+#include "ll/ll_dispatch_lsa.cuh"
+#include "ll/ll_combine_lsa.cuh"
 #include "ll/ll_common.cuh"
 #include "ll/ll_gin.cuh"
 #include "ll/ll_lsa_primitives.cuh"

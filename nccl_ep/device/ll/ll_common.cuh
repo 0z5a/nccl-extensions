@@ -40,14 +40,36 @@ __device__ __forceinline__ unsigned int selectLowLatencyEpoch(
 }
 
 // Advances the epoch for a combined send+recv launch (single-call phases),
-// once send/recv have both completed within this call.
-__device__ __forceinline__ void completeFullLowLatencyEpoch(
-    LowLatencyEpochState* epochState, int phases, int smId, int threadId) {
+// once send/recv have both completed within this call. Shared by both
+// completeFullLowLatencyEpoch overloads below, so the phase-mask check and
+// the actual update stay in exactly one place regardless of how a caller
+// decides which single thread should perform it.
+__device__ __forceinline__ void completeFullLowLatencyEpochImpl(
+    LowLatencyEpochState* epochState, int phases, bool shouldUpdate) {
     if ((phases & (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE)) ==
             (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE) &&
-        smId == 0 && threadId == 0) {
+        shouldUpdate) {
         ++epochState->epoch;
     }
+}
+
+// Elects smId == 0, threadId == 0 to perform the update -- correct for
+// callers whose SEND/RECV phase boundary is a real grid-wide convergence
+// point (e.g. cg::this_grid().sync()), so every CTA (including smId == 0)
+// only reaches this call once every other CTA's SEND-phase work is done.
+__device__ __forceinline__ void completeFullLowLatencyEpoch(
+    LowLatencyEpochState* epochState, int phases, int smId, int threadId) {
+    completeFullLowLatencyEpochImpl(epochState, phases, smId == 0 && threadId == 0);
+}
+
+// For callers with no grid-wide SEND/RECV boundary at all: isElectedCta must
+// be true only for the one thread that has independently proven every CTA's
+// SEND-phase work is complete (e.g. ll_dispatch_lsa.cuh's
+// syncAndSendCounts's isLastCta) -- smId == 0 carries no such guarantee on
+// its own without a barrier.
+__device__ __forceinline__ void completeFullLowLatencyEpoch(
+    LowLatencyEpochState* epochState, int phases, bool isElectedCta, int threadId) {
+    completeFullLowLatencyEpochImpl(epochState, phases, isElectedCta && threadId == 0);
 }
 
 __device__ __forceinline__ void syncSmGroup(int groupIdx, int nThreads) {

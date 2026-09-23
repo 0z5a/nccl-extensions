@@ -28,6 +28,14 @@ __forceinline__ __device__ bool isRankMasked(int* rankMask, int rank) {
     }
 }
 
+// CTA-local (not grid-global) rank-active bitmask: 1 = this CTA's own poll
+// confirmed the rank ready. Avoids the cross-CTA race isRankMasked's
+// grid-global rankMask has -- see waitForAllRanksFinishLsa in
+// ll_combine_lsa.cuh.
+__forceinline__ __device__ bool isRankActiveLocal(const uint32_t* localMask, int rank) {
+    return (localMask[rank / 32] & (1u << (rank % 32))) != 0;
+}
+
 // ============================================================================
 // clean_low_latency_buffer: barrier → zero RDMA buffers → barrier
 // Hybrid barrier: NVLink peers use P2P stores, RDMA peers use GIN signals.

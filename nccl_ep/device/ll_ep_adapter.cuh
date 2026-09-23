@@ -47,6 +47,10 @@ inline int ll_combine_dynamic_smem_bytes(
 // Keep the requested mapping from warp groups to experts, reducing only the
 // per-group parallelism. This preserves correctness while trading throughput
 // to fit the device's opt-in dynamic shared-memory limit.
+//
+// max_dynamic_smem is taken as the exact usable dynamic-smem budget --
+// callers that also need to reserve room for a kernel's static __shared__
+// usage must subtract it before calling this.
 inline combine_smem_config_t choose_combine_smem_config(
     int hidden,
     ncclDataType_t token_dtype,
@@ -155,7 +159,7 @@ struct combine_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
-    int* atomicCleanFlag;
+    int* combineSync;
     int nextRecvCntBufSize;
     int64_t* waitStats;
     LowLatencyEpochState* epochState;
@@ -321,7 +325,7 @@ struct CombineParams {
 
     // Runtime workspace + error tracking. Each pointer is a dedicated,
     // non-overlapping region computed once at group-creation time.
-    int* atomicCleanFlag;
+    int* combineSync;
     int numDeviceSms;
     unsigned int deviceSm;
     int maxDynamicSmem;
@@ -340,6 +344,11 @@ struct CombineParams {
     // halves kMaxNumGroups to stay within the dynamic-SMEM cap).
     ncclDataType_t tokenDtype = ncclBfloat16;
     ncclEpCombQuant_t quantizationRecipe = NCCL_EP_COMB_QUANT_NONE;
+
+    // True when every destination is NVLink-reachable (the whole world fits in
+    // one LSA team). One of the inputs ll_combine_select_algo uses to pick an
+    // LSA-only kernel; ignored by the general (kDefault) JIT path.
+    bool nvlinkOnly = false;
 };
 
 struct CleanLowLatencyBufferParams {

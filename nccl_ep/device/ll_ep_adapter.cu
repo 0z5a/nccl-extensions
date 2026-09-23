@@ -113,6 +113,7 @@ ncclResult_t call_dispatch(
         params.topkIdxIsInt64,
         kernel_spec,
         params.tokenDtype,
+        recipe,
         params.numTopk,
         numSms,
         numWarps,
@@ -151,34 +152,45 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         return ncclInvalidArgument;
     }
 
+    // Reserve room for the LSA combine kernel's static __shared__ usage,
+    // which draws from the same per-block budget as the dynamic portion
+    // sized below -- see choose_combine_smem_config's doc comment. Only the
+    // LSA path declares that static usage, so only trim the budget when
+    // this call is actually eligible for it.
+    const bool lsaCombineEligible =
+        jit::ll_combine_select_algo(params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout) ==
+        jit::LlCombineAlgo::k2SidedRmLsa;
+    const int max_dynamic_smem_for_combine =
+        params.maxDynamicSmem - (lsaCombineEligible ? combine_smem::kLsaStaticSmemBytes : 0);
     const combine_smem_config_t smem_config = choose_combine_smem_config(
         params.hidden,
         params.tokenDtype,
         params.quantizationRecipe,
         numWarpGroups,
         requestedWarpsPerGroup,
-        params.maxDynamicSmem);
+        max_dynamic_smem_for_combine);
     if (!smem_config.feasible) {
         std::fprintf(
             stderr,
             "[nccl_ep] LL combine shared memory cannot fit: hidden=%d, dtype=%d, warp_groups=%d, "
             "requested_warps_per_group=%d, limit=%d bytes.\n",
             params.hidden, static_cast<int>(params.tokenDtype), numWarpGroups, requestedWarpsPerGroup,
-            params.maxDynamicSmem);
+            max_dynamic_smem_for_combine);
         return ncclInvalidArgument;
     }
     const int numWarpsPerGroup = smem_config.num_warps_per_group;
     const int numWarps = smem_config.num_warps;
+    const int smem_size = smem_config.dynamic_smem_bytes;
     if (params.resolvedWarpsPerGroup != nullptr) *params.resolvedWarpsPerGroup = numWarpsPerGroup;
     const int numSms = std::max(
         ceil_div(params.numExperts, numWarpGroups),
         numRecvPerSm == 0 ? 1 : ceil_div(params.numCombinedTokens, numRecvPerSm));
 
-    // atomicCleanFlag is a dedicated, non-overlapping region computed once at
+    // combineSync is a dedicated, non-overlapping region computed once at
     // group-creation time (ncclEpCreateGroup) -- forwarded here as-is, never
     // derived via offset math.
-    if (params.atomicCleanFlag == nullptr) {
-        std::fprintf(stderr, "[nccl_ep] LL combine requires a non-null atomicCleanFlag workspace pointer.\n");
+    if (params.combineSync == nullptr) {
+        std::fprintf(stderr, "[nccl_ep] LL combine requires a non-null combineSync workspace pointer.\n");
         return ncclInvalidArgument;
     }
     if (params.zeroCopy && params.useLogFmt) {
@@ -186,10 +198,9 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         return ncclInvalidArgument;
     }
 
-    auto atomicCleanFlag = params.atomicCleanFlag;
+    auto combineSync = params.combineSync;
 
     const int hidden = params.hidden;
-    const int smem_size = smem_config.dynamic_smem_bytes;
 
     combine_kernel_args_t args{};
     args.inData = params.inData;
@@ -205,7 +216,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvFlagOff = params.recvFlagOff;
-    args.atomicCleanFlag = atomicCleanFlag;
+    args.combineSync = combineSync;
     args.nextRecvCntBufSize = params.nextRecvCntBufSize;
     args.waitStats = params.waitStats;
     args.epochState = params.epochState;
@@ -227,6 +238,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     args.timeoutCycles = params.timeoutCycles;
 
     return jit::launch_ll_combine(
+        params.nvlinkOnly,
         params.useLogFmt,
         params.quantizationRecipe,
         params.deviceSm,

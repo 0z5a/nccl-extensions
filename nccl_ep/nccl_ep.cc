@@ -736,7 +736,7 @@ struct ncclEpGroup {
     int* ws_dispatch_rankSentCnt;    // numRanks ints
     int* ws_dispatch_rankArrivedCnt; // numRanks ints
     int* ws_dispatch_rankDone;       // numExperts ints
-    int* ws_combine_atomicCleanFlag; // 1 int
+    int* ws_combine_sync; // 1 int
     int cuda_device_id;       // CUDA device ID
     int lsa_team_size;        // LSA team size: ncclTeamLsa(comm).nRanks
     int lsa_rank;             // Rank within LSA team: ncclTeamLsa(comm).rank
@@ -970,7 +970,7 @@ struct ncclEpGroup {
     // Constructor to properly initialize all members
     ncclEpGroup()
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), ws_dispatch_rankSentCnt(nullptr),
-          ws_dispatch_rankArrivedCnt(nullptr), ws_dispatch_rankDone(nullptr), ws_combine_atomicCleanFlag(nullptr),
+          ws_dispatch_rankArrivedCnt(nullptr), ws_dispatch_rankDone(nullptr), ws_combine_sync(nullptr),
           cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
           num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
@@ -2390,7 +2390,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->ws_dispatch_rankSentCnt = base;
         ep_group->ws_dispatch_rankArrivedCnt = ep_group->ws_dispatch_rankSentCnt + numRanks;
         ep_group->ws_dispatch_rankDone = ep_group->ws_dispatch_rankArrivedCnt + numRanks;
-        ep_group->ws_combine_atomicCleanFlag = ep_group->ws_dispatch_rankDone + numExperts;
+        ep_group->ws_combine_sync = ep_group->ws_dispatch_rankDone + numExperts;
         const size_t total_ints = static_cast<size_t>(2) * numRanks + numExperts + 1;
         EP_HOST_ASSERT(total_ints * sizeof(int) <= static_cast<size_t>(NUM_WORKSPACE_BYTES));
     }
@@ -5704,6 +5704,11 @@ ncclResult_t ncclEpCombine(
         const ncclEpTensor_t* global_scales = tensor_ptr(inputs->scales);
         assert(x->ndim > 0);
 
+        // LSA-eligibility input to ll_combine_select_algo (device/jit/ll_combine_jit.cuh),
+        // which always picks the RDMA-staged 2-sided kernel whenever the
+        // topology/recipe/layout is LSA-eligible.
+        const bool nvlink_only = (handle->group->lsa_team_size == handle->group->nRanks);
+
         const ncclEpTensor_t* topk_idx = &handle->topk_idx;
         const ncclEpTensor_t* src_info = &handle->ll.expert_recv_source_indices;
         const ncclEpTensor_t* layout_range = &handle->ll.expert_dispatch_layout;
@@ -5869,7 +5874,7 @@ ncclResult_t ncclEpCombine(
                 params.devComm = handle->group->nccl_dev_comm;
                 params.windows = handle->group->nccl_wins;
                 params.signalsBase = signal_base;
-                params.atomicCleanFlag = handle->group->ws_combine_atomicCleanFlag;
+                params.combineSync = handle->group->ws_combine_sync;
                 params.numDeviceSms = handle->group->combine_num_sms;
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
@@ -5884,6 +5889,7 @@ ncclResult_t ncclEpCombine(
                 params.phases = phases;
                 params.tokenDtype = x->datatype;
                 params.quantizationRecipe = quantization_recipe;
+                params.nvlinkOnly = nvlink_only;
                 return nccl_ep::ll::call_combine(params, stream);
             };
             switch (topk_idx->datatype) {

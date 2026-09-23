@@ -123,7 +123,6 @@ run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
   --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
   --dispatch-num-sms 21 --combine-num-sms 23 --validate
 
-
 # Exact LL top-k specialization at the dispatch geometry boundary (31 forwarding
 # warps plus one control warp). Keep this targeted smoke test at the canonical
 # small-batch BF16 configuration rather than multiplying the full layout × batch
