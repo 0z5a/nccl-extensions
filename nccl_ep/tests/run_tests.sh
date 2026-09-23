@@ -157,6 +157,37 @@ for mode in LOCAL_DUP NVLINK_DUP; do
     unset "NCCL_EP_HT_EM_${mode}"
 done
 
+# Scan mode (routing-map AllGather): re-run the EM output-layout suites here for
+# count-vs-scan layout coverage.
+export NCCL_EP_HT_EM_AG_SCAN_MODE=1
+for entry in "${SUITES[@]}"; do
+    IFS='|' read -r bin desc em <<<"${entry}"
+    [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
+    [[ ${em} == 1 ]] || continue
+    run_suite "${bin}" "${desc} (Scan)"
+done
+# DispatchCombineCrossBoundary only runs its body under scan/nvlink-dup/local-dup/pull-push, but
+# it's not em_affected (those two dup modes need a bigger recv budget than it configures), so
+# give it its own scan-only rerun for coverage.
+[[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_elastic_buffer" ]] && run_suite "test_elastic_buffer" "EP Elastic Buffer Tests (Scan)"
+# test_ht_overflow_drop is also not em_affected, so give it the same scan-only rerun: it's the
+# default (count-mode) pass's only DROP coverage, and scan mode's overflow/drop clamp otherwise
+# goes untested.
+[[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && run_suite "test_ht_overflow_drop" "EP HT Overflow Drop Tests (Scan)"
+unset NCCL_EP_HT_EM_AG_SCAN_MODE
+
+# Unfused count mode: publishes the EM recv-count tables at UpdateHandle time like scan,
+# so gets the same em_affected rerun plus test_elastic_buffer's explicit one.
+export NCCL_EP_HT_EM_COUNT_UNFUSED=1
+for entry in "${SUITES[@]}"; do
+    IFS='|' read -r bin desc em <<<"${entry}"
+    [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
+    [[ ${em} == 1 ]] || continue
+    run_suite "${bin}" "${desc} (Unfused Count)"
+done
+[[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_elastic_buffer" ]] && run_suite "test_elastic_buffer" "EP Elastic Buffer Tests (Unfused Count)"
+unset NCCL_EP_HT_EM_COUNT_UNFUSED
+
 # Pull-dispatch / push-combine (single NVLink LSA team, expert-major only). Restricted to the
 # suites with expert-major dispatch/combine coverage; the non-expert-major cases in them skip
 # via SKIP_IF_PULL_PUSH. All ranks form one LSA team so the push combine's single-team path runs.

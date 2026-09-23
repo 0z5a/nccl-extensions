@@ -15,6 +15,8 @@
  *   DispatchMeta             — expert_token_counts_padded and expert_token_offsets
  *   EagerRecvSizeFromLayoutInfo — query-then-allocate through the public recv_total_counter
  *                              readback only (FLAT and EM)
+ *   FusedDispatchRecvTotalEM — fused count mode: recv_total_counter + per-expert counts/offsets
+ *                              and dispatched slot content (count-mode only)
  *
  * Tests (TopK2MixedRoutingTest fixture — top-k=2, mixed same-rank and cross-rank routing):
  *   RankMajorLayout              — correct recv counts and no duplication for same-rank pairs
@@ -168,7 +170,10 @@ protected:
     }
 
     // All ranks run dispatch; returns per-slot first-hidden-element value for this rank.
-    std::vector<float> run_dispatch(ncclEpHandle_t handle, int num_recv, bool expert_major) {
+    // Pass dispatch_layout to wire per-expert counts / recv_total_counter at dispatch time;
+    // nullptr leaves layout_info unset.
+    std::vector<float> run_dispatch(ncclEpHandle_t handle, int num_recv, bool expert_major,
+                                    const ncclEpLayoutInfo_t* dispatch_layout = nullptr) {
         std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
         for (int i = 0; i < kNumTokens; ++i) {
             float v = static_cast<float>(g_rank * kNumTokens + i + 1);
@@ -214,7 +219,7 @@ protected:
         d_out_s.topk_weights = t_recv_w;
         if (!expert_major) d_out_s.topk_idx = t_recv_idx;
         ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
-        EXPECT_EQ(ncclEpDispatch(handle, &d_in_s, &d_out_s, nullptr, &dcfg, g_stream), ncclSuccess);
+        EXPECT_EQ(ncclEpDispatch(handle, &d_in_s, &d_out_s, dispatch_layout, &dcfg, g_stream), ncclSuccess);
         EXPECT_EQ(ncclEpComplete(handle, nullptr, g_stream), ncclSuccess);
         EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
 
@@ -279,6 +284,11 @@ TEST_F(OutputLayoutTest, RankMajorLayout) {
 // ── Test: expert-major layout (no alignment) ──────────────────────────────────
 
 TEST_F(OutputLayoutTest, ExpertMajorLayout) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     ncclEpHandle_t h = make_handle_em(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -310,6 +320,11 @@ TEST_F(OutputLayoutTest, ExpertMajorLayout) {
 // ── Test: expert-major + alignment ───────────────────────────────────────────
 
 TEST_F(OutputLayoutTest, ExpertMajorWithAlignment) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     constexpr size_t kAlign = 4;  // each expert zone padded to 4 tokens
 
     ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -375,6 +390,11 @@ TEST_F(OutputLayoutTest, CombineRankMajor) {
 // S2D to route expert outputs back correctly — result identical to rank-major.
 
 TEST_F(OutputLayoutTest, CombineExpertMajor) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     ncclEpHandle_t h = make_handle_em(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -394,6 +414,8 @@ TEST_F(OutputLayoutTest, CombineExpertMajor) {
 // ── Test: dispatch meta — offsets and padded counts ───────────────────────────
 
 TEST_F(OutputLayoutTest, DispatchMeta) {
+    // Providing layout_info takes the unfused path, which writes per-expert counts and
+    // offsets at UpdateHandle in both count and scan mode.
     constexpr size_t kAlign = 4;
     const int E_local = kNumExperts / g_nranks;  // local experts per rank = 2
 
@@ -436,6 +458,8 @@ TEST_F(OutputLayoutTest, DispatchMeta) {
 // EM: padded total = num_local_experts * align; must equal getNumRecvTokens.
 
 TEST_F(OutputLayoutTest, TotalCounterDeviceEM) {
+    // Providing layout_info takes the unfused path, which writes the padded recv total
+    // at UpdateHandle in both count and scan mode.
     constexpr size_t kAlign = 4;
     const int E_local = kNumExperts / g_nranks;
 
@@ -500,6 +524,137 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
     EXPECT_EQ(static_cast<unsigned int>(h_total), num_recv)
         << "FLAT RECV_TOTAL_COUNTER_DEVICE must match getNumRecvTokens (unpadded)";
     EXPECT_EQ(h_total, 4) << "FLAT total: 2 ranks × 2 tokens per local expert × no padding = 4";
+
+    ncclEpTensorDestroy(t_total);
+    cudaFree(d_total);
+    NCCL_ASSERT(ncclEpHandleDestroy(h));
+}
+
+// ── Test: fused count-mode dispatch writes recv_total_counter + per-expert counts ──
+TEST_F(OutputLayoutTest, FusedDispatchRecvTotalEM) {
+    // The fused dispatch layout is published only by count mode; scan, nvlink/local-dup, and
+    // pull-push wire the recv layout elsewhere, so this test applies to count mode only.
+    if (ht_em_ag_scan_mode_active() ||
+        ht_em_nvlink_dup_active() ||
+        ht_em_local_dup_active() ||
+        ht_em_pull_push_active()) {
+        GTEST_SKIP() << "fused dispatch layout applies only in count mode";
+    }
+    constexpr size_t kAlign = 4;
+    const int E_local = kNumExperts / g_nranks;  // 2
+
+    ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
+    cfg.dispatch_output_per_expert_alignment = kAlign;
+    // No layout_info at UpdateHandle keeps the fused meta path (the dispatch publishes the layout).
+    ncclEpHandle_t h = make_handle_em(&cfg);
+    ASSERT_NE(h, nullptr);
+
+    int64_t *d_total, *d_cnt, *d_off;
+    CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int64_t)));
+    CUDA_ASSERT(cudaMalloc(&d_cnt, E_local * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMalloc(&d_off, E_local * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemset(d_total, 0, sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemset(d_cnt, 0, E_local * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemset(d_off, 0, E_local * sizeof(int64_t)));
+
+    ncclEpTensor_t *t_total, *t_cnt, *t_off;
+    NCCL_ASSERT(epTensorCreate(&t_total, 1, ncclInt64, d_total, 1));
+    NCCL_ASSERT(epTensorCreate(&t_cnt, 1, ncclInt64, d_cnt, E_local));
+    NCCL_ASSERT(epTensorCreate(&t_off, 1, ncclInt64, d_off, E_local));
+
+    ncclEpLayoutInfo_t layout = NCCL_EP_LAYOUT_INFO_INIT;
+    layout.recv_total_counter = t_total;
+    layout.expert_counters = t_cnt;
+    layout.expert_offsets = t_off;
+
+    // Each local expert receives 2 tokens (1 per contributing rank), padded to kAlign;
+    // pre-drop padded total = num_local_experts * kAlign.
+    const int expected_total = E_local * static_cast<int>(kAlign);
+    auto slots = run_dispatch(h, expected_total, /*expert_major=*/true, &layout);
+
+    // Slot content, not just counts/offsets: same routing/alignment as ExpertMajorWithAlignment
+    // (E_local0 zone = slots [0..3], E_local1 zone = slots [4..7], zero entries are padding).
+    std::set<float> zone0, zone1;
+    for (int s = 0; s < 4; ++s)
+        if (slots[s] != 0.f) zone0.insert(slots[s]);
+    for (int s = 4; s < 8; ++s)
+        if (slots[s] != 0.f) zone1.insert(slots[s]);
+    if (g_rank == 0) {
+        EXPECT_EQ(zone0, (std::set<float>{1.f, 9.f}));
+        EXPECT_EQ(zone1, (std::set<float>{2.f, 10.f}));
+    } else if (g_rank == 1) {
+        EXPECT_EQ(zone0, (std::set<float>{3.f, 11.f}));
+        EXPECT_EQ(zone1, (std::set<float>{4.f, 12.f}));
+    } else if (g_rank == 2) {
+        EXPECT_EQ(zone0, (std::set<float>{5.f, 13.f}));
+        EXPECT_EQ(zone1, (std::set<float>{6.f, 14.f}));
+    } else {
+        EXPECT_EQ(zone0, (std::set<float>{7.f, 15.f}));
+        EXPECT_EQ(zone1, (std::set<float>{8.f, 16.f}));
+    }
+
+    int64_t h_total = 0;
+    std::vector<int64_t> h_cnt(E_local), h_off(E_local);
+    CUDA_ASSERT(cudaMemcpy(&h_total, d_total, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_ASSERT(cudaMemcpy(h_cnt.data(), d_cnt, E_local * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_ASSERT(cudaMemcpy(h_off.data(), d_off, E_local * sizeof(int64_t), cudaMemcpyDeviceToHost));
+
+    EXPECT_EQ(h_total, static_cast<int64_t>(expected_total))
+        << "fused dispatch must write the pre-drop padded recv total";
+    // Offsets are the running prefix of the padded per-expert counts (fused publish).
+    int64_t sum = 0;
+    for (int e = 0; e < E_local; ++e) {
+        EXPECT_EQ(h_cnt[e], static_cast<int64_t>(kAlign))
+            << "local expert " << e << " padded count";
+        EXPECT_EQ(h_off[e], sum)
+            << "local expert " << e << " offset must equal the padded prefix";
+        sum += h_cnt[e];
+    }
+    EXPECT_EQ(sum, h_total)
+        << "recv_total_counter must equal the sum of padded per-expert counts";
+
+    ncclEpTensorDestroy(t_total);
+    ncclEpTensorDestroy(t_cnt);
+    ncclEpTensorDestroy(t_off);
+    cudaFree(d_total);
+    cudaFree(d_cnt);
+    cudaFree(d_off);
+    NCCL_ASSERT(ncclEpHandleDestroy(h));
+}
+
+// A standalone int32 recv_total_counter (no expert_counters/expert_offsets) at
+// fused dispatch time must not be rejected against a wrongly-defaulted int64
+// expectation -- caller_out_is_int64 must be inferred from recv_total_counter
+// itself when it is the only optional output given.
+TEST_F(OutputLayoutTest, FusedDispatchRecvTotalInt32Standalone) {
+    if (ht_em_ag_scan_mode_active() ||
+        ht_em_nvlink_dup_active() ||
+        ht_em_local_dup_active() ||
+        ht_em_pull_push_active()) {
+        GTEST_SKIP() << "fused dispatch layout applies only in count mode";
+    }
+    ncclEpHandle_t h = make_handle_em(nullptr);
+    ASSERT_NE(h, nullptr);
+
+    int32_t* d_total;
+    CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemset(d_total, 0, sizeof(int32_t)));
+    ncclEpTensor_t* t_total;
+    NCCL_ASSERT(epTensorCreate(&t_total, 1, ncclInt32, d_total, 1));
+
+    ncclEpLayoutInfo_t layout = NCCL_EP_LAYOUT_INFO_INIT;
+    layout.recv_total_counter = t_total;
+
+    // Count mode defers the EM recv count to post-dispatch (see ExpertMajorLayout), so use the
+    // fixture's known no-alignment total: 2 local experts x 2 tokens each = 4 (same as
+    // ExpertMajorLayout's num_recv).
+    constexpr int kExpectedTotal = 4;
+    run_dispatch(h, kExpectedTotal, /*expert_major=*/true, &layout);
+
+    int32_t h_total = 0;
+    CUDA_ASSERT(cudaMemcpy(&h_total, d_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(h_total, kExpectedTotal)
+        << "standalone int32 recv_total_counter must be written, not rejected";
 
     ncclEpTensorDestroy(t_total);
     cudaFree(d_total);
@@ -1400,6 +1555,11 @@ TEST_F(TopK2MixedRoutingTest, RankMajorLayout) {
 // ── Test: expert-major no-align — E1 duplicated from E0 for same-rank pairs ────
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorNoAlign) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     ncclEpHandle_t h = make_handle2_em(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -1422,6 +1582,11 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorNoAlign) {
 // Cross-rank pair (ranks 2,3): both zones filled with distinct tokens (no padding needed).
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadding) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     constexpr size_t kAlign = 4;
 
     ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -1455,6 +1620,11 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadding) {
 // Cross-rank pair (ranks 2,3): E0 and E1 slots are distinct token values.
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorDupTokens) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     ncclEpHandle_t h = make_handle2_em(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -1492,6 +1662,11 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorDupTokens) {
 // Cross-rank pair (ranks 2,3): each zone has 4 real + 4 pad.
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadVerified) {
+    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
+    // count both publish it at UpdateHandle time like this test expects.
+    if (!ht_em_ag_scan_mode_active() && !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
+    }
     constexpr size_t kAlign = 8;
 
     ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;

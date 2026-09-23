@@ -36,6 +36,8 @@ struct dispatch_warp_layout_t {
     int lsa_g2s_group_start;
     int lsa_s2g_group_warps;
     int lsa_s2g_group_start;
+    int map_group_warps;
+    int map_group_start;
     int pad_group_warps;
     int pad_group_start;
     int head_extra_group_warps;
@@ -50,7 +52,8 @@ struct dispatch_warp_layout_t {
 inline constexpr int kDispatchHeadWarps = 3;
 
 inline dispatch_warp_layout_t
-compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines) {
+compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_pipelines,
+                             bool count_map_warp) {
     const bool multi_lsa_layout = (num_lsa_teams != 1);
     dispatch_warp_layout_t L{};
     L.num_pipelines = num_pipelines;
@@ -60,11 +63,17 @@ compute_dispatch_warp_layout(int num_lsa_teams, ncclEpLayout_t layout, int num_p
     L.lsa_g2s_group_start = multi_lsa_layout ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0;
     L.lsa_s2g_group_warps = L.num_pipelines;
     L.lsa_s2g_group_start = L.lsa_g2s_group_start + L.lsa_g2s_group_warps;
-    L.pad_group_warps = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0;
-    L.pad_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
+    // Count mode dispatches FLAT (rank-major) with no EM padding, so it swaps the single EM PAD
+    // warp for a dedicated MAP group (the two are mutually exclusive). The MAP warps build the
+    // receiver EM tables on round-robin chunks; both warps also build the s2d rows that S2G gates
+    // on, so this is the s2d builder count and the floor is 2.
+    L.map_group_warps = count_map_warp ? 2 : 0;
+    L.map_group_start = L.lsa_s2g_group_start + L.lsa_s2g_group_warps;
+    L.pad_group_warps = count_map_warp ? 0 : ((layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) ? 1 : 0);
+    L.pad_group_start = L.map_group_start + L.map_group_warps;
     // Filler warps appended after PAD to guarantee the head always has 3 warps.
     const int comm_warps = L.cross_lsa_group_warps + L.lsa_g2s_group_warps +
-                           L.lsa_s2g_group_warps + L.pad_group_warps;
+                           L.lsa_s2g_group_warps + L.map_group_warps + L.pad_group_warps;
     L.head_extra_group_start = comm_warps;
     L.head_extra_group_warps = (comm_warps >= kDispatchHeadWarps) ? 0 : (kDispatchHeadWarps - comm_warps);
     L.block_dim = 32 * (comm_warps + L.head_extra_group_warps);
@@ -78,6 +87,8 @@ inline std::string dispatch_jit_source(
     int lsa_g2s_group_start,
     int lsa_s2g_group_warps,
     int lsa_s2g_group_start,
+    int map_group_warps,
+    int map_group_start,
     int pad_group_warps,
     int pad_group_start,
     int head_extra_group_warps,
@@ -94,6 +105,7 @@ inline std::string dispatch_jit_source(
     ncclEpLayout_t layout,
     int hidden_dim,
     int sf_bytes_per_token,
+    int experts_per_rank,
     const DispatchKernelSpec& kernel_spec) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     std::ostringstream src;
@@ -108,12 +120,13 @@ inline std::string dispatch_jit_source(
         << lsa_g2s_group_start << ">;\n"
         << "using LSA_S2G_GROUP = ht_ep::warp_group<" << lsa_s2g_group_warps << ", "
         << lsa_s2g_group_start << ">;\n"
+        << "using MAP_GROUP            = ht_ep::warp_group<" << map_group_warps << ", " << map_group_start << ">;\n"
         << "using PAD_GROUP            = ht_ep::warp_group<" << pad_group_warps << ", " << pad_group_start << ">;\n"
         << "using HEAD_EXTRA_GROUP     = ht_ep::warp_group<" << head_extra_group_warps << ", "
         << head_extra_group_start << ">;\n"
         << "\n"
         << "extern \"C\" __launch_bounds__(GIN_GROUP::size() + LSA_G2S_GROUP::size() + "
-           "LSA_S2G_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
+           "LSA_S2G_GROUP::size() + MAP_GROUP::size() + PAD_GROUP::size() + HEAD_EXTRA_GROUP::size(), 1)\n"
         << "__global__ void " << kDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ ht_ep::dispatch_kernel_param_t<TOKEN_DATA_TYPE, " << lsa_team_size
         << "> param) {\n"
@@ -125,6 +138,7 @@ inline std::string dispatch_jit_source(
         << "      GIN_GROUP,\n"
         << "      LSA_G2S_GROUP,\n"
         << "      LSA_S2G_GROUP,\n"
+        << "      MAP_GROUP,\n"
         << "      PAD_GROUP,\n"
         << "      HEAD_EXTRA_GROUP,\n"
         << "      " << num_of_stages << ",\n"
@@ -138,7 +152,8 @@ inline std::string dispatch_jit_source(
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
         << "      " << hidden_dim << ",\n"
-        << "      kSfBytesPerToken>(param, smem_bytes);\n"
+        << "      kSfBytesPerToken,\n"
+        << "      " << experts_per_rank << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
@@ -151,14 +166,16 @@ inline ncclResult_t launch_dispatch(
     ncclEpLayout_t layout,
     int hidden_dim,
     int sf_bytes_per_token,
+    int experts_per_rank,
     const ncclEpEnvConfig* env,  // for rank-0-gated verbose param dump; may be null
     void* param,
     size_t param_size,
     int dynamic_smem_bytes,
     cudaStream_t stream,
-    const DispatchKernelSpec& kernel_spec) {
+    const DispatchKernelSpec& kernel_spec,
+    bool count_map_warp) {
     const dispatch_warp_layout_t L =
-        compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines);
+        compute_dispatch_warp_layout(num_lsa_teams, layout, config.num_pipelines, count_map_warp);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
@@ -175,7 +192,9 @@ inline ncclResult_t launch_dispatch(
              << "_recipe" << kernel_spec.recipe_cache_tag
              << "_payload" << kernel_spec.payload_cache_tag
              << "_scale" << kernel_spec.scale_cache_tag
-             << "_sf" << sf_bytes_per_token;
+             << "_sf" << sf_bytes_per_token
+             << "_epr" << experts_per_rank
+             << (count_map_warp ? "_countmap" : "");
         return name.str();
     }();
     const std::string source = dispatch_jit_source(
@@ -185,6 +204,8 @@ inline ncclResult_t launch_dispatch(
         L.lsa_g2s_group_start,
         L.lsa_s2g_group_warps,
         L.lsa_s2g_group_start,
+        L.map_group_warps,
+        L.map_group_start,
         L.pad_group_warps,
         L.pad_group_start,
         L.head_extra_group_warps,
@@ -201,6 +222,7 @@ inline ncclResult_t launch_dispatch(
         layout,
         hidden_dim,
         sf_bytes_per_token,
+        experts_per_rank,
         kernel_spec);
 
     ::nccl_ep::jit::JitKernelVariant variant;
@@ -319,6 +341,7 @@ inline void dispatch_dump_warp_timing(
     _wt_print_group("INTER_N2N", L.cross_lsa_group_start, L.cross_lsa_group_warps);
     _wt_print_group("INTRA_G2S", L.lsa_g2s_group_start, L.lsa_g2s_group_warps);
     _wt_print_group("INTRA_S2G", L.lsa_s2g_group_start, L.lsa_s2g_group_warps);
+    _wt_print_group("MAP", L.map_group_start, L.map_group_warps);
     _wt_print_group("PAD", L.pad_group_start, L.pad_group_warps);
     _wt_print_block_span();
 }
@@ -453,7 +476,12 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "      p.caller_num_recv_tokens,\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_scales_em),\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_scale_staging),\n"
-        << "      p.scale_row_bytes);\n"
+        << "      p.scale_row_bytes,\n"
+        << "      p.flat2em_out,\n"
+        << "      p.lerm_in,\n"
+        << "      p.lerm_out,\n"
+        << "      p.em_permute_cursors,\n"
+        << "      p.allow_overflow_drop);\n"
         << "}\n";
     return src.str();
 }

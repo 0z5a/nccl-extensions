@@ -240,6 +240,37 @@ __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
 
+// Packed bitmap stored as little-endian 64-bit words: word count, word index, single-bit test/set.
+__host__ __device__ constexpr int bit_words(int n) { return ceil_div(n, 64); }
+__host__ __device__ constexpr int bit_word(int i) { return i >> 6; }
+template <typename WordT>
+__host__ __device__ __forceinline__ bool test_bit(const WordT* words, int i) {
+    return (words[i >> 6] >> (i & 63)) & WordT{1};
+}
+template <typename WordT>
+__host__ __device__ __forceinline__ void set_bit(WordT* words, int i) {
+    words[i >> 6] |= (WordT{1} << (i & 63));
+}
+// OR-reduces bits [lo, hi) of a packed bitmap; lo/hi need not be word-aligned or word-sized
+// (partial words at either end are masked off before the OR). The first word keeps bits
+// [lo%64, 64), interior words are taken whole, and the last word keeps bits [0, hi%64).
+template <typename WordT>
+__host__ __device__ __forceinline__ bool bit_range_any(const WordT* words, int lo, int hi) {
+    if (lo == hi) return false;
+    const WordT whole_word_mask = ~WordT{0};
+    const WordT first_word_mask = ~((WordT{1} << (lo & 63)) - WordT{1});
+    const WordT last_word_mask = ((hi & 63) == 0) ? whole_word_mask : ((WordT{1} << (hi & 63)) - WordT{1});
+    WordT acc = 0;
+    WordT cur_mask = first_word_mask;
+    int wi = bit_word(lo);
+    for (; wi < bit_words(hi) - 1; wi++) {
+        acc |= words[wi] & cur_mask;
+        cur_mask = whole_word_mask;
+    }
+    cur_mask &= last_word_mask;
+    return (acc | (words[wi] & cur_mask)) != 0;
+}
+
 // Buffer-relative offsets into rdma_buffer. Pointers are resolved at use time
 // against the group's current rdma_buffer base, so the buffer can be
 // reallocated (e.g., grown for a larger layout) without invalidating any

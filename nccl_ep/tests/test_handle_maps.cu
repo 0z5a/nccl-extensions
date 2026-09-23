@@ -355,6 +355,11 @@ TEST_F(HandleMapsTest, S2DExpertMajorPermute) {
         SUCCEED() << "skipped: FLAT-shape s2d only populated under default kLocalPermute mode";
         return;
     }
+    // Count mode builds the FLAT s2d during dispatch, not UpdateHandle, so there is nothing to
+    // inspect here; only scan mode fills it at UpdateHandle.
+    if (!ht_em_ag_scan_mode_active()) {
+        GTEST_SKIP() << "count mode defers FLAT s2d to post-dispatch";
+    }
 
     ncclEpHandle_t h = make_handle_em(nullptr);
     ASSERT_NE(h, nullptr);

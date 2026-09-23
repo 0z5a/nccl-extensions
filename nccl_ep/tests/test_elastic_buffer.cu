@@ -137,6 +137,16 @@ TEST_F(ElasticBufferTest, RegisterDeregister) {
 // GPU->CPU boundary. The identity-expert round-trip verifies every token.
 
 TEST_F(ElasticBufferTest, DispatchCombineCrossBoundary) {
+    // Fused count mode publishes the recv count during dispatch, so getNumRecvTokens()
+    // reads 0 right after UpdateHandle; every other mode (including unfused count) wires
+    // it at UpdateHandle time.
+    if (!ht_em_ag_scan_mode_active() &&
+        !ht_em_nvlink_dup_active() &&
+        !ht_em_local_dup_active() &&
+        !ht_em_pull_push_active() &&
+        !ht_em_count_unfused_active()) {
+        GTEST_SKIP() << "fused count defers recv count to dispatch; getNumRecvTokens is 0 after UpdateHandle";
+    }
     ncclEpElasticBuffer buf;
     void* base = alloc_elastic(&buf, /*gpu*/kXbGpuBytes, /*cpu*/kXbCpuBytes);
     ASSERT_NE(base, nullptr);

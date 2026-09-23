@@ -24,6 +24,11 @@
 namespace nccl_ep {
 namespace ht {
 
+// Count-mode receiver-table row width cap (fixed [flat2em|weights] row stride in the group
+// IPC tables). Also caps HT EM local-permute num_topk (local_permute_reduce packs in
+// ceil(kEpCountMaxTopk/32) warp chunks).
+constexpr int kEpCountMaxTopk = 64;
+
 // ============================================================================
 // Runtime constants (from ep_group, not hardcoded):
 //   lsa_team_size  - ncclTeamLsa(comm).nRanks  (1..NCCL_EP_HT_MAX_LSA_TEAM_SIZE)
@@ -56,6 +61,66 @@ void convert_topk_to_routing_map(
     int experts_per_lsa_team_packed, // = ceil(experts_per_lsa_team / 8)
     int row_bytes,                   // per-token stride = experts_per_lsa_team_packed * num_lsa_teams
     cudaStream_t stream);
+
+// ============================================================================
+// Count-exchange (push dispatch): builds per-source-rank count rows from topk_idx
+// and reduces them into receiver layout on the unfused path. Push-dispatch only;
+// pull dispatch (below) uses its own count-row builder.
+// ============================================================================
+
+// Count-exchange path: per-destination-rank and per-expert send-count histogram from topk_idx.
+// topk_idx is read in its native width; cached_topk_idx is always widened to int64.
+template <typename TopkIdxT>
+void build_count_metadata(
+    const TopkIdxT* topk_idx,
+    int64_t* cached_topk_idx,  // [num_tokens, num_topk] cache copy for prob rebuild + combine, nullable
+    int num_tokens,
+    int num_topk,
+    int experts_per_rank,
+    int num_world_dst_ranks,
+    int num_experts,           // num_world_dst_ranks * experts_per_rank
+    int32_t* cnt_rank,         // [num_world_dst_ranks], pre-zeroed
+    int32_t* cnt_expert,       // [num_experts], pre-zeroed, nullable
+    int tokens_per_chunk,      // dispatch source-chunk width
+    int32_t* own_chunk_rank,   // own-LSA-team slice [num_chunks, lsa_team_size], pre-zeroed, nullable
+    int lsa_team_size,                       // dest ranks per LSA team
+    int num_lsa_teams,                       // must be 1 (count mode is single-LSA-team only)
+    uint64_t* token_dst_rank_bitmap, // [num_tokens] per-token dest-rank bitmap, nullable
+    int32_t* per_src_lteam_num_tokens, // [num_lsa_teams] token counts; only own slot written (single-LSA: [1]), nullable
+    int my_lteam,
+    bool* rdma_to_attn_map,    // this-LSA-team slice; rdma_to_attn_map[r2a_offset+token], nullable
+    int r2a_offset,            // my_lteam * rdma_per_lsa_sz
+    int num_sms,               // grid cap = scan preprocessing SM count; kernel grid-strides
+    cudaStream_t stream);
+
+// compute_layout_info: unfused count path (EM). Reduces the world-AllGathered
+// per-source count rows into per-expert recv counts and writes the caller layout
+// tensors. The reduction is order-independent, so it is valid whether count mode's
+// current single-LSA-team constraint holds or is later lifted to multiple LSA teams
+// (multinode). Counts/offsets exclude dropped tokens; recv_total_counter reports
+// the pre-drop total (same DROP contract as scan mode).
+void compute_layout_info(
+    const int32_t* cached_cnt_rows,    // [num_src_ranks * (num_src_ranks + num_experts)]
+    int num_src_ranks,             // nRanks
+    int num_experts,               // num_src_ranks * experts_per_rank (world)
+    int experts_per_rank,
+    int my_rank,
+    int em_alignment,              // dispatch_output_per_expert_alignment
+    int max_recv_tokens_per_rank,  // recv budget / DROP capacity
+    bool allow_overflow_drop,
+    bool out_is_int64,             // dtype of caller counts/offsets
+    int64_t* em_internal_offsets,  // [experts_per_rank + 1] handle expert_token_offsets
+    void* em_padded_out_counts,    // caller expert_counters
+    void* em_out_offsets,          // caller expert_offsets, nullable
+    int32_t* em_actual_counts_out, // handle authoritative counts, nullable
+    void* recv_total_counter,      // caller recv_total_counter, nullable
+    cudaStream_t stream);
+
+// ============================================================================
+// Pull dispatch (kPullPush): order-preserving uint16 topk map, replacing the bitmap
+// routing map. Pull-side count-exchange helpers (receiver count-row build) belong
+// here too, next to pack_topk_idx.
+// ============================================================================
 
 // Pull dispatch: order-preserving alternative to the bitmap routing map. Emits each
 // token's top-k global expert ids as uint16 (row stride = num_topk), kTopkIdxInvalid
@@ -102,6 +167,7 @@ void sparse_to_dense_prob_combine(
     int experts_per_rank,
     int experts_per_lsa_team, // = experts_per_rank * ranks_per_lsa_team
     int local_rank, // rank within lsa team
+    bool lerm_bitmap, // count mode: LERM is a ceil(epr/64)-word packed bitmap per token
     cudaStream_t stream);
 
 // ============================================================================
@@ -128,6 +194,7 @@ void dense_to_sparse_prob(
     int global_expert_offset, // = group_rank * experts_per_rank; added to local id under GLOBAL
     ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major, // true = 1D recv_topk_weights, false = 2D
+    bool lerm_bitmap, // count mode: LERM is a ceil(epr/64)-word packed bitmap per token
     cudaStream_t stream);
 
 // Combine BWD output: sparse k-slot writeback keyed by FWD-input cached_topk_idx.
@@ -260,7 +327,10 @@ size_t get_em_scan_gscratch_size(int lsa_team_size, int experts_per_rank,
 
 // Scatter FLAT staging rows into EM zones using flat2em_slot_map (written by
 // em_scan_kernel during UpdateHandle); zero-fill per-expert pad rows.
-// shuffle_sms=0 picks sm_count.
+// shuffle_sms=0 picks sm_count. Count mode passes flat2em_out/lerm_in/lerm_out/em_permute_cursors
+// (all non-null) to build the flat2em rows inline from the LERM rows instead of consuming a
+// pre-built map; em_permute_cursors is a zero-seeded [experts_per_rank + 1] cursor array (see
+// local_permute_dup_param_t in ht_ep.cuh) and lerm_out persists the LERM row for combine.
 void launch_dispatch_permute(
     void* recv_x_em,
     float* recv_topk_weights_em,
@@ -269,7 +339,9 @@ void launch_dispatch_permute(
     const int32_t* flat2em_slot_map,
     const int32_t* num_recv_tokens_dev,
     const int64_t* expert_token_offsets,
-    const int32_t* per_expert_counts_active,
+    // Mutable: DROP-mode phantom-row fixup corrects it in place (see allow_overflow_drop
+    // below and local_permute_dup_param_t in ht_ep.cuh).
+    int32_t* per_expert_counts_active,
     int top_k,
     int experts_per_rank,
     int row_bytes,
@@ -280,7 +352,15 @@ void launch_dispatch_permute(
     ncclEpDispQuant_t recipe,
     void* recv_scales_em,
     const void* flat_scale_staging,
-    int scale_row_bytes);
+    int scale_row_bytes,
+    int32_t* flat2em_out = nullptr,
+    const bool* lerm_in = nullptr,
+    bool* lerm_out = nullptr,
+    int32_t* em_permute_cursors = nullptr,
+    // Count mode + DROP only: gates an in-kernel phantom-row correction (see
+    // local_permute_dup_param_t::allow_overflow_drop in ht_ep.cuh for why it's needed).
+    // Ignored (no correction) when em_permute_cursors is null.
+    bool allow_overflow_drop = false);
 
 // Pull EM dispatch (MNNVL): each receiver reads its source rows and topk weights
 // directly from the source ranks' input buffers over NVLink and scatters them into
@@ -433,6 +513,37 @@ struct combine_memory_region_info_t {
 // Dispatch wrapper with template parameter resolution
 // ============================================================================
 
+// Count-exchange dispatch payload: buffers and tunables the MAP warps consume to
+// rebuild the receiver s2d/LERM/flat2em tables inside dispatch. Disabled
+// (active=false) leaves the scan comm path untouched. Set together in the
+// dispatch caller so the top-level DispatchParams stays scannable.
+struct DispatchPushCountParams {
+    bool active = false;                                    // gate: MAP warps build s2d/LERM in-kernel
+    const int32_t* own_row = nullptr;                       // fused-path per-handle own count row (head fan-out source)
+    const int32_t* cached_cnt_rows = nullptr;               // unfused: AllGathered count rows (per-handle), nullable
+    bool fused_meta_dispatch = true;                        // fused meta delivery (intra-LSA fan-out); false = unfused, MAP reads cached_cnt_rows
+    int32_t* s2d_out = nullptr;                             // writable s2d [max_tokens, lsa_team_size], host-set 0xFF
+    size_t published_offset = 0;                            // count rows offset in the peer table regions
+    const int32_t* per_src_lteam_chunk_rank = nullptr;       // [num_chunks, lsa_team_size] per-chunk send counts
+    const int64_t* cached_topk_idx = nullptr;               // cached sender topk_idx [max_tokens, num_topk]
+    int32_t* num_recv_out = nullptr;                        // FLAT recv count (num_tokens_for_experts)
+    const int32_t* per_src_lteam_num_tokens = nullptr;       // [1] real token count for the sender's stream
+    int num_topk = 0;
+    int num_src_ranks = 0;                                  // nRanks (== lsa_team_size in count mode)
+    int lsa_team_size = 0;
+    const uint64_t* token_dst_rank_bitmap = nullptr;        // [max_tokens] per-token global dest-rank bitmap
+    uint8_t* const* recv_tables_ptrs = nullptr;             // per-peer EM table region base
+    int recv_max_slots = 0;
+    bool allow_overflow_drop = false;                       // clamp published per-expert offsets/counts to recv_max_slots
+    int64_t* expert_token_offsets_out = nullptr;            // [experts_per_rank + 1]
+    int32_t* per_expert_counts_out = nullptr;               // [experts_per_rank] unpadded counts
+    void* caller_offsets = nullptr;
+    void* caller_counts = nullptr;
+    void* caller_recv_total = nullptr;                      // caller recv_total_counter scalar (pre-drop padded total), nullable
+    bool caller_out_is_int64 = false;
+    int em_alignment = 1;
+};
+
 // All parameters needed for dispatch kernel, needed redifine because those in ht_ep.cuh are with template on data type.
 struct DispatchParams {
     // User inputs
@@ -493,6 +604,9 @@ struct DispatchParams {
 
     // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
     int max_recv_tokens_per_rank = 0;
+
+    // Count-exchange payload (fused-meta-dispatch). See DispatchPushCountParams.
+    DispatchPushCountParams dispatch_push_count;
 };
 
 // Call dispatch kernel. Recipe and pass-direction enums remain explicit until

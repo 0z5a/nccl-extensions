@@ -24,17 +24,46 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <strings.h>  // strcasecmp
 #include <thread>
 #include <vector>
 
 #define NCCL_ASSERT(x) ASSERT_EQ((x), ncclSuccess)
 #define CUDA_ASSERT(x) ASSERT_EQ((x), cudaSuccess)
 
+// Mirrors nccl_ep_env.cc::parse_flag's truthy tokens (1/on/true, case-insensitive);
+// anything else, including unset, is inactive.
+static inline bool env_flag_active(const char* name) {
+    const char* v = getenv(name);
+    if (v == nullptr || v[0] == '\0') return false;
+    return strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "true") == 0;
+}
+
 // True when HT EM pull-dispatch/push-combine mode is active (NCCL_EP_HT_EM_PULL_PUSH).
 // The mode only supports the expert-major layout, so FLAT / rank-major cases skip.
 static inline bool ht_em_pull_push_active() {
-    const char* v = getenv("NCCL_EP_HT_EM_PULL_PUSH");
-    return v && v[0] != '\0' && v[0] != '0';
+    return env_flag_active("NCCL_EP_HT_EM_PULL_PUSH");
+}
+
+// True when the scan (routing-map AllGather) fallback is active (NCCL_EP_HT_EM_AG_SCAN_MODE).
+static inline bool ht_em_ag_scan_mode_active() {
+    return env_flag_active("NCCL_EP_HT_EM_AG_SCAN_MODE");
+}
+
+// True when count mode is forced unfused (NCCL_EP_HT_EM_COUNT_UNFUSED); like scan mode,
+// it publishes the EM recv-count tables at UpdateHandle time.
+static inline bool ht_em_count_unfused_active() {
+    return env_flag_active("NCCL_EP_HT_EM_COUNT_UNFUSED");
+}
+
+// True when HT EM nvlink-dup mode is active (NCCL_EP_HT_EM_NVLINK_DUP).
+static inline bool ht_em_nvlink_dup_active() {
+    return env_flag_active("NCCL_EP_HT_EM_NVLINK_DUP");
+}
+
+// True when HT EM local-dup mode is active (NCCL_EP_HT_EM_LOCAL_DUP).
+static inline bool ht_em_local_dup_active() {
+    return env_flag_active("NCCL_EP_HT_EM_LOCAL_DUP");
 }
 
 // Skip the current test under NCCL_EP_HT_EM_PULL_PUSH, which supports expert-major only.

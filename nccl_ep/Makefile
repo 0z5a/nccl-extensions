@@ -72,6 +72,7 @@ NCCL_EP_JIT_HEADERS := \
     device/ht_ep_configs.cuh \
     device/cuda_compat_shims.cuh \
     device/scan_kernel.cuh \
+    device/count_kernel.cuh \
     device/macros.cuh \
     device/ll_ep.cuh \
     device/ll_ep_adapter.cuh \

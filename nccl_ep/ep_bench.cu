@@ -4744,6 +4744,7 @@ void printUsage(const char* programName, int myRank) {
         printf("  --datatype <dtype>      Wire dtype for token tensors: bf16 (default), fp16, fp32\n");
         printf("  --disable-token-dropping LL only: do not insert random -1 sentinels in the topk table\n");
         printf("                          (drop-free, deterministic routing; useful for debugging/validation)\n");
+        printf("  --fused-meta-dispatch   HT-EM count: keep AG-of-count fused in dispatch (skip UpdateHandle unfused path)\n");
         printf("  -B, --backward          HT only: also benchmark the backward dispatch/combine ops\n");
         printf("                          (reuses the forward routing state; combine consumes topk_weights)\n");
         printf("  --help                  Show this help message\n");
@@ -4770,6 +4771,7 @@ int main(int argc, char* argv[]) {
     bool validate_data = false;  // Validate dispatch/combine correctness
     bool validation_passed = true;  // Aggregated across ranks when validation is enabled
     bool dispatch_only = false;  // Skip combine run and validation (use with --validate)
+    bool fused_meta_dispatch = false;  // HT-EM count: keep AG-of-count fused in dispatch (skip UpdateHandle unfused path)
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
     bool run_backward = false;  // Also benchmark the HT backward dispatch/combine ops
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
@@ -4840,8 +4842,9 @@ int main(int argc, char* argv[]) {
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
+        {"fused-meta-dispatch", no_argument, 0, 1005},
         {"backward", no_argument, 0, 'B'},
-        {"overflow-drop", no_argument, 0, 1005},
+        {"overflow-drop", no_argument, 0, 1006},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -5076,8 +5079,11 @@ int main(int argc, char* argv[]) {
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
-        case 1005:  // --overflow-drop
+        case 1006:  // --overflow-drop
             overflow_drop = true;
+            break;
+        case 1005:  // --fused-meta-dispatch
+            fused_meta_dispatch = true;
             break;
         case 'h':
             printUsage(argv[0], myRank);
@@ -5455,6 +5461,7 @@ int main(int argc, char* argv[]) {
     ncclEpGroupConfig_t config = NCCL_EP_GROUP_CONFIG_INIT;
     config.algorithm = algorithm;
     config.num_experts = num_experts;
+    config.num_topk = top_k;
     // max_dispatch_tokens_per_rank is the per-rank batch size (max tokens any single rank will send).
     config.max_dispatch_tokens_per_rank = dynamic_tokens ? NCCL_EP_AUTO : max_tokens_per_rank;
 
@@ -5632,18 +5639,23 @@ int main(int argc, char* argv[]) {
     int64_t* dispatch_meta_counts_host = nullptr;
     int64_t* dispatch_meta_offsets_host = nullptr;
     const bool ht_em = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
-    const bool need_dispatch_meta = ht_em && validate_data;
+    const bool need_layout_info = ht_em && validate_data;
 
+    // HT-EM count: default unfused (write layout_info in UpdateHandle); --fused-meta-dispatch keeps it
+    // fused in dispatch. Allocate the count tensors so the unfused path is exercised/timed even
+    // without --validate.
+    const bool need_layout_info_before_dispatch = ht_em && !fused_meta_dispatch;
     ncclEpTensor_t* recv_expert_counter_tensor = nullptr;
     ncclEpTensor_t* recv_total_counter_tensor = nullptr;
-    if (ht_em && (dynamic_tokens || need_dispatch_meta)) {
+    if (ht_em && (dynamic_tokens || need_layout_info || need_layout_info_before_dispatch)) {
         NCCLCHECK(epMakeTensor(&recv_expert_counter_tensor, 1, ncclInt64, num_local_experts));
+        if (need_layout_info_before_dispatch) NCCLCHECK(epMakeTensor(&recv_total_counter_tensor, 1, ncclInt64, 1));
     } else if (dynamic_tokens) {
         NCCLCHECK(epMakeTensor(&recv_expert_counter_tensor, 1, ncclInt32, num_local_experts));
         NCCLCHECK(epMakeTensor(&recv_total_counter_tensor, 1, ncclInt32, 1));
     }
     ncclEpTensor_t* meta_offsets_tensor = nullptr;
-    if (need_dispatch_meta) {
+    if (need_layout_info || need_layout_info_before_dispatch) {
         NCCLCHECK(epMakeTensor(&meta_offsets_tensor, 1, ncclInt64, num_local_experts));
     }
 
@@ -5655,6 +5667,10 @@ int main(int argc, char* argv[]) {
     const bool has_handle_layout_info = handle_layout_info.expert_counters != nullptr ||
                                         handle_layout_info.recv_total_counter != nullptr ||
                                         handle_layout_info.expert_offsets != nullptr;
+    // --fused-meta-dispatch suppresses UpdateHandle count provisioning so the AG-of-count stays fused
+    // in the dispatch head.
+    const bool provide_update_layout = has_handle_layout_info && !fused_meta_dispatch;
+    const ncclEpLayoutInfo_t* handle_layout = provide_update_layout ? &handle_layout_info : nullptr;
 
     const bool ht_expert_major = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
     ncclEpHandleConfig_t handle_cfg = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -5678,14 +5694,14 @@ int main(int argc, char* argv[]) {
     if (user_handle_mem) {
         NCCLCHECK(ncclEpInitHandle(&ep_handle, ep_group, layout, cfg_ptr, static_cast<int>(top_k), handle_mem_tensor));
         NCCLCHECK(
-            ncclEpUpdateHandle(ep_handle, topk_idx, has_handle_layout_info ? &handle_layout_info : nullptr, stream));
+            ncclEpUpdateHandle(ep_handle, topk_idx, handle_layout, stream));
     } else {
         NCCLCHECK(ncclEpCreateHandle(
             &ep_handle,
             ep_group,
             layout,
             topk_idx,
-            has_handle_layout_info ? &handle_layout_info : nullptr,
+            handle_layout,
             cfg_ptr,
             stream));
     }
@@ -6027,8 +6043,7 @@ int main(int argc, char* argv[]) {
 
     ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
     combine_config.quant_recipe = combine_quantization;
-    const ncclEpLayoutInfo_t* update_layout_info_ptr = has_handle_layout_info ? &handle_layout_info : nullptr;
-    auto update_fn = [&]() { NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, update_layout_info_ptr, stream)); };
+    auto update_fn = [&]() { NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, handle_layout, stream)); };
 
     auto dispatch_fn = [&]() {
         NCCLCHECK(ncclEpDispatch(
@@ -6179,9 +6194,13 @@ int main(int argc, char* argv[]) {
     if (dispatch_only) benchmark_combine_fn = [] {};
 
     // Times one paired dispatch+combine pass with the currently-wired direction.
-    auto run_paired_pass = [&](KernelTimer& kt) {
+    // pass_update_fn is a parameter (not always the captured update_fn) so the backward
+    // pass below can skip it: backward reuses the routing state the forward pass already
+    // established, and re-running UpdateHandle during backward's own warmup (with no
+    // intervening forward dispatch) desyncs count mode's dispatch-rebuilt s2d.
+    auto run_paired_pass = [&](KernelTimer& kt, std::function<void()> pass_update_fn) {
         return runPairedBenchmark(
-            update_fn,
+            pass_update_fn,
             dispatch_fn,
             benchmark_combine_fn,
             actual_warmup,
@@ -6192,7 +6211,7 @@ int main(int argc, char* argv[]) {
             stream);
     };
 
-    PairedBenchResult paired_result = run_paired_pass(ktimer);
+    PairedBenchResult paired_result = run_paired_pass(ktimer, update_fn);
 
     // Post-combine GPU memory snapshot. By this point the EP group has been
     // created, the handle has been initialized (and the rdma_buffer grown to
@@ -6214,7 +6233,6 @@ int main(int argc, char* argv[]) {
     if (profile_mode) {
         auto handle_create_fn = [&]() {
             NCCLCHECK(ncclEpHandleDestroy(ep_handle));
-            const ncclEpLayoutInfo_t* layout_info_ptr = has_handle_layout_info ? &handle_layout_info : nullptr;
             if (user_handle_mem) {
                 NCCLCHECK(ncclEpInitHandle(
                     &ep_handle,
@@ -6223,9 +6241,9 @@ int main(int argc, char* argv[]) {
                     cfg_ptr,
                     static_cast<int>(top_k),
                     handle_mem_tensor));
-                NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, layout_info_ptr, stream));
+                NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, handle_layout, stream));
             } else {
-                NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, layout, topk_idx, layout_info_ptr, cfg_ptr, stream));
+                NCCLCHECK(ncclEpCreateHandle(&ep_handle, ep_group, layout, topk_idx, handle_layout, cfg_ptr, stream));
             }
         };
         runNvtxProfiling(myRank, actual_iters, dispatch_fn, benchmark_combine_fn, handle_create_fn, stream);
@@ -6253,43 +6271,6 @@ int main(int argc, char* argv[]) {
                 dispatchRecipeName(dispatch_quantization),
             nRanks);
         printf("NOTE: total time = kernel time + memcpyD2D + misc\n");
-    }
-
-    // UpdateHandle CUPTI micro-bench. Must run after the main bench (running
-    // it in isolation desyncs the cross-GPU notify protocol and hangs Dispatch).
-    // Save/restore g_kernel_stats so the main-bench timings survive
-    // ktimer.start() under CUPTI; without CUPTI the save/restore is a no-op
-    // and g_kernel_stats does not exist.
-    {
-#ifdef HAVE_CUPTI
-        auto saved_main_kernel_stats = g_kernel_stats;
-#endif
-
-        const int update_warmup = actual_warmup;
-        const int update_iters = actual_iters;
-        const ncclEpLayoutInfo_t* layout_info_ptr = has_handle_layout_info ? &handle_layout_info : nullptr;
-        for (int i = 0; i < update_warmup; ++i) {
-            NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, layout_info_ptr, stream));
-        }
-        CUDACHECK(cudaStreamSynchronize(stream));
-        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
-        KernelTimer ktimer_update;
-        ktimer_update.start();
-        for (int i = 0; i < update_iters; ++i) {
-            NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, layout_info_ptr, stream));
-        }
-        CUDACHECK(cudaStreamSynchronize(stream));
-        ktimer_update.stop();
-        if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ktimer_update.is_valid()) {
-            printf("\n--- UpdateHandle timing ---\n");
-            printf("Update:      kernel=%.2f us\n", ktimer_update.sum_per_launch_us());
-            printf("Update:      scan_flat=%.2f us\n", ktimer_update.get_avg_us("scan_flat"));
-            printf("\n");
-        }
-
-#ifdef HAVE_CUPTI
-        g_kernel_stats = std::move(saved_main_kernel_stats);
-#endif
     }
 
     // Print results and summary based on algorithm mode
@@ -6383,13 +6364,29 @@ int main(int argc, char* argv[]) {
             dispatch_quantization,
             dispatch_input_dtype);
 
+        // HT-EM count mode wires the caller's per-expert offsets/counts at Dispatch
+        // (receiver-local, written post-build), so point dispatch_layout_info at the
+        // validation tensors for this run. Restored after so cleanup frees the
+        // setup-owned dispatch_layout_info tensors.
+        ncclEpTensor_t* saved_dispatch_counters = dispatch_layout_info.expert_counters;
+        ncclEpTensor_t* saved_dispatch_offsets = dispatch_layout_info.expert_offsets;
+        if (need_layout_info) {
+            dispatch_layout_info.expert_counters = recv_expert_counter_tensor;
+            dispatch_layout_info.expert_offsets = meta_offsets_tensor;
+        }
+
         // Run dispatch
         dispatch_fn();
         CUDACHECK(cudaStreamSynchronize(stream));
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
 
+        if (need_layout_info) {
+            dispatch_layout_info.expert_counters = saved_dispatch_counters;
+            dispatch_layout_info.expert_offsets = saved_dispatch_offsets;
+        }
+
         // Copy per-expert metadata from device to host for validation
-        if (need_dispatch_meta) {
+        if (need_layout_info) {
             dispatch_meta_counts_host = new int64_t[num_local_experts];
             dispatch_meta_offsets_host = new int64_t[num_local_experts];
             void* counts_ptr;
@@ -6574,7 +6571,8 @@ int main(int argc, char* argv[]) {
 
             MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
             KernelTimer ktimer_bwd;
-            PairedBenchResult bwd_result = run_paired_pass(ktimer_bwd);
+            // No update_fn here: backward reuses the forward pass's routing state as-is.
+            PairedBenchResult bwd_result = run_paired_pass(ktimer_bwd, [] {});
 
             // Backward transports a different byte volume than forward (dispatch drops
             // weights/idx, combine moves grad tokens), so suppress the forward-derived
@@ -6668,8 +6666,35 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // UpdateHandle CUPTI micro-bench. Must run after the main bench (isolation desyncs
+    // the cross-GPU notify protocol and hangs Dispatch) and after any backward pass
+    // above -- these UpdateHandle-only calls don't rebuild count mode's dispatch-time
+    // s2d, so a later backward run would desync.
+    {
+        const int update_warmup = actual_warmup;
+        const int update_iters = actual_iters;
+        for (int i = 0; i < update_warmup; ++i) {
+            NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, handle_layout, stream));
+        }
+        CUDACHECK(cudaStreamSynchronize(stream));
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+        KernelTimer ktimer_update;
+        ktimer_update.start();
+        for (int i = 0; i < update_iters; ++i) {
+            NCCLCHECK(ncclEpUpdateHandle(ep_handle, topk_idx, handle_layout, stream));
+        }
+        CUDACHECK(cudaStreamSynchronize(stream));
+        ktimer_update.stop();
+        if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ktimer_update.is_valid()) {
+            printf("\n--- UpdateHandle timing ---\n");
+            printf("Update:      kernel=%.2f us\n", ktimer_update.sum_per_launch_us());
+            printf("Update:      scan_flat=%.2f us\n", ktimer_update.get_avg_us("scan_flat"));
+            printf("\n");
+        }
+    }
+
     // Destroy HT per-expert metadata local tensors and free host copies
-    if (need_dispatch_meta) {
+    if (need_layout_info || need_layout_info_before_dispatch) {
         epFreeTensor(&meta_offsets_tensor);
     }
     delete[] dispatch_meta_counts_host;
@@ -6858,11 +6883,12 @@ int main(int argc, char* argv[]) {
 
     if (handle_mem_tensor != nullptr) epFreeTensor(&handle_mem_tensor);
 
-    // Cleanup recv_expert_counter if allocated (must be before group destroy)
-    if (dynamic_tokens && recv_expert_counter_tensor != nullptr) {
+    // Cleanup recv counters if allocated (must be before group destroy). Allocated on the
+    // dynamic-token path and the count-mode-before-dispatch path, so free whenever non-null.
+    if (recv_expert_counter_tensor != nullptr) {
         epFreeTensor(&recv_expert_counter_tensor);
     }
-    if (dynamic_tokens && recv_total_counter_tensor != nullptr) {
+    if (recv_total_counter_tensor != nullptr) {
         epFreeTensor(&recv_total_counter_tensor);
     }
 

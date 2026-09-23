@@ -896,7 +896,10 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                The actual number of tokens received by rank `r` is obtained via
 //                                layout_info->src_rank_counters[`r`] (see below).
 //   layout_info   - [IN,OUT] Named local tensors for layout-specific counters (see ncclEpLayoutInfo_t).
-//                              * For HT mode should be NULL, the counter information is available through ncclEpUpdateHandle.
+//                              * For HT mode normally NULL: the counter information is available through
+//                                ncclEpUpdateHandle. Exception: HT expert-major count mode may instead
+//                                pass expert_counters and recv_total_counter here, published by dispatch
+//                                itself rather than ncclEpUpdateHandle.
 //                              * For LL mode, layout-specific counter tensors must be provided (see ncclEpLayoutInfo_t doc).
 //                                * Expert-major layout: expert_counters tensor is required.
 //                                * Rank-major layout: src_rank_counters is optional; when provided,

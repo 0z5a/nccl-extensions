@@ -56,6 +56,12 @@ struct ncclEpEnvConfig {
     // Launch the intra-LSA head and tail sync as separate kernels instead of
     // fusing them into the dispatch/combine kernels. Pull-push only.
     ncclEpEnvVar ht_unfused_sync{"NCCL_EP_HT_UNFUSED_SYNC", ncclEpEnvType::flag};
+    // Count exchange is the default HT EM path; set to fall back to the routing-map
+    // AllGather + scan path instead.
+    ncclEpEnvVar ht_em_ag_scan_mode{"NCCL_EP_HT_EM_AG_SCAN_MODE", ncclEpEnvType::flag};
+    // Count mode fuses the recv layout into dispatch by default; set to force the unfused
+    // AllGather + compute_layout_info path (used to compare fused vs. unfused performance).
+    ncclEpEnvVar ht_em_count_unfused{"NCCL_EP_HT_EM_COUNT_UNFUSED", ncclEpEnvType::flag};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
