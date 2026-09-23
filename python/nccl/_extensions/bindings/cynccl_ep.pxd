@@ -191,6 +191,8 @@ ctypedef struct ncclEpGroupConfig_t 'ncclEpGroupConfig_t':
     ncclEpOverflowPolicy_t overflow_policy
     unsigned int num_topk
     unsigned char padding_v2[4]
+    unsigned int dispatch_num_sms
+    unsigned int combine_num_sms
 
 
 ###############################################################################

@@ -81,9 +81,11 @@ inline std::string combine_jit_source(
     int lsa_team_size,
     ncclEpLayout_t layout,
     int hidden_dim,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -121,12 +123,13 @@ inline std::string combine_jit_source(
         << "      " << hidden_dim << ",\n"
         << "      " << lsa_team_size << ",\n"
         << "      " << layout_literal << ",\n"
-        << "      " << token_dtype_literal << ">(param, smem_bytes);\n"
+        << "      " << token_dtype_literal << ",\n"
+        << "      " << recipe_literal << ">(param, smem_bytes);\n"
         << "}\n";
     return src.str();
 }
 
-inline void launch_combine(
+inline ncclResult_t launch_combine(
     const ::ht_ep::combine_config_t& config,
     int max_tokens_per_rank,
     int num_lsa_teams,
@@ -138,13 +141,20 @@ inline void launch_combine(
     size_t param_size, // size of packed kernel arguments buffer
     int dynamic_smem_bytes,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     const combine_warp_layout_t L =
         compute_combine_warp_layout(num_lsa_teams, config.num_pipelines);
 
     static const int fwd_variant_identity = 0;
     static const int bwd_variant_identity = 0;
     const int& variant_identity = config.backward_combine ? bwd_variant_identity : fwd_variant_identity;
+    // combine_recipe_literal() returns null for a recipe with no enumerator name; the source
+    // builders stream it straight into an ostringstream, where null would be UB.
+    if (::nccl_ep::jit::combine_recipe_literal(recipe) == nullptr) {
+        std::fprintf(stderr, "[nccl_ep jit] combine: unsupported HT combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine"
@@ -155,7 +165,8 @@ inline void launch_combine(
              << config.num_of_blocks
              << (config.backward_combine ? "_bwd" : "_fwd")
              << ::nccl_ep::jit::layout_name_tag(layout)
-             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe);
         return name.str();
     }();
     const std::string source = combine_jit_source(
@@ -171,7 +182,8 @@ inline void launch_combine(
         lsa_team_size,
         layout,
         hidden_dim,
-        token_dtype);
+        token_dtype,
+        recipe);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_combine";
@@ -220,11 +232,12 @@ inline void launch_combine(
         ::nccl_ep::jit::launch_jit_kernel(variant, param, param_size, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(stderr, "[nccl_ep jit] fatal combine JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
+        std::fprintf(stderr, "[nccl_ep jit] combine JIT launch failure for %s: %s%s%s\n", variant_name.c_str(),
                      ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
                      error.empty() ? "" : error.c_str());
-        std::abort();
+        return ncclInternalError;
     }
+    return ncclSuccess;
 }
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -404,6 +417,7 @@ inline void launch_local_reduce(
 constexpr const char* kLocalPermuteReduceJitEntryName = "nccl_ep_jit_local_permute_reduce_kernel";
 
 // 2 blocks/SM at small hidden; reg pressure fits without spilling. Grid bumped 2x in caller.
+// MXFP8 does not change this budget: the quantize epilogue only adds per-iteration temporaries.
 inline int pick_reduce_blocks_per_sm(int hidden_int4) {
     return (hidden_int4 <= 256) ? 2 : ::ht_ep::kLocalPermuteReduceBlocksPerSM;
 }
@@ -412,8 +426,10 @@ inline std::string local_permute_reduce_jit_source(
     int top_k,
     int hidden_int4,
     int blocks_per_sm,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* recipe_literal = ::nccl_ep::jit::combine_recipe_literal(recipe);
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -422,7 +438,7 @@ inline std::string local_permute_reduce_jit_source(
         << "__global__ void " << kLocalPermuteReduceJitEntryName << "(\n"
         << "    const __grid_constant__ ::ht_ep::local_permute_reduce_param_t p) {\n"
         << "  ::ht_ep::local_permute_reduce<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
-        << ">(\n"
+        << ", " << recipe_literal << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.flat_staging),\n"
         << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
         << "      p.flat2em_slot_map,\n"
@@ -436,24 +452,39 @@ inline std::string local_permute_reduce_jit_source(
     return src.str();
 }
 
-inline void launch_local_permute_reduce(
+inline ncclResult_t launch_local_permute_reduce(
     int top_k,
-    int row_bytes,
+    int input_row_bytes,
     int num_blocks,
     ::ht_ep::local_permute_reduce_param_t& param,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16) {
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t recipe) {
     static const int variant_identity = 0;
-    assert((row_bytes % 16) == 0);
-    const int hidden_int4 = row_bytes / 16;
+    // The caller passes the row the kernel reads, so hidden_int4 needs no per-recipe
+    // reasoning: the packed output width is the adapter's business, not this launcher's.
+    if ((input_row_bytes % 16) != 0) {
+        std::fprintf(stderr,
+                     "[nccl_ep jit] local-permute-reduce: %d B input row is not 16B-aligned\n",
+                     input_row_bytes);
+        return ncclInternalError;
+    }
+    // Same null contract as launch_combine: the source builder streams the literal directly.
+    if (::nccl_ep::jit::combine_recipe_literal(recipe) == nullptr) {
+        std::fprintf(
+            stderr, "[nccl_ep jit] local-permute-reduce: unsupported combine recipe %d\n", static_cast<int>(recipe));
+        return ncclInvalidArgument;
+    }
+    const int hidden_int4 = input_row_bytes / 16;
     const int blocks_per_sm = pick_reduce_blocks_per_sm(hidden_int4);
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_reduce_topk" << top_k << "_h" << hidden_int4 << "_b" << blocks_per_sm
-             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
+             << ::nccl_ep::jit::combine_recipe_name_tag(recipe);
         return name.str();
     }();
-    const std::string source = local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm, token_dtype);
+    const std::string source = local_permute_reduce_jit_source(top_k, hidden_int4, blocks_per_sm, token_dtype, recipe);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "local_permute_reduce";
@@ -461,7 +492,8 @@ inline void launch_local_permute_reduce(
     variant.source = source;
     variant.entry_name = kLocalPermuteReduceJitEntryName;
     variant.identity = &variant_identity;
-    variant.runtime_key = (static_cast<std::uint64_t>(token_dtype) << 48) |
+    variant.runtime_key = (static_cast<std::uint64_t>(recipe) << 56) |
+                          (static_cast<std::uint64_t>(token_dtype) << 48) |
                           (static_cast<std::uint64_t>(hidden_int4) << 32) |
                           (static_cast<std::uint64_t>(blocks_per_sm) << 16) | static_cast<std::uint64_t>(top_k);
     variant.num_blocks = num_blocks * blocks_per_sm;
@@ -472,11 +504,12 @@ inline void launch_local_permute_reduce(
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
-        std::fprintf(stderr, "[nccl_ep jit] fatal local-permute-reduce JIT launch failure for %s: %s%s%s\n",
+        std::fprintf(stderr, "[nccl_ep jit] local-permute-reduce JIT launch failure for %s: %s%s%s\n",
                      variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
                      error.empty() ? "" : error.c_str());
-        std::abort();
+        return ncclInternalError;
     }
+    return ncclSuccess;
 }
 
 // ======================== Push EM combine + reduce =========================

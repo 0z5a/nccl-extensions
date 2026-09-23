@@ -56,6 +56,9 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group);
 // Forward declaration for LL helper (defined alongside ll_init_handle).
 static ncclResult_t ll_resize_rdma_buffer(ncclEpGroup_t ep_group, size_t new_size);
 
+// Forward declarations used by mega-buffer sizing (definitions live later in this file).
+static bool is_internode_available(ncclEpGroup_t ep_group);
+
 // Define NCCL_CHECK_RESULT macro for NCCL error checking
 #ifndef NCCL_CHECK_RESULT
 #define NCCL_CHECK_RESULT(cmd) \
@@ -510,7 +513,9 @@ static ncclResult_t validateCombineRecipe(
     const ncclEpCombineInputs_t* inputs,
     const ncclEpCombineOutputs_t* outputs,
     const ncclEpCombineConfig_t* config,
-    unsigned int device_sm) {
+    ncclEpAlgorithm_t algorithm,
+    unsigned int device_sm,
+    bool internode) {
     const auto recipe = config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
     const ncclEpTensor_t* tokens = tensor_required(inputs->tokens);
     const ncclEpTensor_t* scales = tensor_ptr(inputs->scales);
@@ -531,6 +536,11 @@ static ncclResult_t validateCombineRecipe(
             return validate_dtype(tokens->datatype)
                 ? ncclSuccess : fail("tokens has unsupported dtype");
         case NCCL_EP_COMB_QUANT_NVFP4:
+            // LL-only, as the enum documents: the HT combine kernels have no NVFP4
+            // combine_recipe_traits specialization, so an HT call would fail JIT
+            // compilation. Reject before the HT path is entered.
+            if (algorithm != NCCL_EP_ALGO_LOW_LATENCY)
+                return fail("NVFP4 combine is supported only in LL mode");
             if (!nccl_ep::host_build_supports_fp4()) {
                 fprintf(stderr, "NCCL EP warning: NVFP4 combine requires CUDA 12.9+ with cuda_fp4.h\n");
                 return ncclInvalidUsage;
@@ -549,6 +559,42 @@ static ncclResult_t validateCombineRecipe(
                 return fail("NVFP4 requires FP32 3D inputs->scales global scales");
             }
             return ncclSuccess;
+        case NCCL_EP_COMB_QUANT_MXFP8: {
+            // HT-only: LL has no MXFP8 CombineRecipeTraits specialization, so an LL call
+            // would fail JIT compilation. Reject before the LL path is entered.
+            if (algorithm == NCCL_EP_ALGO_LOW_LATENCY)
+                return fail("MXFP8 combine is supported only in HT mode");
+            // NVLink-only. The packed [FP8 H | E8M0 H/32] row is an intra-node wire format and
+            // there is no quantized inter-node transport, so reject a multi-LSA-team group here
+            // rather than accounting for an RDMA leg everywhere downstream.
+            if (internode)
+                return fail("MXFP8 combine is single-LSA-team (NVLink) only; "
+                            "this group spans multiple LSA teams");
+            if (!nccl_ep::host_build_supports_mxfp8()) {
+                fprintf(stderr, "NCCL EP warning: MXFP8 combine requires CUDA 12.8+ (__nv_fp8_e8m0)\n");
+                return ncclInvalidUsage;
+            }
+            // Quantization is internal and fused into local_permute_reduce, so the caller
+            // always hands over BF16 rows and never a scale tensor. The layout requirement
+            // that follows from that is checked in ncclEpCombine, where the layout is known.
+            // Packed row is H + H/32 bytes; 16-byte alignment requires
+            // H % NCCL_EP_MXFP8_HIDDEN_ALIGN == 0, which also implies scale row
+            // H/32 >= 16 B for TMA when H > 0. Hidden 0 (empty-rank [0, 0]) is a
+            // valid no-op (0 is a multiple of the align).
+            const ncclEpTensor_t* out = tensor_required(outputs->tokens);
+            if (tokens->ndim != 2)
+                return fail("MXFP8 combine tokens must be 2D [recv_tokens, hidden]");
+            if (tokens->sizes[1] % NCCL_EP_MXFP8_HIDDEN_ALIGN != 0)
+                return fail("MXFP8 combine hidden dim must be a multiple of 512 "
+                            "(packed row H+H/32 must be 16-byte aligned)");
+            if (out->datatype != ncclBfloat16)
+                return fail("MXFP8 combine output tokens must be BF16");
+            if (inputs->scales != nullptr)
+                return fail("MXFP8 combine generates scales internally; inputs->scales must be null");
+            if (tokens->datatype != ncclBfloat16)
+                return fail("MXFP8 combine tokens must be BF16");
+            return ncclSuccess;
+        }
         default:
             return fail("recipe is not implemented");
     }
@@ -712,8 +758,8 @@ struct ncclEpGroup {
 
     // Resolved HT dispatch/combine tokens-per-chunk for this group. RDMA configs
     // default to HT_TOKENS_PER_CHUNK_RDMA_DEFAULT (64); LSA-only configs default to
-    // a grid-proportional size (NUM_OF_TOKENS_PER_GROUP * comm_num_sms, rounded up
-    // to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
+    // a dispatch-grid-proportional size (NUM_OF_TOKENS_PER_GROUP times the dispatch
+    // budget, rounded up to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
     int ht_tokens_per_chunk = 0;
 
     struct {
@@ -768,7 +814,8 @@ struct ncclEpGroup {
     // it (see ncclEpDispatch) without re-querying the device on every call.
     // NOTE: consumed by the EM pull-push path only for now; other EM modes do not yet use it.
     size_t device_smem_optin;
-    unsigned int comm_num_sms;      // Resolved SM count for EP kernels (from config.max_num_sms)
+    unsigned int dispatch_num_sms; // Resolved dispatch SM budget.
+    unsigned int combine_num_sms;  // Resolved combine SM budget.
     unsigned int shuffle_sms; // Resolved SM count for the shuffle kernels (local_dup, local_reduce, push-combine reduce).
     unsigned int
         preprocess_num_sms; // Resolved SM count for the preprocessing scan kernels (NCCL_EP_PREPROCESS_NUM_SMS).
@@ -815,11 +862,13 @@ struct ncclEpGroup {
         void** dispatch_expert_output_scaling_factor_buffer_ptrs;
         uint16_t** combine_expert_input_token_buffer_ptrs;
         float** combine_expert_input_prob_buffer_ptrs;
+        uint8_t** dispatch_push_count_meta_table_ptrs;
 
     // Local buffers (owned by this rank)
         void* expert_output_token;
         float* expert_output_prob;
         void* expert_output_scaling_factor;
+        uint8_t* expert_output_meta_tables;
         uint16_t* expert_input_token;
         float* expert_input_prob;
 
@@ -841,6 +890,15 @@ struct ncclEpGroup {
         uint32_t* dispatch_expected_lsa_flag_val = nullptr;
         uint64_t* combine_expected_gin_flag_val = nullptr;
         uint32_t* combine_expected_lsa_flag_val = nullptr;
+
+    // Group-shared count-mode / EM local-permute scratch. Written-before-read within each
+    // dispatch/combine, so group-scoping stays PP-safe. Managed by alloc/free helpers.
+        struct CountScratch {
+        // Per-expert EM permute write cursors; zeroed and consumed within a single dispatch.
+            int32_t* em_permute_cursors = nullptr;
+        // FLAT recv-slot weights (EM local-permute only). Sized by kEpCountMaxTopk.
+            float* recv_topk_weights_flat = nullptr;
+        } count_scratch;
 
     // RDMA buffers (multi-LSA-team only)
         uint64_t* dispatch_gin_G2S_flags;
@@ -869,6 +927,8 @@ struct ncclEpGroup {
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
         size_t ipc_dispatch_scaling_factor_offset = 0;  // QUANT_FWD per-block output-scales region in the mega buffer
+        size_t ipc_dispatch_meta_tables_offset = 0;   // count-mode receiver EM tables: [LERM meta] + published count rows
+        size_t published_offset = 0; // sender-published count rows offset within the tables region
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
 
@@ -893,7 +953,7 @@ struct ncclEpGroup {
         : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
           num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
-          last_ll_combine_warps_per_group(0), device_smem_optin(0), comm_num_sms(0), shuffle_sms(0),
+          last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
           node_id(0), num_nccl_comms(0), nccl_comms{}, nccl_dev_comms(nullptr), nccl_wins(nullptr),
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
@@ -1035,6 +1095,34 @@ buildIntranodePtrArray(const ncclEpGroup_t group, const ncclEpTensor_t* tensor, 
 static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group);
 static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t stream, unsigned int* num_recv_tokens);
 
+// Allocate group-shared count-mode / EM local-permute scratch buffers.
+static void alloc_ht_count_scratch(ncclEpGroup_t ep_group) {
+    // +1 trailing int: DROP-mode phantom-row fixup's grid arrival counter (see
+    // local_permute_dup_param_t::allow_overflow_drop in ht_ep.cuh).
+    CUDA_CHECK(ep_group->alloc.alloc_fn(
+        reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.em_permute_cursors),
+        static_cast<size_t>(ep_group->num_local_experts + 1) * sizeof(int32_t), ep_group->alloc.context));
+    // FLAT recv-slot weights only exist for EM local-permute; sized by the fixed cap.
+    if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute) {
+        CUDA_CHECK(ep_group->alloc.alloc_fn(
+            reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.recv_topk_weights_flat),
+            static_cast<size_t>(ep_group->max_recv_tokens) * nccl_ep::ht::kEpCountMaxTopk * sizeof(float),
+            ep_group->alloc.context));
+    }
+}
+
+// Free group-shared count-mode / EM local-permute scratch buffers.
+static void free_ht_count_scratch(ncclEpGroup_t ep_group) {
+    if (ep_group->ht_buffers.count_scratch.em_permute_cursors) {
+        ep_group->alloc.free_fn(ep_group->ht_buffers.count_scratch.em_permute_cursors, ep_group->alloc.context);
+        ep_group->ht_buffers.count_scratch.em_permute_cursors = nullptr;
+    }
+    if (ep_group->ht_buffers.count_scratch.recv_topk_weights_flat) {
+        ep_group->alloc.free_fn(ep_group->ht_buffers.count_scratch.recv_topk_weights_flat, ep_group->alloc.context);
+        ep_group->ht_buffers.count_scratch.recv_topk_weights_flat = nullptr;
+    }
+}
+
 // HT Intra-LSA Initialization (adapted for public NCCL APIs)
 static ncclResult_t
 init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
@@ -1099,11 +1187,57 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     size_t dispatch_token_aligned = skip_token_staging ? 0 : align_ipc(expert_output_token_sz);
     size_t dispatch_prob_aligned = align_ipc(expert_output_prob_sz);
     size_t dispatch_sf_aligned = align_ipc(expert_output_scaling_factor_sz);
+    // Count-mode receiver EM tables: LERM bitmap rows, then one [cnt_rank | cnt_expert] row
+    // per sender. Single-LSA-team only; per-token weights are receiver-local and stay out
+    // of this IPC region.
+    // LERM is a packed bitmap: ceil(num_local_experts/64) u64 words per slot.
+    const size_t lerm_words = nccl_ep::ceil_div<size_t>(static_cast<size_t>(num_local_experts), 64);
+    // Group half of dispatch_push_count_capable(); when false, the LERM/count-row region below
+    // is dead space and skipped.
+    const bool group_count_capable =
+        !nccl_ep_env_flag_on(ep_group->env.ht_em_ag_scan_mode) &&
+        !is_internode_available(ep_group) &&
+        ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute;
+    // LERM bitmap rows, then one published [cnt_rank | cnt_expert] count row per sender.
+    // Both regions are skipped when the group can't take the count path.
+    size_t published_offset = 0;
+    size_t dispatch_meta_tables_aligned = 0;
+    if (group_count_capable) {
+        const size_t count_row_ints =
+            static_cast<size_t>(ep_group->nRanks) + ep_group->config.num_experts;
+        published_offset = align_ipc(max_output_slots * lerm_words * sizeof(uint64_t));
+        dispatch_meta_tables_aligned =
+            published_offset +
+            align_ipc(static_cast<size_t>(ep_group->nRanks) * count_row_ints * sizeof(int32_t));
+    }
+    ep_group->ht_buffers.published_offset = published_offset;
     size_t combine_token_aligned = skip_token_staging ? 0 : align_ipc(expert_input_token_sz);
     size_t combine_prob_aligned = align_ipc(expert_input_prob_sz);
 
-    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned +
-                     combine_prob_aligned;
+    struct StagingSegment {
+        const char* name;
+        size_t size;
+    };
+    const StagingSegment staging_segments[] = {
+        {"dispatch token", dispatch_token_aligned},
+        {"dispatch probability", dispatch_prob_aligned},
+        {"dispatch scaling factor", dispatch_sf_aligned},
+        {"combine token", combine_token_aligned},
+        {"combine probability", combine_prob_aligned},
+    };
+    for (const StagingSegment& segment : staging_segments) {
+        if ((segment.size & 255) != 0) {
+            std::fprintf(
+                stderr,
+                "NCCL EP: HT %s staging segment size is not 256-byte aligned (%zu bytes)\n",
+                segment.name,
+                segment.size);
+            return ncclInternalError;
+        }
+    }
+
+    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned +
+                     dispatch_meta_tables_aligned + combine_token_aligned + combine_prob_aligned;
     {
         ncclResult_t mega_res = ncclMemAlloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz);
         if (mega_res != ncclSuccess) epWarnMegaBufferAllocFailed(ep_group, mega_sz);
@@ -1112,32 +1246,53 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.ipc_mega_buffer_size = mega_sz;
 
     uint8_t* mega_base = static_cast<uint8_t*>(ep_group->ht_buffers.ipc_mega_buffer);
+    if ((reinterpret_cast<uintptr_t>(mega_base) & 255) != 0) {
+        std::fprintf(
+            stderr,
+            "NCCL EP: HT staging mega-buffer is not 256-byte aligned (%p)\n",
+            static_cast<void*>(mega_base));
+        return ncclInternalError;
+    }
+    // Chain each region offset off the previous one so the layout stays correct if a
+    // segment size changes: offset[n] = offset[n-1] + size[n-1].
     ep_group->ht_buffers.ipc_dispatch_token_offset = 0;
     ep_group->ht_buffers.expert_output_token = skip_token_staging ? nullptr : mega_base;
 
-    ep_group->ht_buffers.ipc_dispatch_prob_offset = dispatch_token_aligned;
-    ep_group->ht_buffers.expert_output_prob = reinterpret_cast<float*>(mega_base + dispatch_token_aligned);
+    ep_group->ht_buffers.ipc_dispatch_prob_offset =
+        ep_group->ht_buffers.ipc_dispatch_token_offset + dispatch_token_aligned;
+    ep_group->ht_buffers.expert_output_prob =
+        reinterpret_cast<float*>(mega_base + ep_group->ht_buffers.ipc_dispatch_prob_offset);
 
     // QUANT_FWD output-scales region (after token+prob; shifts combine offsets by dispatch_sf_aligned).
-    ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset = dispatch_token_aligned + dispatch_prob_aligned;
+    ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset =
+        ep_group->ht_buffers.ipc_dispatch_prob_offset + dispatch_prob_aligned;
     ep_group->ht_buffers.expert_output_scaling_factor =
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned;
+        mega_base + ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset;
+
+    ep_group->ht_buffers.ipc_dispatch_meta_tables_offset =
+        ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset + dispatch_sf_aligned;
+    ep_group->ht_buffers.expert_output_meta_tables =
+        mega_base + ep_group->ht_buffers.ipc_dispatch_meta_tables_offset;
+    // One-time zero of the count landing rows (bootstrap only; overwritten per round).
+    CUDA_CHECK(cudaMemsetAsync(
+        ep_group->ht_buffers.expert_output_meta_tables + published_offset, 0,
+        dispatch_meta_tables_aligned - published_offset, stream));
 
     ep_group->ht_buffers.ipc_combine_token_offset =
-        dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned;
+        ep_group->ht_buffers.ipc_dispatch_meta_tables_offset + dispatch_meta_tables_aligned;
     ep_group->ht_buffers.expert_input_token =
-        skip_token_staging ? nullptr
-                           : reinterpret_cast<uint16_t*>(
-                                 mega_base + dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned);
+        skip_token_staging ? nullptr :
+                    reinterpret_cast<uint16_t*>(mega_base + ep_group->ht_buffers.ipc_combine_token_offset);
 
     ep_group->ht_buffers.ipc_combine_prob_offset =
-        dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned;
-    ep_group->ht_buffers.expert_input_prob = reinterpret_cast<float*>(
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned + dispatch_sf_aligned + combine_token_aligned);
+        ep_group->ht_buffers.ipc_combine_token_offset + combine_token_aligned;
+    ep_group->ht_buffers.expert_input_prob =
+        reinterpret_cast<float*>(mega_base + ep_group->ht_buffers.ipc_combine_prob_offset);
 
     // Host pointer arrays indexed by HT local rank within LSA team.
     size_t host_block_sz = sizeof(void*) * lsa_ranks + sizeof(float*) * lsa_ranks // dispatch prob
-                           + sizeof(void*) * lsa_ranks // dispatch scales
+                           + sizeof(void*) * lsa_ranks     // dispatch scales
+                           + sizeof(uint8_t*) * lsa_ranks  // dispatch count tables (count mode)
                            + sizeof(uint16_t*) * lsa_ranks + sizeof(float*) * lsa_ranks;
     CUDA_CHECK(cudaHostAlloc(&ep_group->ht_buffers.host_ptr_block, host_block_sz, cudaHostAllocMapped));
 
@@ -1148,6 +1303,8 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     hptr += sizeof(float*) * lsa_ranks;
     ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs = reinterpret_cast<void**>(hptr);
     hptr += sizeof(void*) * lsa_ranks;
+    ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs = reinterpret_cast<uint8_t**>(hptr);
+    hptr += sizeof(uint8_t*) * lsa_ranks;
     ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs = reinterpret_cast<uint16_t**>(hptr);
     hptr += sizeof(uint16_t*) * lsa_ranks;
     ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
@@ -1195,6 +1352,9 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
+    // Group-shared count-mode / EM local-permute scratch (zeroed/written per dispatch).
+    alloc_ht_count_scratch(ep_group);
+
     // =========================================================================
     // Phase 2: Register windows for shared intra-LSA regions
     // Consolidated registration: mega buffer (token+prob+combine) & completion flags
@@ -1226,6 +1386,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_prob;
             ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
                 ep_group->ht_buffers.expert_output_scaling_factor;
+            ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs[i] = ep_group->ht_buffers.expert_output_meta_tables;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_token;
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] = ep_group->ht_buffers.expert_input_prob;
         } else {
@@ -1234,12 +1395,22 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             NCCL_CHECK_RESULT(
                 ncclGetPeerDevicePointer(ep_group->ht_buffers.intranode_mega_window, 0, peer_global, &peer_base));
             uint8_t* pb = static_cast<uint8_t*>(peer_base);
+            if ((reinterpret_cast<uintptr_t>(pb) & 255) != 0) {
+                std::fprintf(
+                    stderr,
+                    "NCCL EP: HT staging peer pointer for rank %d is not 256-byte aligned (%p)\n",
+                    peer_global,
+                    peer_base);
+                return ncclInternalError;
+            }
             ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
                 skip_token_staging ? nullptr : pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
                 reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_prob_offset);
             ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs[i] =
                 pb + ep_group->ht_buffers.ipc_dispatch_scaling_factor_offset;
+            ep_group->ht_buffers.dispatch_push_count_meta_table_ptrs[i] =
+                pb + ep_group->ht_buffers.ipc_dispatch_meta_tables_offset;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
                 skip_token_staging ? nullptr : reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
@@ -1284,6 +1455,7 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.expert_output_token = nullptr;
         ep_group->ht_buffers.expert_output_prob = nullptr;
         ep_group->ht_buffers.expert_output_scaling_factor = nullptr;
+        ep_group->ht_buffers.expert_output_meta_tables = nullptr;
         ep_group->ht_buffers.expert_input_token = nullptr;
         ep_group->ht_buffers.expert_input_prob = nullptr;
     }
@@ -1298,6 +1470,9 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.combine_expected_gin_flag_val = nullptr;
         ep_group->ht_buffers.combine_expected_lsa_flag_val = nullptr;
     }
+
+    // Free group-shared count-mode / EM local-permute scratch
+    free_ht_count_scratch(ep_group);
 
     // Free merged completion flags local allocation
     if (ep_group->ht_buffers.completion_flags_base) {
@@ -1352,10 +1527,12 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->gin_config.num_dcomms = 1;
         ep_group->gin_config.dcomms = new ncclDevComm_t[1];
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        // Dispatch uses one LSA barrier session per launched CTA. Keep the
-        // compile-time combine-tail session available when fewer CTAs are requested.
+        // Dispatch indexes one LSA barrier session per CTA with blockIdx.x.
+        // Combine synchronizes through a single tail CTA at the next session,
+        // so its SM budget does not increase the required session count.
+        // Keep the compile-time dispatch range available for specialized kernels.
         reqs.lsaBarrierCount =
-            std::max<int>(ep_group->comm_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
+            std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
         CUDACHECK_RET(cudaMalloc(
             reinterpret_cast<void**>(&ep_group->gin_config.d_dcomms),
@@ -1511,7 +1688,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     }
 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
-    int min_required_ctx = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+    // Only dispatch has dedicated cross-node warps per CTA. Combine selects
+    // channels from the resulting shared context pool, so its SM budget does
+    // not impose an additional per-CTA minimum here.
+    int min_required_ctx =
+        NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
     if (qps_per_rank < min_required_ctx) {
         fprintf(stderr,
@@ -1555,10 +1736,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
         reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
-        // One session per launched dispatch CTA plus the combine-tail session.
-        // This must follow the resolved SM count, not just the default grid size.
+        // Dispatch uses sessions [0, dispatch_num_sms); all combine CTAs rendezvous
+        // through one tail CTA at session dispatch_num_sms. Therefore
+        // combine_num_sms does not affect this resource count.
         reqs.lsaBarrierCount =
-            std::max<int>(ep_group->comm_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
+            std::max<int>(ep_group->dispatch_num_sms, NCCL_EP_HT_DISPATCH_BLOCKS) + 1;
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -1778,31 +1960,51 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         &ep_group->max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, ep_group->cuda_device_id));
     ep_group->device_smem_optin = device_prop.sharedMemPerBlockOptin;
 
-    // Resolve SM counts for EP kernels (dispatch, combine, preprocessing)
-    if (in_config->max_num_sms == NCCL_EP_AUTO) {
-        if (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
-            ep_group->comm_num_sms = NCCL_EP_HT_DFLT_NUM_SMS;
-        } else {
-            ep_group->comm_num_sms = ep_group->device_sm_count;
-        }
-        ep_group->shuffle_sms = ep_group->device_sm_count;
-        ep_group->preprocess_num_sms = ep_group->device_sm_count;
-    } else {
+    // Resolve the shared budget first. New operation-specific config fields
+    // inherit it when AUTO, preserving the V1/V2 behavior exactly.
+    const unsigned int default_comm_sms =
+        in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT ?
+            NCCL_EP_HT_DFLT_NUM_SMS :
+            ep_group->device_sm_count;
+    unsigned int shared_num_sms = default_comm_sms;
+    if (in_config->max_num_sms != NCCL_EP_AUTO) {
         if (in_config->max_num_sms > ep_group->device_sm_count) {
             fprintf(stderr, "Error: NCCL EP requires max_num_sms <= device_sm_count\n");
             return ncclInvalidUsage;
         }
-        ep_group->comm_num_sms = in_config->max_num_sms;
-        ep_group->shuffle_sms = in_config->max_num_sms;
-        // Preprocessing scan defaults to all device SMs, not the comm/max_num_sms budget, so a
-        // small comm budget does not throttle it (its cost scales inversely with block count).
-        // Overridable via NCCL_EP_PREPROCESS_NUM_SMS.
-        ep_group->preprocess_num_sms = ep_group->device_sm_count;
+        shared_num_sms = in_config->max_num_sms;
     }
+    // Resolve an operation-specific config value, inheriting the already
+    // resolved legacy/default budget when the new field is left as AUTO.
+    auto resolve_config_sms = [dev_sms = ep_group->device_sm_count](
+                                  const char* name, unsigned int requested, unsigned int fallback,
+                                  unsigned int* resolved) -> ncclResult_t {
+        if (requested == NCCL_EP_AUTO) {
+            *resolved = fallback;
+            return ncclSuccess;
+        }
+        if (requested > dev_sms) {
+            fprintf(stderr, "Error: NCCL EP requires %s <= device_sm_count (%u)\n", name, dev_sms);
+            return ncclInvalidUsage;
+        }
+        *resolved = requested;
+        return ncclSuccess;
+    };
+    NCCL_CHECK_RESULT(resolve_config_sms(
+        "dispatch_num_sms", in_config->dispatch_num_sms, shared_num_sms, &ep_group->dispatch_num_sms));
+    NCCL_CHECK_RESULT(resolve_config_sms(
+        "combine_num_sms", in_config->combine_num_sms, shared_num_sms, &ep_group->combine_num_sms));
+    ep_group->shuffle_sms =
+        in_config->max_num_sms == NCCL_EP_AUTO ? ep_group->device_sm_count : in_config->max_num_sms;
+    // Preprocessing defaults to all device SMs so a small communication budget
+    // does not throttle its scan kernels.
+    ep_group->preprocess_num_sms = ep_group->device_sm_count;
 
-    // Apply an env-provided SM-count override, validated against [1, device_sm_count].
-    // Out-of-range values are warned about and the resolved default is kept.
+    // Apply env overrides. Precedence is operation env > legacy shared env >
+    // operation config > legacy shared config > algorithm default.
     const unsigned int dev_sms = ep_group->device_sm_count;
+    // Apply one environment override without discarding the lower-precedence
+    // value when the override is invalid.
     auto apply_sms_override = [dev_sms, &env = ep_group->env](const ncclEpEnvVar& var, unsigned int& target) {
         if (!var.is_set) return;
         if (var.value.ul >= 1 && var.value.ul <= dev_sms) {
@@ -1810,30 +2012,38 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         } else {
             fprintf(stderr, "[nccl_ep] %s=%lu out of range (must be in [1, %u]); using %u\n", var.name, var.value.ul,
                     dev_sms, target);
-            // Dump the full env configuration to help diagnose the misconfig.
             nccl_ep_env_print(env);
         }
     };
-    apply_sms_override(ep_group->env.comm_num_sms, ep_group->comm_num_sms);
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->dispatch_num_sms);
+    apply_sms_override(ep_group->env.comm_num_sms, ep_group->combine_num_sms);
+    apply_sms_override(ep_group->env.dispatch_num_sms, ep_group->dispatch_num_sms);
+    apply_sms_override(ep_group->env.combine_num_sms, ep_group->combine_num_sms);
     apply_sms_override(ep_group->env.shuffle_sms, ep_group->shuffle_sms);
     apply_sms_override(ep_group->env.preprocess_num_sms, ep_group->preprocess_num_sms);
 
-    // LL warp-group bound. Validate the RESOLVED comm SM count
+    // LL warp-group bound applies independently to both operation grids.
     if (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        // This reflects the current limitation of the LL backend
-        // TODO: validate that the limitation is valid and if need - relax it in a follow-up fix
         constexpr int llMaxWarpGroupsLimit = nccl_ep::ll::kLlDispatchMaxWarpGroups;
         const int num_experts = ep_group->config.num_experts;
-        const int sms = static_cast<int>(ep_group->comm_num_sms);
-        const int numWarpGroups = (num_experts + (sms - 1)) / sms;
-        if (numWarpGroups > llMaxWarpGroupsLimit) {
-            const int required_sms = (num_experts + (llMaxWarpGroupsLimit - 1)) / llMaxWarpGroupsLimit;
-            fprintf(stderr,
-                    "Error: insufficient comm SM count for Low-Latency mode: %d SMs with %d "
-                    "experts gives %d warp groups (max %d). Need >= %d SMs -- raise "
-                    "ncclEpGroupConfig_t::max_num_sms or NCCL_EP_COMM_SMS.\n",
-                    sms, num_experts, numWarpGroups, llMaxWarpGroupsLimit, required_sms);
-            return ncclInvalidUsage;
+        const struct {
+            const char* operation;
+            unsigned int sms;
+        } budgets[] = {
+            {"dispatch", ep_group->dispatch_num_sms},
+            {"combine", ep_group->combine_num_sms},
+        };
+        for (const auto& budget : budgets) {
+            const int numWarpGroups = (num_experts + static_cast<int>(budget.sms) - 1) / budget.sms;
+            if (numWarpGroups > llMaxWarpGroupsLimit) {
+                const int required_sms = (num_experts + llMaxWarpGroupsLimit - 1) / llMaxWarpGroupsLimit;
+                fprintf(stderr,
+                        "Error: insufficient %s SM count for Low-Latency mode: %u SMs with %d "
+                        "experts gives %d warp groups (max %d). Need >= %d SMs.\n",
+                        budget.operation, budget.sms, num_experts, numWarpGroups,
+                        llMaxWarpGroupsLimit, required_sms);
+                return ncclInvalidUsage;
+            }
         }
     }
 
@@ -1897,8 +2107,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
 
     if (ep_group->config.num_qp_per_rank == NCCL_EP_AUTO) {
+        // Dispatch dedicates N2N warps per CTA; combine reuses this pool.
         ep_group->config.num_qp_per_rank =
-            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
+            NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->dispatch_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     }
 
     // Resolve timeout_cycles: env var > config field > compile-time default
@@ -2038,8 +2249,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     if (ht_mode) {
         // Resolve the dispatch/combine tokens-per-chunk for this group. RDMA
         // (multi-LSA-team) configs use the tuned 64-token default; LSA-only configs
-        // use a grid-proportional size so one chunk is one wave across all SMs
-        // (NUM_OF_TOKENS_PER_GROUP tokens per SM). Either may be overridden by
+        // use a dispatch-grid-proportional size so one chunk is one wave across
+        // the dispatch SMs (NUM_OF_TOKENS_PER_GROUP tokens per SM). This keeps
+        // combine grid tuning from changing dispatch scheduling. Either may be overridden by
         // NCCL_EP_TOKENS_PER_CHUNK. The chunk must be a multiple of 32 (warp width;
         // also covers the uint4 routing-map-load and token-group granularities), so
         // non-conforming values are rounded up with a warning.
@@ -2047,7 +2259,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         int chunk =
             (ep_group->rdma_team_size > 1) ?
                 HT_TOKENS_PER_CHUNK_RDMA_DEFAULT :
-                round_up_32(NCCL_EP_HT_COMBINE_TOK_PER_GROUP * static_cast<int>(ep_group->comm_num_sms));
+                round_up_32(
+                    NCCL_EP_HT_COMBINE_TOK_PER_GROUP * static_cast<int>(ep_group->dispatch_num_sms));
         if (ep_group->env.tokens_per_chunk.is_set && ep_group->env.tokens_per_chunk.value.ul > 0) {
             const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
             chunk = round_up_32(requested);
@@ -2437,6 +2650,26 @@ struct ncclEpHandle {
             int64_t* expert_token_offsets; // [experts_per_rank] written by remap kernel
             int32_t* per_expert_counts_active; // alias to authoritative counts buffer
 
+            // Count mode, always used (both fused and unfused meta dispatch): per-handle scratch
+            // that persists UpdateHandle -> Dispatch, grouped so the count metadata stays one unit.
+            struct {
+                // own_chunk_rank holds this rank's per-source-chunk per-dest-rank send counts so the
+                // s2d build assigns slots deterministically (rank-major, sender token order) without
+                // a global atomic.
+                int32_t*  own_chunk_rank;             // [max_src_chunks * lsa_team_size]
+                int32_t*  per_src_lteam_num_tokens;    // [num_lsa_teams] per-source-LSA-team token counts
+                uint64_t* token_dst_rank_bitmap;      // [max_tokens, ceil(nRanks/64)] per-token dest-rank bitmap
+                bool*     lerm_landing;               // IPC LERM landing zone (sender-written, permute input)
+                // Fused meta dispatch: histogram writes this rank's own count row here (comm-free);
+                // the dispatch head fans it out to the LSA peers, so UpdateHandle does no exchange.
+                int32_t*  own_row;                    // [nRanks + num_experts] own count row
+                // Unfused meta dispatch (caller requests layout_info): UpdateHandle AllGathers every
+                // sender's count row into this per-handle buffer (PP-safe); dispatch MAP warps read it
+                // in place of the fused fan-out. fused_meta_dispatch=false marks it populated this round.
+                int32_t*  cached_cnt_rows;            // [nRanks * (nRanks + num_experts)]
+                bool      fused_meta_dispatch;
+            } dispatch_push_count;
+
             // EM local-fanout dup-groups (allocated iff mode == kLocalDup). Written by EM
             // scan; consumed by local_dup (post-dispatch) and local_reduce (pre-combine).
             int32_t* emuf_group_buf;
@@ -2450,18 +2683,14 @@ struct ncclEpHandle {
             void* topk_idx;
 
             // FLAT-dispatch + local-permute scratch (EM-permute path only).
-            // flat2em_slot_map, recv_topk_weights_flat and token_to_recv_slot
-            // are all null when em_local_permute_enabled() is false.
-            // In em-permute mode sparse_to_dense_map is FLAT-shape
-            // (inner=lsa_team_size).
+            // flat2em_slot_map and token_to_recv_slot are null when em_local_permute_enabled()
+            // is false. In em-permute mode sparse_to_dense_map is FLAT-shape (inner=lsa_team_size).
             //
             // Mapping from the local-node FLAT slot index to the Expert-major
             // slot in the output tensor. Shape [max_recv_tokens, top_k]
             // (invalid positions are -1). Written by em_scan_kernel during
             // UpdateHandle, read by the local-permute kernels.
             int32_t* flat2em_slot_map;
-            // Per-FLAT-slot topk weights; populated by dense_to_sparse_prob.
-            float* recv_topk_weights_flat;
             // [num_total_attn_tokens] FLAT recv slot per global attention
             // token; -1 when the token has no local-rank hit. Populated by
             // scan_impl_flat in em-permute mode; consumed by em_scan_kernel
@@ -2503,6 +2732,28 @@ static bool em_local_permute_enabled(ncclEpGroup_t group, ncclEpLayout_t layout)
 }
 static inline bool em_local_permute_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
     return em_local_permute_enabled(group, handle->layout);
+}
+
+// Fused-meta-dispatch (count exchange) gate: replaces the bitmap AllGather + global scan
+// with a device-side histogram push and receiver-local EM rebuild. EM local-permute,
+// single-LSA-team only; disabled by NCCL_EP_HT_EM_AG_SCAN_MODE. Layout sizing and handle
+// activation share this gate so they never disagree.
+static inline bool dispatch_push_count_capable(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    // kPullPush is also EM local-permute but always uses the scan path (order-preserving
+    // uint16 map), so it is excluded here.
+    return !nccl_ep_env_flag_on(group->env.ht_em_ag_scan_mode) &&
+           !is_internode_available(group) &&
+           em_local_permute_enabled(group, layout) &&
+           group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute;
+}
+static inline bool dispatch_push_count_active(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    return dispatch_push_count_capable(group, handle->layout);
+}
+
+// handle->ht.topk_idx mirrors the caller's native width on the scan path, but count mode's
+// cache (build_count_metadata) is always widened to int64.
+static inline bool topk_idx_cache_is_int32(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    return handle->topk_idx.datatype == ncclInt32 && !dispatch_push_count_active(group, handle);
 }
 
 // Pull EM dispatch: a variant of em_permute that pulls source rows over NVLink
@@ -2565,8 +2816,10 @@ struct HtBlockLayout {
     int emuf_max_groups; // capacity in rows; kernel must not exceed
     // EM-permute scratch (handle mem).
     size_t sz_flat2em_slot_map;
-    size_t sz_recv_topk_weights_flat;
     size_t sz_token_to_recv_slot;
+    // Count-mode scratch (EM-permute count mode): sender chunk/rank/expert counts, token bitmap,
+    // own + gathered count rows.
+    size_t sz_count_scratch;
     size_t sz_recv_slot_to_src; // pull dispatch only
     size_t sz_srcpos_map;       // pull dispatch only
     size_t zero_region, no_memset_region, total;
@@ -2587,11 +2840,22 @@ struct HtBlockLayout {
         // path needs but pull does not.
         const bool needs_pull_buffers = em_pull_enabled(ep_group, layout);
 
+        // Fused-meta-dispatch sizing gate (same helper the runtime path uses). When capable,
+        // weights alias the own-rank IPC table region (see ht_init_handle) and flat2em/LERM live
+        // in per-handle scratch; the scan-only token_to_recv_slot is not allocated.
+        const bool count_mode_capable = dispatch_push_count_capable(ep_group, layout);
+
         HtBlockLayout L = {};
         L.sz_r2a = align256(static_cast<size_t>(rdma_team_size) * padded_max_tokens * sizeof(bool));
         L.sz_a2r =
             (rdma_team_size > 1) ? align256(static_cast<size_t>(max_tokens) * (rdma_team_size - 1) * sizeof(bool)) : 0;
-        L.sz_ler = align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
+        // Count mode persists LERM as a packed bitmap (ceil(epr/64) u64 words per slot); scan
+        // mode as one bool per expert. Per-handle so combine reads a private copy (the FWD
+        // permute writes it here from the sender-written IPC landing zone).
+        L.sz_ler = count_mode_capable ?
+                       align256(static_cast<size_t>(ep_group->max_recv_tokens) *
+                                nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)) :
+                       align256(static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool));
         L.sz_ntfe = align256(sizeof(int32_t));
         // S2D inner_dim: num_topk for nvlink_dup/local_dup EM (packed rank/slot); lsa_team_size
         // for FLAT and for EM-permute (unified FLAT-shape s2d — em_scan_kernel's
@@ -2641,9 +2905,9 @@ struct HtBlockLayout {
         const size_t max_flat_recv_tokens =
             std::min<size_t>(static_cast<size_t>(max_recv_tokens),
                              static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size);
-        // EM-permute scratch: only when EM + !zero_copy_on (env-var flip handled at call time).
-        // pull-push caps rows at the recv-token count; em-local-permute keeps full
-        // max_recv_tokens sizing.
+        // EM-permute scratch: flat2em is per-handle for scan, count, and pull. recv-slot
+        // weights are group-shared (ht_buffers.count_scratch.recv_topk_weights_flat). pull-push caps rows
+        // at the recv-token count; the other EM paths keep full max_recv_tokens sizing.
         // TODO(em-local-permute): baseline over-sizes by a num_topk factor; cap at
         // max_flat_recv_tokens once its flat2em indexing is confirmed recv-token-bounded.
         L.sz_flat2em_slot_map =
@@ -2651,18 +2915,32 @@ struct HtBlockLayout {
                 ? align256((needs_pull_buffers ? max_flat_recv_tokens : static_cast<size_t>(max_recv_tokens)) *
                            num_topk * sizeof(int32_t))
                 : 0;
-        // recv_topk_weights_flat: FLAT per-recv-token weight scratch used only by the
-        // local-permute (kLocalPermute) EM path. Pull dispatch reads weights straight
-        // from the source rank, so it is unused under pull (needs_pull_buffers).
-        L.sz_recv_topk_weights_flat = (em_permute && num_topk > 0 && !needs_pull_buffers) ?
-                                          align256(static_cast<size_t>(max_recv_tokens) * num_topk * sizeof(float)) :
-                                          0;
-        // EM-shape LERM mirrors sz_ler size; needs to be zero-initialised so
-        // em_scan_kernel can write only the local-rank's em_slot rows.
+        // [num_total_attn_tokens] FLAT recv slot per global attention token, filled by
+        // scan_impl_flat (scan and pull paths; count never runs the scan that fills it).
         // num_total_attn_tokens = max_tokens * lsa_team_size * rdma_team_size.
         L.sz_token_to_recv_slot =
-            em_permute ? align256(static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size * sizeof(int32_t)) :
-                         0;
+            (em_permute && !count_mode_capable) ?
+                align256(static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size * sizeof(int32_t)) :
+                0;
+        // Count-mode scratch (EM-permute): sender-local per-chunk per-dest-rank counts and the
+        // token bitmap, followed by the own/gathered count rows. The receiver count-landing rows
+        // live in the IPC table region. Only allocated in count mode.
+        const size_t max_src_chunks = (static_cast<size_t>(max_tokens) + ep_group->ht_tokens_per_chunk - 1) /
+                                  ep_group->ht_tokens_per_chunk;
+        // token_dst_rank_bitmap is ceil(nRanks/64) u64 words per token (matches the histogram's
+        // hit_words = (lsa_team_size + 63) / 64); >1 word once nRanks exceeds 64.
+        const size_t cnt_hit_words = nccl_ep::ceil_div<size_t>(static_cast<size_t>(ep_group->nRanks), 64);
+        L.sz_count_scratch =
+            count_mode_capable
+                ? align256((max_src_chunks * lsa_team_size + rdma_team_size) * sizeof(int32_t)) +
+                      align256(static_cast<size_t>(max_tokens) * cnt_hit_words * sizeof(uint64_t)) +
+                      // Per-handle own count row [cnt_rank(nRanks) | cnt_expert(num_experts)]:
+                      // the histogram writes it here (comm-free), the dispatch head fans it out.
+                      align256(static_cast<size_t>(ep_group->nRanks + num_experts) * sizeof(int32_t)) +
+                      // Per-handle AllGather landing for every sender's count row (unfused path).
+                      align256(static_cast<size_t>(ep_group->nRanks) *
+                               (ep_group->nRanks + num_experts) * sizeof(int32_t))
+                : 0;
         // Pull dispatch inverse map, indexed by recv slot. Written only for kept
         // slots by the scan; no zero-init needed (unread slots aren't pulled).
         L.sz_recv_slot_to_src =
@@ -2674,7 +2952,7 @@ struct HtBlockLayout {
         L.zero_region = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
         L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
                              L.sz_emuf_group_buf + L.sz_emuf_group_count + L.sz_flat2em_slot_map +
-                             L.sz_recv_topk_weights_flat + L.sz_token_to_recv_slot + L.sz_recv_slot_to_src +
+                             L.sz_token_to_recv_slot + L.sz_count_scratch + L.sz_recv_slot_to_src +
                              L.sz_srcpos_map;
         L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
         return L;
@@ -2767,11 +3045,11 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
         return ncclInvalidArgument;
     }
 
-    const int num_device_sms = static_cast<int>(ep_group->comm_num_sms);
+    const int num_device_sms = static_cast<int>(ep_group->dispatch_num_sms);
     if (num_device_sms <= 0) return ncclInvalidUsage;
     const int num_warp_groups = (ep_group->config.num_experts + num_device_sms - 1) / num_device_sms;
     if (num_warp_groups <= 0 || num_warp_groups > nccl_ep::ll::kLlDispatchMaxWarpGroups) {
-        fprintf(stderr, "ncclEpInitHandle: LL warp-group geometry is unsupported: num_experts=%u, comm_sms=%d, warp_groups=%d\n",
+        fprintf(stderr, "ncclEpInitHandle: LL warp-group geometry is unsupported: num_experts=%u, dispatch_sms=%d, warp_groups=%d\n",
                 ep_group->config.num_experts, num_device_sms, num_warp_groups);
         return ncclInvalidUsage;
     }
@@ -2779,7 +3057,7 @@ static ncclResult_t validate_ll_geometry(const ncclEpGroup_t ep_group, int num_t
     const int num_warps = num_warp_groups * num_warps_per_group;
     if (num_warps_per_group <= 0 || num_topk + nccl_ep::ll::kLlDispatchControlWarps > num_warps) {
         fprintf(stderr,
-                "ncclEpInitHandle: LL top-k geometry is unsupported: top-k=%d, num_experts=%u, comm_sms=%d, "
+                "ncclEpInitHandle: LL top-k geometry is unsupported: top-k=%d, num_experts=%u, dispatch_sms=%d, "
                 "warp_groups=%d, launched_warps=%d, forwarding_warps=%d\n",
                 num_topk, ep_group->config.num_experts, num_device_sms, num_warp_groups, num_warps,
                 std::max(0, num_warps - nccl_ep::ll::kLlDispatchControlWarps));
@@ -2872,10 +3150,51 @@ ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     return ncclSuccess;
 }
 
+// Lays out the count-mode per-handle scratch fields (see ht.dispatch_push_count docstring) at ptr + offset,
+// or nulls them out when the handle has no count scratch (sz_count_scratch == 0).
+static void ht_assign_count_scratch(ncclEpHandle_t handle, ncclEpGroup_t ep_group, char* ptr, size_t offset,
+                                     size_t sz_count_scratch) {
+    if (sz_count_scratch == 0) {
+        handle->ht.dispatch_push_count.own_chunk_rank = nullptr;
+        handle->ht.dispatch_push_count.per_src_lteam_num_tokens = nullptr;
+        handle->ht.dispatch_push_count.token_dst_rank_bitmap = nullptr;
+        handle->ht.dispatch_push_count.own_row = nullptr;
+        handle->ht.dispatch_push_count.cached_cnt_rows = nullptr;
+        handle->ht.dispatch_push_count.fused_meta_dispatch = true;
+        handle->ht.dispatch_push_count.lerm_landing = nullptr;
+        return;
+    }
+    const int lsa_team_size = ep_group->lsa_team_size;
+    const int num_experts = ep_group->config.num_experts;
+    const int num_lsa_teams = ep_group->rdma_team_size;
+    const size_t max_chunks_per_rank =
+        (static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) + ep_group->ht_tokens_per_chunk - 1) /
+        ep_group->ht_tokens_per_chunk;
+    int32_t* cs = reinterpret_cast<int32_t*>(ptr + offset);
+    handle->ht.dispatch_push_count.own_chunk_rank = cs;
+    handle->ht.dispatch_push_count.per_src_lteam_num_tokens = handle->ht.dispatch_push_count.own_chunk_rank + max_chunks_per_rank * lsa_team_size;
+    const size_t cnt_ints_bytes =
+        ((max_chunks_per_rank * lsa_team_size + num_lsa_teams) * sizeof(int32_t) + 255) & ~size_t(255);
+    handle->ht.dispatch_push_count.own_row = reinterpret_cast<int32_t*>(ptr + offset + cnt_ints_bytes);
+    const size_t own_row_bytes =
+        (static_cast<size_t>(ep_group->nRanks + num_experts) * sizeof(int32_t) + 255) & ~size_t(255);
+    handle->ht.dispatch_push_count.token_dst_rank_bitmap =
+        reinterpret_cast<uint64_t*>(ptr + offset + cnt_ints_bytes + own_row_bytes);
+    // ceil(nRanks/64) u64 words per token, matching the histogram's hit_words.
+    const size_t bitmap_words = nccl_ep::ceil_div<size_t>(static_cast<size_t>(ep_group->nRanks), 64);
+    const size_t bitmap_bytes =
+        (static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) * bitmap_words * sizeof(uint64_t) +
+         255) &
+        ~size_t(255);
+    handle->ht.dispatch_push_count.cached_cnt_rows =
+        reinterpret_cast<int32_t*>(ptr + offset + cnt_ints_bytes + own_row_bytes + bitmap_bytes);
+    handle->ht.dispatch_push_count.fused_meta_dispatch = true;
+}
+
 static ncclResult_t
 ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor_t* handle_mem, int num_topk) {
     assert(ep_group->config.max_dispatch_tokens_per_rank > 0 && "HT requires max_dispatch_tokens_per_rank > 0");
-    
+
     if(num_topk <= 0) {
         fprintf(stderr, "HT mode requires num_topk > 0 (pass top_k to ncclEpInitHandle)\n");
         return ncclInvalidUsage;
@@ -2895,6 +3214,19 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
             "ncclEpGroupConfig_t::num_topk for the Expert-Major layout\n");
         return ncclInvalidUsage;
     }
+    if (em_local_permute_enabled(ep_group, handle->layout)) {
+        // EM local-permute packs each received token's top-k into a fixed-width row and the
+        // group recv_topk_weights_flat is sized by kEpCountMaxTopk; a larger num_topk overruns it.
+        if (num_topk > static_cast<int>(nccl_ep::ht::kEpCountMaxTopk)) {
+            fprintf(stderr,
+                "NCCL EP: HT Expert-Major local-permute requires num_topk <= %d\n",
+                nccl_ep::ht::kEpCountMaxTopk);
+            return ncclInvalidUsage;
+        }
+    }
+    // Count mode's single-LSA-team precondition is already enforced by dispatch_push_count_capable()
+    // (which includes !is_internode_available); internode EM falls back to scan through the same
+    // gate, so no redundant handle-init assert is needed here.
     // kNvlinkDup/kLocalDup write the staging buffer in the same per-expert
     // expanded shape as the dispatch output (each token can occupy up to
     // num_topk slots), so max_recv_tokens must cover the worst case
@@ -2973,12 +3305,19 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     handle->ht.flat2em_slot_map =
         (L.sz_flat2em_slot_map > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_flat2em_slot_map;
-    handle->ht.recv_topk_weights_flat =
-        (L.sz_recv_topk_weights_flat > 0) ? reinterpret_cast<float*>(ptr + offset) : nullptr;
-    offset += L.sz_recv_topk_weights_flat;
     handle->ht.token_to_recv_slot =
         (L.sz_token_to_recv_slot > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_token_to_recv_slot;
+    // Layout order matters: own_row must follow own_chunk_rank/per_src_lteam_num_tokens so
+    // ht_update_handle_count_mode can zero all three with one memset (see its call site).
+    ht_assign_count_scratch(handle, ep_group, ptr, offset, L.sz_count_scratch);
+    offset += L.sz_count_scratch;
+    // lerm_landing aliases the IPC table (cross-rank LERM rows); the permute copies it into
+    // local_expert_routing_map so combine sees a private copy.
+    if (L.sz_count_scratch > 0) {
+        handle->ht.dispatch_push_count.lerm_landing =
+            reinterpret_cast<bool*>(ep_group->ht_buffers.expert_output_meta_tables);
+    }
     handle->ht.recv_slot_to_src =
         (L.sz_recv_slot_to_src > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_recv_slot_to_src;
@@ -3061,6 +3400,120 @@ ncclResult_t ncclEpInitHandle(
     return res;
 }
 
+// Fused-meta-dispatch UpdateHandle path: publishes this rank's count row via the device
+// histogram; the unfused path (caller supplies layout_info) AllGathers rows here instead.
+static ncclResult_t ht_update_handle_count_mode(
+    ncclEpGroup_t ep_group,
+    ncclEpHandle_t handle,
+    bool out_is_int64,
+    void* padded_out_counts,
+    void* out_offsets,
+    void* recv_total_counter,
+    int32_t* per_expert_counts_device,
+    int max_recv_tpr,
+    cudaStream_t stream) {
+    const int num_experts = ep_group->config.num_experts;
+    const int max_tokens = ep_group->config.max_dispatch_tokens_per_rank;
+    const int num_lsa_teams = ep_group->rdma_team_size;
+    const int experts_per_rank = ep_group->num_local_experts;
+
+    // Histogram writes this rank's send counts into its own count row (comm-free); the
+    // dispatch head fans it out to LSA peers, which rebuild the EM tables from the landed rows.
+    const int lsa_team_size = ep_group->lsa_team_size;
+    const size_t count_row_ints = (size_t)ep_group->nRanks + (size_t)num_experts;
+    // Own row lands in per-handle scratch (comm-free, multi-handle-safe); fan-out happens at
+    // the dispatch head, not here.
+    int32_t* cnt_rank_pub = handle->ht.dispatch_push_count.own_row;
+    int32_t* cnt_expert_pub = cnt_rank_pub + ep_group->nRanks;
+    // Per-chunk per-dest-rank counts give the dispatch MAP warp its deterministic chunk slot
+    // bases.
+    const int tokens_per_chunk = ep_group->ht_tokens_per_chunk;
+    const int padded_max_tokens = nccl_ep::align(max_tokens, 16);
+    const int r2a_offset = ep_group->rdma_rank * padded_max_tokens;
+    // The histogram writes its own-LSA-team outputs to per-handle scratch, so batched-ahead
+    // UpdateHandles can't clobber another handle's in-flight metadata.
+    int32_t* chunk_rank_own = handle->ht.dispatch_push_count.own_chunk_rank;
+    uint64_t* bitmap_own = handle->ht.dispatch_push_count.token_dst_rank_bitmap;
+    int32_t* stream_ntok = handle->ht.dispatch_push_count.per_src_lteam_num_tokens;
+    // One memset clears the contiguous zero-required span [own_chunk_rank | per_src_lteam | own_row]:
+    // the histogram accumulates into own_chunk_rank and own_row (both need zeroing), while the
+    // bitmap that follows is written per token and needs none.
+    const size_t count_zero_bytes =
+        (size_t)(reinterpret_cast<const uint8_t*>(cnt_rank_pub) -
+                 reinterpret_cast<const uint8_t*>(chunk_rank_own)) +
+        count_row_ints * sizeof(int32_t);
+    CUDA_CHECK(cudaMemsetAsync(chunk_rank_own, 0, count_zero_bytes, stream));
+    // topk_idx is read in its caller-native width; the cache it writes is always int64.
+    if (handle->topk_idx.datatype == ncclInt32) {
+        nccl_ep::ht::build_count_metadata(
+            static_cast<const int32_t*>(handle->topk_idx.data),
+            static_cast<int64_t*>(handle->ht.topk_idx),
+            handle->num_tokens, handle->num_topk, experts_per_rank, ep_group->nRanks,
+            num_experts, cnt_rank_pub, cnt_expert_pub,
+            tokens_per_chunk, chunk_rank_own,
+            lsa_team_size, num_lsa_teams,
+            bitmap_own,
+            stream_ntok,
+            ep_group->rdma_rank, handle->ht.rdma_to_attn_map, r2a_offset,
+            ep_group->preprocess_num_sms, stream);
+    } else {
+        nccl_ep::ht::build_count_metadata(
+            static_cast<const int64_t*>(handle->topk_idx.data),
+            static_cast<int64_t*>(handle->ht.topk_idx),
+            handle->num_tokens, handle->num_topk, experts_per_rank, ep_group->nRanks,
+            num_experts, cnt_rank_pub, cnt_expert_pub,
+            tokens_per_chunk, chunk_rank_own,
+            lsa_team_size, num_lsa_teams,
+            bitmap_own,
+            stream_ntok,
+            ep_group->rdma_rank, handle->ht.rdma_to_attn_map, r2a_offset,
+            ep_group->preprocess_num_sms, stream);
+    }
+
+    // Unfused path (caller supplies layout_info): AllGather count rows now and derive the
+    // caller tensors immediately; dispatch MAP warps then read these gathered rows instead
+    // of the fused per-peer landing.
+    const bool provide_layout_info =
+        (padded_out_counts != nullptr) || (out_offsets != nullptr) || (recv_total_counter != nullptr);
+    // Eager mode needs the recv count at UpdateHandle time, before the fused path would
+    // publish it, so it always runs the unfused count exchange.
+    const bool run_unfused_count =
+        provide_layout_info || ep_group->eager_mode || nccl_ep_env_flag_on(ep_group->env.ht_em_count_unfused);
+    handle->ht.dispatch_push_count.fused_meta_dispatch = true;
+    if (run_unfused_count) {
+        NCCL_CHECK_RESULT(ncclAllGather(
+            cnt_rank_pub,
+            handle->ht.dispatch_push_count.cached_cnt_rows,
+            count_row_ints,
+            ncclInt32,
+            ep_group->comm,
+            stream));
+        // Derive the caller layout tensors from the gathered rows. Count mode is EM-only
+        // (gated by em_local_permute_enabled). Counts/offsets exclude dropped tokens;
+        // recv_total_counter reports the pre-drop total.
+        nccl_ep::ht::compute_layout_info(
+            handle->ht.dispatch_push_count.cached_cnt_rows,
+            ep_group->nRanks,
+            num_experts,
+            experts_per_rank,
+            ep_group->rank,
+            static_cast<int>(handle->ht.dispatch_output_per_expert_alignment),
+            max_recv_tpr,
+            ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
+            out_is_int64,
+            handle->ht.expert_token_offsets,
+            padded_out_counts,
+            out_offsets,
+            per_expert_counts_device,
+            recv_total_counter,
+            stream);
+        handle->ht.dispatch_push_count.fused_meta_dispatch = false;
+    }
+    // Per-expert offsets/counts are receiver-local (known only after dispatch); the caller
+    // tensors are wired from ncclEpDispatch's layout_info and written by the permute post-build.
+    return ncclSuccess;
+}
+
 ncclResult_t ncclEpUpdateHandle(
     ncclEpHandle_t handle,
     const ncclEpTensor_t* topk_idx,
@@ -3130,14 +3583,22 @@ ncclResult_t ncclEpUpdateHandle(
     const int routing_row_bytes = experts_per_lsa_team_packed * nNodes;
     (void)num_experts;
 
+    // Count-exchange path selector (stable per group/handle); computed once and reused below.
+    const bool count_mode = dispatch_push_count_active(ep_group, handle);
+
     // Zero the entire preprocessing zero region (routing, r2a, a2r, ler, ntfe) in one call.
     // Buffers are allocated at max_tokens capacity, so this clears beyond the active num_tokens
     // region — safe because allgather/preprocessing will overwrite the relevant portions.
-    CUDA_CHECK(cudaMemsetAsync(
-        handle->ht.preprocessing_block,
-        0,
-        handle->ht.preprocessing_zero_region_size,
-        stream));
+    // Count mode only needs r2a cleared here; ntfe, LERM, and a2r are handled elsewhere
+    // (dispatch, the IPC table, and the count block below).
+    if (count_mode) {
+        const int padded_max_tokens = nccl_ep::align(max_tokens, 16);
+        CUDA_CHECK(cudaMemsetAsync(
+            handle->ht.rdma_to_attn_map, 0, (size_t)nNodes * padded_max_tokens * sizeof(bool), stream));
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(
+            handle->ht.preprocessing_block, 0, handle->ht.preprocessing_zero_region_size, stream));
+    }
     // Pull dispatch consumes the uint16 topk map (produced below) instead of the bitmap;
     // skip the bitmap convert + gather entirely when pull is enabled.
     const bool em_pull = em_pull_enabled(ep_group, handle);
@@ -3157,8 +3618,10 @@ ncclResult_t ncclEpUpdateHandle(
     // so resolve the send pointer only on the bitmap path.
     uint8_t* global_routing_map = ep_group->ht_buffers.global_routing_map;
 
+    // Count mode skips the bitmap here too, using a count AllGather instead, same as pull
+    // dispatch (which scans the order-preserving uint16 topk map).
     // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
-    if (!use_topk_idx_scan) {
+    if (!count_mode && !use_topk_idx_scan) {
         uint8_t* local_routing_send_ptr = global_routing_map + (max_tokens * routing_row_bytes) * ep_group->rank;
         // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
         // ncclAllGather below ships max_tokens rows and stale tail bits would otherwise
@@ -3199,6 +3662,9 @@ ncclResult_t ncclEpUpdateHandle(
             ep_group->comm,
             stream));
     }
+    // Count mode caches topk_idx inside build_count_metadata, so no separate copy here.
+    // The cache is always widened to int64 regardless of the caller's native width.
+    // TODO: narrow to int16 once the device receiver read is width-parametrized.
 
     // Pull dispatch: produce + gather the order-preserving uint16 topk map (row stride =
     // num_topk); the pull scan consumes this instead of the bitmap. The pack kernel also
@@ -3325,6 +3791,12 @@ ncclResult_t ncclEpUpdateHandle(
         // Eager local-permute: padded zones live in the caller buffer
         // Extend the zone-overflow budget by the worst-case padding.
         max_recv_tpr += experts_per_rank * (alignment - 1);
+    }
+
+    if (count_mode) {
+        return ht_update_handle_count_mode(
+            ep_group, handle, out_is_int64, padded_out_counts, out_offsets, recv_total_counter,
+            per_expert_counts_device, max_recv_tpr, stream);
     }
 
     NCCLCHECK(
@@ -3702,8 +4174,7 @@ ncclResult_t ncclEpDispatch(
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
             auto* expert_recv_source_indices_data = static_cast<int*>(handle->ll.expert_recv_source_indices.data);
-            auto* src_rank_counter_data =
-                src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
+            auto* src_rank_counter_data = src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
             auto* expert_dispatch_layout_data = static_cast<int64_t*>(handle->ll.expert_dispatch_layout.data);
             auto* recv_count_data = recv_count ? static_cast<int*>(recv_count->data) : nullptr;
             auto* x_data = x->data;
@@ -3763,7 +4234,7 @@ ncclResult_t ncclEpDispatch(
                 params.windows = group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.workspace = group->ep_workspace;
-                params.numDeviceSms = group->comm_num_sms;
+                params.numDeviceSms = group->dispatch_num_sms;
                 params.rankMask = group->mask_buffer;
                 params.asyncErrorFlag = group->async_error_flag;
                 params.timeoutCycles = group->timeout_cycles;
@@ -4025,7 +4496,7 @@ ncclResult_t ncclEpDispatch(
                 static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_prob, 0, dense_prob_size, stream));
 
-            if (handle->topk_idx.datatype == ncclInt32) {
+            if (topk_idx_cache_is_int32(group, handle)) {
                 nccl_ep::ht::sparse_to_dense_prob(
                     static_cast<const int32_t*>(handle->ht.topk_idx),
                     static_cast<const float*>(topk_weights->data),
@@ -4077,6 +4548,8 @@ ncclResult_t ncclEpDispatch(
         // staging -> recv_x->data); external-window vs. plain recv_x is irrelevant
         // since the permute kernel just dereferences recv_x->data.
         const bool em_permute_active = em_local_permute_enabled(group, handle);
+        // Count-exchange path selector (stable per group/handle); computed once and reused below.
+        const bool count_mode = dispatch_push_count_active(group, handle);
 
         if (rcv_x_zcopy && !em_permute_active) {
             NCCLCHECK(buildIntranodePtrArray<void>(group, recv_x, dispatch_output_token_ptrs));
@@ -4184,6 +4657,100 @@ ncclResult_t ncclEpDispatch(
         params.pad_expert_token_offsets = fused_em_pad ? handle->ht.expert_token_offsets : nullptr;
         params.pad_alignment =
             fused_em_pad ? static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) : 0;
+        // Padded eager EM recv budget, matching ncclEpUpdateHandle's compute_layout_info
+        // (max_recv_tpr). Used below both as count mode's recv_max_slots and as the S2G
+        // backstop bound (params.max_recv_tokens_per_rank), so legitimately-padded slots
+        // don't trip S2G's assert.
+        int max_recv_tokens_per_rank = group->max_recv_tokens;
+        if (group->eager_mode && em_permute_active && handle->ht.dispatch_output_per_expert_alignment > 0) {
+            max_recv_tokens_per_rank += group->num_local_experts *
+                (static_cast<int>(handle->ht.dispatch_output_per_expert_alignment) - 1);
+        }
+        // Fused-meta-dispatch path: build the rank-major s2d inside the dispatch kernel from the
+        // histogram-published per-rank count rows (FWD only; BWD reuses the FWD-populated s2d).
+        // No host collective or kernel runs between the histogram and dispatch.
+        const bool count_mode_dispatch = count_mode && forward_dispatch;
+        params.dispatch_push_count.active = count_mode_dispatch;
+        if (count_mode_dispatch) {
+            params.dispatch_push_count.own_row = handle->ht.dispatch_push_count.own_row;
+            // Unfused path: MAP warps read the per-handle AllGather buffer instead of the
+            // fanned-out landing (set in UpdateHandle when the caller supplies layout_info).
+            params.dispatch_push_count.fused_meta_dispatch = handle->ht.dispatch_push_count.fused_meta_dispatch;
+            params.dispatch_push_count.cached_cnt_rows = handle->ht.dispatch_push_count.cached_cnt_rows;
+            params.dispatch_push_count.s2d_out = handle->ht.sparse_to_dense_map;
+            params.dispatch_push_count.published_offset = group->ht_buffers.published_offset;
+            params.dispatch_push_count.per_src_lteam_chunk_rank = handle->ht.dispatch_push_count.own_chunk_rank;
+            params.dispatch_push_count.cached_topk_idx = static_cast<const int64_t*>(handle->ht.topk_idx);
+            params.dispatch_push_count.num_recv_out = handle->ht.num_tokens_for_experts;
+            params.dispatch_push_count.per_src_lteam_num_tokens = handle->ht.dispatch_push_count.per_src_lteam_num_tokens;
+            params.dispatch_push_count.num_topk = handle->num_topk;
+            params.dispatch_push_count.num_src_ranks = group->nRanks;
+            params.dispatch_push_count.lsa_team_size = group->lsa_team_size;
+            params.dispatch_push_count.token_dst_rank_bitmap = handle->ht.dispatch_push_count.token_dst_rank_bitmap;
+            params.dispatch_push_count.recv_tables_ptrs =
+                reinterpret_cast<uint8_t* const*>(group->ht_buffers.dispatch_push_count_meta_table_ptrs);
+            params.dispatch_push_count.recv_max_slots = max_recv_tokens_per_rank;
+            // Only NCCL_EP_OVERFLOW_DROP sets this; TRAP still traps on overflow (see the
+            // DROP-contract doc). When set, the fused meta build clamps published per-expert
+            // offsets/counts to the recv budget so over-budget tokens drop instead of trapping.
+            params.dispatch_push_count.allow_overflow_drop = group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP;
+            params.dispatch_push_count.expert_token_offsets_out = handle->ht.expert_token_offsets;
+            params.dispatch_push_count.per_expert_counts_out = handle->ht.per_expert_counts_active;
+            // Info-layout at dispatch time is only wired for HT EM local-permute; other HT paths
+            // still write it in UpdateHandle. Remove once every HT mode supports it here.
+            EP_HOST_ASSERT(em_permute_active && "HT dispatch info-layout wiring is only supported for EM local permute");
+            // Caller's padded per-expert offsets/counts, wired from the dispatch-time
+            // layout_info when provided; the permute writes them post-build (receiver-local).
+            const ncclEpTensor_t* caller_offsets_tensor =
+                layout_info ? tensor_ptr(layout_info->expert_offsets) : nullptr;
+            const ncclEpTensor_t* count_caller_counts_tensor =
+                layout_info ? tensor_ptr(layout_info->expert_counters) : nullptr;
+            auto check_count_caller_tensor = [&](const ncclEpTensor_t* t) {
+                EP_HOST_ASSERT(t->ndim == 1 && "tensor must be 1D");
+                EP_HOST_ASSERT((t->datatype == ncclInt32 || t->datatype == ncclInt64) && "tensor must be ncclInt32 or ncclInt64");
+                EP_HOST_ASSERT(
+                    t->sizes[0] >= static_cast<size_t>(group->num_local_experts) &&
+                    "tensor size must be >= num_local_experts");
+                EP_HOST_ASSERT(t->data != nullptr && "tensor data must not be null");
+            };
+            if (caller_offsets_tensor) check_count_caller_tensor(caller_offsets_tensor);
+            if (count_caller_counts_tensor) check_count_caller_tensor(count_caller_counts_tensor);
+            // Offsets and counts must share dtype; default int64 when neither tensor is given.
+            if (caller_offsets_tensor && count_caller_counts_tensor)
+                EP_HOST_ASSERT(
+                    caller_offsets_tensor->datatype == count_caller_counts_tensor->datatype &&
+                    "expert_offsets and expert_counters must share dtype");
+            params.dispatch_push_count.caller_offsets = caller_offsets_tensor ? caller_offsets_tensor->data : nullptr;
+            params.dispatch_push_count.caller_counts = count_caller_counts_tensor ? count_caller_counts_tensor->data : nullptr;
+            // Caller's scalar recv_total_counter (pre-drop padded total), written by the fused
+            // permute alongside the per-expert counts. Its int width must match counts/offsets.
+            const ncclEpTensor_t* recv_total_tensor =
+                layout_info ? tensor_ptr(layout_info->recv_total_counter) : nullptr;
+            // Infer the shared dtype from whichever optional output the caller actually gave;
+            // default int64 only when none of the three were requested.
+            params.dispatch_push_count.caller_out_is_int64 =
+                count_caller_counts_tensor    ? (count_caller_counts_tensor->datatype == ncclInt64)
+                : caller_offsets_tensor ? (caller_offsets_tensor->datatype == ncclInt64)
+                : recv_total_tensor     ? (recv_total_tensor->datatype == ncclInt64)
+                                              : true;
+            params.dispatch_push_count.em_alignment =
+                static_cast<int>(handle->ht.dispatch_output_per_expert_alignment);
+            if (recv_total_tensor) {
+                EP_HOST_ASSERT(recv_total_tensor->ndim == 1 && "recv_total_counter must be 1D");
+                EP_HOST_ASSERT(recv_total_tensor->sizes[0] >= 1 && "recv_total_counter size must be >= 1");
+                EP_HOST_ASSERT((recv_total_tensor->datatype == ncclInt32 || recv_total_tensor->datatype == ncclInt64) &&
+                       "recv_total_counter must be ncclInt32 or ncclInt64");
+                EP_HOST_ASSERT(recv_total_tensor->data != nullptr && "recv_total_counter data must not be null");
+                EP_HOST_ASSERT((recv_total_tensor->datatype == ncclInt64) == params.dispatch_push_count.caller_out_is_int64 &&
+                       "recv_total_counter dtype must match expert_counters/offsets");
+            }
+            params.dispatch_push_count.caller_recv_total = recv_total_tensor ? recv_total_tensor->data : nullptr;
+            // Always publish whatever the caller requested via this call's layout_info: it may
+            // name different tensors than ncclEpUpdateHandle's layout_info (or none at all), so
+            // UpdateHandle having already published its own tensors doesn't cover this call's.
+            // The recompute is deterministic from the same count rows, so re-publishing into a
+            // tensor UpdateHandle already wrote is redundant but not wrong.
+        }
         // Always pass a valid device pointer — the kernel unconditionally
         // dereferences this even in single-LSA-team mode (the value is just unused).
         params.expected_gin_flag_val = group->ht_buffers.dispatch_expected_gin_flag_val;
@@ -4240,10 +4807,10 @@ ncclResult_t ncclEpDispatch(
         // EM local-fanout: dispatch dedups S2G; receiver local_dup fills secondaries.
         const bool em_unfused_active = em_local_dup_active(group, handle->layout);
         params.local_dup_num_sms = em_unfused_active ? static_cast<int>(group->shuffle_sms) : 0;
-        // Device-side backstop bound for recv slot indices: the fixed budget or
-        // the derived eager bound. The scan produces slots below it (DROP masks
-        // the rest), so the S2G assert only fires on corrupted or stale routing maps.
-        params.max_recv_tokens_per_rank = group->max_recv_tokens;
+        // Device-side backstop bound for recv slot indices: the fixed budget or the derived
+        // eager bound (computed above). The scan/count build produces slots below it (DROP
+        // masks the rest), so the S2G assert only fires on corrupted or stale routing maps.
+        params.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
 
         // Call dispatch kernel
         int sf_bytes_per_token = 0;
@@ -4262,7 +4829,7 @@ ncclResult_t ncclEpDispatch(
                     group->rdma_team_size,
                     recipe,
                     pass_direction,
-                    static_cast<int>(group->comm_num_sms),
+                    static_cast<int>(group->dispatch_num_sms),
                     group->max_dynamic_smem,
                     sf_bytes_per_token,
                     &group->env,
@@ -4371,34 +4938,43 @@ ncclResult_t ncclEpDispatch(
                         : NCCL_EP_EXPERT_ID_AUTO);
             const int global_expert_offset = group->rank * group->num_local_experts;
 
+            // Fused-meta-dispatch path: the sender-side table work is LERM only (weights
+            // extracted from the landed prob below, flat2em built by the permute), so the
+            // dense->sparse extraction runs as in scan mode on all topologies.
             // em-permute path: dense_to_sparse_prob runs in FLAT shape.
             // Weights are written to FLAT scratch (recv_topk_weights_flat) and
             // the topk_idx write is skipped to preserve the em_slot values
             // published by em_scan_kernel. The local permute kernel below
             // reshuffles FLAT scratch into the caller's EM recv buffer.
-            const bool dsp_em = em && !em_permute_active;
-            float* dsp_topk_weights = em_permute_active ? handle->ht.recv_topk_weights_flat :
-                                                          static_cast<float*>(recv_topk_weights->data);
-            int64_t* dsp_topk_idx =
-                em_permute_active ? nullptr : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
+            {
+                const bool dsp_em = em && !em_permute_active;
+                float* dsp_topk_weights = em_permute_active ? group->ht_buffers.count_scratch.recv_topk_weights_flat :
+                                                              static_cast<float*>(recv_topk_weights->data);
+                int64_t* dsp_topk_idx =
+                    em_permute_active ? nullptr : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
 
-            // Pull relocates weights directly from the source topk_weights row, so it
-            // needs no FLAT weight staging (prob buffer is not populated under pull).
-            if (!em_pull_active)
-                nccl_ep::ht::dense_to_sparse_prob(
-                    group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
-                    handle->ht.local_expert_routing_map,
-                    dsp_topk_weights,
-                    dsp_topk_idx,
-                    num_recv_tokens,
-                    handle->num_topk,
-                    group->num_local_experts,
-                    experts_per_lsa_team,
-                    group->lsa_rank,
-                    global_expert_offset,
-                    recv_topk_idx_kind,
-                    dsp_em,
-                    stream);
+                // Pull relocates weights directly from the source topk_weights row, so it
+                // needs no FLAT weight staging (prob buffer is not populated under pull).
+                if (!em_pull_active)
+                    nccl_ep::ht::dense_to_sparse_prob(
+                        group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
+                        // Count mode reads the IPC LERM landing zone here (pre-permute); the
+                        // per-handle copy is not populated until the permute runs below.
+                        count_mode ? handle->ht.dispatch_push_count.lerm_landing
+                                   : handle->ht.local_expert_routing_map,
+                        dsp_topk_weights,
+                        dsp_topk_idx,
+                        num_recv_tokens,
+                        handle->num_topk,
+                        group->num_local_experts,
+                        experts_per_lsa_team,
+                        group->lsa_rank,
+                        global_expert_offset,
+                        recv_topk_idx_kind,
+                        dsp_em,
+                        count_mode, // count mode: LERM is a packed bitmap
+                        stream);
+            }
         }
 
         // EM-permute path: FLAT staging now holds rank-major token rows, the
@@ -4561,8 +5137,8 @@ ncclResult_t ncclEpDispatch(
                     static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                     lsa_ranks,
                     // Pull is the dispatch, so it uses the dispatch SM budget
-                    // (comm_num_sms / NCCL_EP_COMM_SMS), not the shuffle budget.
-                    static_cast<int>(group->comm_num_sms),
+                    // (dispatch_num_sms), not the shuffle or combine budget.
+                    static_cast<int>(group->dispatch_num_sms),
                     0u,
                     recipe,
                     group->gin_config.d_dcomms,
@@ -4571,11 +5147,23 @@ ncclResult_t ncclEpDispatch(
                     stream,
                     nccl_ep_env_flag_on(group->env.ht_unfused_sync)));
             } else {
+                // Count mode: the permute builds the flat2em rows inline from the
+                // MAP-written LERM (FWD only; BWD reuses the rows persisted by the FWD
+                // dispatch). The em cursors are zero-seeded per dispatch.
+                const bool count_lean_build = forward_dispatch && count_mode;
+                int32_t* em_permute_cursors = nullptr;
+                if (count_lean_build) {
+                    em_permute_cursors = group->ht_buffers.count_scratch.em_permute_cursors;
+                    // +1: the phantom-row fixup's grid arrival counter (trailing slot).
+                    CUDA_CHECK(cudaMemsetAsync(
+                        em_permute_cursors, 0,
+                        static_cast<size_t>(group->num_local_experts + 1) * sizeof(int32_t), stream));
+                }
                 nccl_ep::ht::launch_dispatch_permute(
                     recv_x->data,
                     deliver_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
                     group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
-                    deliver_weights ? handle->ht.recv_topk_weights_flat : nullptr,
+                    deliver_weights ? group->ht_buffers.count_scratch.recv_topk_weights_flat : nullptr,
                     handle->ht.flat2em_slot_map,
                     handle->ht.num_tokens_for_experts,
                     handle->ht.expert_token_offsets,
@@ -4590,7 +5178,12 @@ ncclResult_t ncclEpDispatch(
                     recipe,
                     perm_recv_scales_em,
                     perm_flat_scale_staging,
-                    perm_scale_row_bytes);
+                    perm_scale_row_bytes,
+                    count_lean_build ? handle->ht.flat2em_slot_map : nullptr,
+                    count_lean_build ? handle->ht.dispatch_push_count.lerm_landing : nullptr,
+                    count_lean_build ? handle->ht.local_expert_routing_map : nullptr,
+                    em_permute_cursors,
+                    count_lean_build && group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP);
             }
         }
 
@@ -4645,7 +5238,9 @@ ncclResult_t ncclEpCombine(
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     const ncclEpCombQuant_t quantization_recipe =
         config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
-    NCCLCHECK(validateCombineRecipe(inputs, outputs, config, handle->group->device_sm));
+    NCCLCHECK(validateCombineRecipe(
+        inputs, outputs, config, handle->group->config.algorithm, handle->group->device_sm,
+        is_internode_available(handle->group)));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
@@ -4664,11 +5259,15 @@ ncclResult_t ncclEpCombine(
         handle->num_tokens_set = true;
     }
 
-    // Consolidated token-dtype gate for all combine paths (LL/HT): NONE-mode
-    // (bf16/fp16/fp32). There is no FP8 combine. Checked once here.
+    // Consolidated token-dtype gate for the NONE recipe on all combine paths (LL/HT):
+    // bf16/fp16/fp32. Quantized recipes state their own, stricter dtype contract in
+    // validateCombineRecipe above -- MXFP8 requires BF16 tokens and a null scales tensor --
+    // so they skip this check rather than repeat it. Checked once here.
     {
+        const ncclEpCombQuant_t gate_recipe =
+            config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
         const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
-        if (!validate_dtype(xt->datatype)) {
+        if (gate_recipe == NCCL_EP_COMB_QUANT_NONE && !validate_dtype(xt->datatype)) {
             fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n", static_cast<int>(xt->datatype));
             return ncclInvalidArgument;
         }
@@ -4847,7 +5446,7 @@ ncclResult_t ncclEpCombine(
                 params.windows = handle->group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.workspace = handle->group->ep_workspace;
-                params.numDeviceSms = handle->group->comm_num_sms;
+                params.numDeviceSms = handle->group->combine_num_sms;
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
                 params.resolvedWarpsPerGroup = &handle->group->last_ll_combine_warps_per_group;
@@ -4910,6 +5509,10 @@ ncclResult_t ncclEpCombine(
         // Get dimensions from input tensor
         auto num_tokens = static_cast<int>(x->sizes[0]);
         auto hidden = static_cast<int>(x->sizes[1]);
+
+        const ncclEpCombQuant_t combine_recipe =
+            config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
+        const bool mxfp8_combine = (combine_recipe == NCCL_EP_COMB_QUANT_MXFP8);
 
         // Validate int4 alignment for TMA
         assert((hidden * ncclTypeSize(x->datatype)) % sizeof(int4) == 0);
@@ -5048,6 +5651,22 @@ ncclResult_t ncclEpCombine(
             fprintf(stderr, "ncclEpCombine: NCCL_EP_HT_EM_PULL_PUSH push combine is single-LSA-team only\n");
             return ncclInvalidUsage;
         }
+        // MXFP8 quantization is fused into local_permute_reduce, which only runs in
+        // expert-major local-permute mode. Any other layout or EM mode has no kernel that
+        // could produce FP8+E8M0, so reject instead of silently transporting BF16.
+        // kPullPush satisfies em_permute_combine but routes through combine_push /
+        // combine_reduce_stage, neither of which quantizes, so reject it here too --
+        // before the branch split, so both paths are covered.
+        if (mxfp8_combine && (!em_permute_combine || comb_push)) {
+            fprintf(
+                stderr,
+                "NCCL EP error: MXFP8 combine requires the expert-major local-permute path "
+                "(layout=%d, em_permute=%d, push_combine=%d)\n",
+                static_cast<int>(handle->layout),
+                static_cast<int>(em_permute_combine),
+                static_cast<int>(comb_push));
+            return ncclInvalidArgument;
+        }
         if (comb_push) {
             // Push EM combine (FWD, NONE, single LSA team): each expert rank locally
             // reduces its K em copies and pushes the row into the destination attn
@@ -5091,8 +5710,8 @@ ncclResult_t ncclEpCombine(
                 group->lsa_rank,
                 static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                 team_size,
-                // Push combine is a comm kernel (NVLink push), so it uses the comm SM budget.
-                static_cast<int>(group->comm_num_sms),
+                // Push combine is a comm kernel (NVLink push), so it uses the combine SM budget.
+                static_cast<int>(group->combine_num_sms),
                 0u,
                 stream,
                 x->datatype,
@@ -5119,26 +5738,34 @@ ncclResult_t ncclEpCombine(
                 backward_combine));
         } else {
             if (em_permute_combine) {
-                // x dtype already validated as NONE-mode at the combine entry gate;
-                // local_permute_reduce handles bf16/fp16/fp32.
-                const int row_bytes = hidden * ncclTypeSize(x->datatype);
-                if (row_bytes <= 0 || (row_bytes % 16) != 0) {
-                    return ncclInvalidArgument; // int4-vectorized row copy requires 16B-aligned row
+                // MXFP8: app provides BF16; local_permute_reduce accumulates and quantizes to
+                // packed [FP8 H | E8M0 H/32] (same layout as the RDMA wire) in expert_input,
+                // and the combine kernel dequantizes in the RED warp.
+                // NONE: output row matches the caller's dtype (bf16/fp16/fp32).
+                // Bytes of the row the reduce kernel reads. What it writes is the recipe's
+                // packed width, derived in the adapter where the device geometry lives.
+                const int input_row_bytes = hidden * static_cast<int>(ncclTypeSize(x->datatype));
+                if (input_row_bytes <= 0 || (input_row_bytes % 16) != 0) {
+                    return ncclInvalidArgument;
                 }
-                nccl_ep::ht::launch_combine_reduce(
+                // Count mode reads the per-handle flat2em built by the dispatch permute, same
+                // as the scan path.
+                NCCLCHECK(nccl_ep::ht::launch_combine_reduce(
                     group->ht_buffers.expert_input_token,
                     x->data,
                     handle->ht.flat2em_slot_map,
                     handle->ht.num_tokens_for_experts,
                     em_permute_bwd_weights ? static_cast<const float*>(topk_weights->data) : nullptr,
-                    em_permute_bwd_weights ? handle->ht.recv_topk_weights_flat : nullptr,
+                    em_permute_bwd_weights ? group->ht_buffers.count_scratch.recv_topk_weights_flat : nullptr,
                     handle->num_topk,
-                    row_bytes,
+                    hidden,
+                    input_row_bytes,
                     num_tokens,  // caller EM buffer rows: slot backstop in the kernel
                     static_cast<int>(group->device_sm_count),
                     group->shuffle_sms,
                     stream,
-                    x->datatype);
+                    x->datatype,
+                    mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE));
             } else if (!combine_x_uses_external_window) {
                 // Clamp to staging capacity (nvlink_dup/local_dup EM only).
                 const size_t clamped_tokens =
@@ -5150,6 +5777,8 @@ ncclResult_t ncclEpCombine(
                     token_copy_size,
                     cudaMemcpyDeviceToDevice,
                     stream));
+                // No scale copy: MXFP8 is rejected above unless em_permute_combine, and its
+                // E8M0 scales ride in the packed token row, not a separate buffer.
             }
 
             /* ===== Convert sparse topk_weights to dense prob for backward combine ===== */
@@ -5171,10 +5800,12 @@ ncclResult_t ncclEpCombine(
                 // the 1D EM input keyed by the EM-shape LERM scratch.
                 const bool use_flat_inputs = em_permute_combine;
                 const float* prob_input = (use_flat_inputs && expert_major_in) ?
-                                              handle->ht.recv_topk_weights_flat :
+                                              group->ht_buffers.count_scratch.recv_topk_weights_flat :
                                               static_cast<const float*>(topk_weights->data);
                 const int prob_stride = use_flat_inputs ? num_topk : input_topk_stride;
                 const bool* lerm_for_combine = handle->ht.local_expert_routing_map;
+                // Count mode persists LERM as a packed bitmap; scan mode as one bool per expert.
+                const bool lerm_bitmap = dispatch_push_count_active(group, handle);
                 nccl_ep::ht::sparse_to_dense_prob_combine(
                     prob_input,
                     lerm_for_combine,
@@ -5184,6 +5815,7 @@ ncclResult_t ncclEpCombine(
                     group->num_local_experts, // experts_per_rank
                     experts_per_lsa_team,
                     group->lsa_rank,
+                    lerm_bitmap,
                     stream);
             }
 
@@ -5216,6 +5848,7 @@ ncclResult_t ncclEpCombine(
             }
             params.expert_input_prob_ptrs =
                 backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
+            params.combine_recipe = mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE;
             params.attn_output_token = combined_x->data;
             params.attn_output_prob = backward_combine ? dense_output_prob : nullptr;
             params.combine_gin_RED_tokens = is_lsa_only ? nullptr : group->ht_buffers.combine_gin_RED_tokens;
@@ -5245,6 +5878,7 @@ ncclResult_t ncclEpCombine(
             params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
             params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
+            params.combine_barrier_offset = group->dispatch_num_sms;
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
             const size_t combine_token_offset =
@@ -5303,7 +5937,9 @@ ncclResult_t ncclEpCombine(
             }
 
             /* ===== Call combine kernel ===== */
-            params.token_dtype = x->datatype;
+            // MXFP8: kTokenDtype drives the BF16 output path; the FP8 wire format is
+            // driven by params.combine_recipe, not x->datatype.
+            params.token_dtype = mxfp8_combine ? ncclBfloat16 : x->datatype;
             NCCLCHECK(
                 nccl_ep::ht::call_combine(
                     params,
@@ -5311,7 +5947,7 @@ ncclResult_t ncclEpCombine(
                     group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
                     group->rdma_team_size, // num_lsa_teams (RDMA domain size)
                     backward_combine, // backward mode flag
-                    static_cast<int>(group->comm_num_sms),
+                    static_cast<int>(group->combine_num_sms),
                     group->max_dynamic_smem,
                     &group->env,
                     stream));
@@ -5324,7 +5960,7 @@ ncclResult_t ncclEpCombine(
             assert(
                 handle->ht.topk_idx != nullptr &&
                 "HT BWD combine: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
-            if (handle->topk_idx.datatype == ncclInt32) {
+            if (topk_idx_cache_is_int32(group, handle)) {
                 nccl_ep::ht::dense_to_sparse_prob_combine(
                     dense_output_prob,
                     static_cast<const int32_t*>(handle->ht.topk_idx),
@@ -5513,4 +6149,11 @@ ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dyn
 
 int ncclEpGroup_test_getLastLlCombineWarpsPerGroup(ncclEpGroup_t group) {
     return group == nullptr ? 0 : group->last_ll_combine_warps_per_group;
+}
+
+void ncclEpGroup_test_getSmBudgets(
+    ncclEpGroup_t group, unsigned int* dispatch_num_sms, unsigned int* combine_num_sms) {
+    if (group == nullptr) return;
+    if (dispatch_num_sms != nullptr) *dispatch_num_sms = group->dispatch_num_sms;
+    if (combine_num_sms != nullptr) *combine_num_sms = group->combine_num_sms;
 }

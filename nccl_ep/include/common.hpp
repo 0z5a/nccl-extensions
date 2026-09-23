@@ -99,6 +99,21 @@ static constexpr uint16_t kTopkIdxInvalid = 0xFFFFu;
 #include "nccl_device.h"
 #include "device/macros.cuh"
 #include "ep_enums.h"
+#include "cuda_fp_features.h"
+
+// Library-side NCCLCHECK: for ncclResult_t-returning functions. The
+// app/exit-on-error flavor used by ep_bench/ep_test is defined locally in
+// those TUs (they exit rather than return).
+#ifndef NCCLCHECK
+#define NCCLCHECK(cmd) \
+    do { \
+        ncclResult_t _ncclcheck_res = (cmd); \
+        if (_ncclcheck_res != ncclSuccess) { \
+            fprintf(stderr, "NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(_ncclcheck_res)); \
+            return _ncclcheck_res; \
+        } \
+    } while (0)
+#endif
 
 namespace nccl_ep {
 
@@ -123,6 +138,14 @@ inline constexpr bool host_build_supports_fp4() {
     return NCCL_EP_HAS_CUDA_FP4_TYPES && CUDART_VERSION >= 12090;
 }
 
+// cuda_fp8.h ships E4M3 from CUDA 11.8; __nv_fp8_e8m0 (and therefore the
+// preferred MXFP8 reciprocal-scale path) requires CUDA 12.8. Device headers
+// still compile on older toolkits via a software fallback; the API rejects
+// MXFP8 there so the fallback is compile-only.
+inline constexpr bool host_build_supports_mxfp8() {
+    return NCCL_EP_HAS_CUDA_E8M0_TYPE;
+}
+
 constexpr int kDsFp8E3M4ElementsPerScale = 128;
 
 // low-latency kernels
@@ -138,6 +161,23 @@ constexpr int kLlDispatchMaxWarpGroups = 14;
 template <typename dtype_t>
 __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ((a + b - 1) / b) * b;
+}
+
+// Expert / rank index arithmetic of the LL dispatch protocol, kept next to the
+// header layout it addresses so other device headers and host code can reuse it.
+__host__ __device__ __forceinline__ int getLocalExpertIdx(int expertIdx, int numLocalExperts) {
+    return (expertIdx >= 0) ? expertIdx % numLocalExperts : -1;
+}
+
+// Sender's slot relative to the receiver around the rank ring, in [0, numRanks).
+// Relative indexing distributes the NVLink staging addresses across receivers.
+__host__ __device__ __forceinline__ int relativeRankSlot(int senderRank, int receiverRank, int numRanks) {
+    return (senderRank >= receiverRank) ? (senderRank - receiverRank)
+                                         : (senderRank - receiverRank + numRanks);
+}
+
+__host__ __device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExperts) {
+    return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
 }
 
 // Per-hop routing entry in the dispatch message header.
@@ -177,7 +217,7 @@ static_assert(offsetof(DispatchHdr<NCCL_EP_LAYOUT_EXPERT_MAJOR>, rtr) == 4, "une
 // Dispatch header wire size: token_id prefix through last rtr entry, rounded up
 // to int4 (16-byte) boundary for vectorized RDMA access.
 template <ncclEpLayout_t kLayout>
-__host__ __device__ __forceinline__ size_t get_dispatch_hdr_sz(int num_topk) {
+__host__ __device__ __forceinline__ constexpr size_t get_dispatch_hdr_sz(int num_topk) {
     const size_t base_sz =
         offsetof(DispatchHdr<kLayout>, rtr) + static_cast<size_t>(num_topk) * sizeof(DispatchRouter<kLayout>);
     return align<size_t>(base_sz, sizeof(int4));
@@ -198,6 +238,37 @@ __host__ __device__ constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {
 template <typename dtype_t>
 __host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
+}
+
+// Packed bitmap stored as little-endian 64-bit words: word count, word index, single-bit test/set.
+__host__ __device__ constexpr int bit_words(int n) { return ceil_div(n, 64); }
+__host__ __device__ constexpr int bit_word(int i) { return i >> 6; }
+template <typename WordT>
+__host__ __device__ __forceinline__ bool test_bit(const WordT* words, int i) {
+    return (words[i >> 6] >> (i & 63)) & WordT{1};
+}
+template <typename WordT>
+__host__ __device__ __forceinline__ void set_bit(WordT* words, int i) {
+    words[i >> 6] |= (WordT{1} << (i & 63));
+}
+// OR-reduces bits [lo, hi) of a packed bitmap; lo/hi need not be word-aligned or word-sized
+// (partial words at either end are masked off before the OR). The first word keeps bits
+// [lo%64, 64), interior words are taken whole, and the last word keeps bits [0, hi%64).
+template <typename WordT>
+__host__ __device__ __forceinline__ bool bit_range_any(const WordT* words, int lo, int hi) {
+    if (lo == hi) return false;
+    const WordT whole_word_mask = ~WordT{0};
+    const WordT first_word_mask = ~((WordT{1} << (lo & 63)) - WordT{1});
+    const WordT last_word_mask = ((hi & 63) == 0) ? whole_word_mask : ((WordT{1} << (hi & 63)) - WordT{1});
+    WordT acc = 0;
+    WordT cur_mask = first_word_mask;
+    int wi = bit_word(lo);
+    for (; wi < bit_words(hi) - 1; wi++) {
+        acc |= words[wi] & cur_mask;
+        cur_mask = whole_word_mask;
+    }
+    cur_mask &= last_word_mask;
+    return (acc | (words[wi] & cur_mask)) != 0;
 }
 
 // Buffer-relative offsets into rdma_buffer. Pointers are resolved at use time

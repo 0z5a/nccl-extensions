@@ -46,23 +46,6 @@ __device__ __forceinline__ int getCtxId(int hashKey) {
     return hashKey % MAX_NCCL_GIN_CTX_PER_COMM;
 }
 
-__device__ __forceinline__ int getLocalExpertIdx(int expertIdx, int numLocalExperts) {
-    return (expertIdx >= 0) ? expertIdx % numLocalExperts : -1;
-}
-
-// Distance from `myRank` to `otherRank` going forward around the ring, in [0, numRanks).
-// Used to place each sender's per-srcRank staging region at an offset relative to
-// (sender,receiver) rather than at the sender's absolute rank index to enable
-// NVL VA distribution.
-__device__ __forceinline__ int relativeRankSlot(int senderRank, int receiverRank, int numRanks) {
-    return (senderRank >= receiverRank) ? (senderRank - receiverRank)
-                                         : (senderRank - receiverRank + numRanks);
-}
-
-__device__ __forceinline__ int getExpertRankIdx(int expertIdx, int numLocalExperts) {
-    return (expertIdx >= 0) ? expertIdx / numLocalExperts : -1;
-}
-
 __device__ __forceinline__ unsigned int selectLowLatencyEpoch(
     LowLatencyEpochState* epochState, int phases, int smId, int threadId) {
     if (phases & LOW_LATENCY_SEND_PHASE) {
@@ -1040,6 +1023,18 @@ LOW_LATENCY_DISPATCH_RECV:
         // Wait tokens to arrive
         int numRecvTokens;
         EP_DEVICE_ASSERT(numWarpsPerGroup > 1 and numWarpGroups <= kLlDispatchMaxWarpGroups);
+
+        // Per-source wire layout: NVLink (intra-LSA) peers use the split layout,
+        // cross-LSA RDMA peers the interleaved one. The mapping mirrors the
+        // sender-side ncclGetP2pPtr check above.
+        bool isNvlinkSrc = false;
+        {
+            constexpr int kCommId = 0;
+            ncclTeam lsa = ncclTeamLsa(devComms[kCommId]);
+            ncclTeam world = ncclTeamWorld(devComms[kCommId]);
+            isNvlinkSrc = ncclTeamRankIsMember(lsa, world, srcRank);
+        }
+
         if (subWarpId == 1 and laneId == 0) {
             numRecvTokens = waitForRecvTokensRelaxed(
                 srcRank,
@@ -1074,16 +1069,10 @@ LOW_LATENCY_DISPATCH_RECV:
             }
         }
 
-        // Pick per srcRank wire layout: NVLink (split) if the sender is an
-        // intra-LSA peer, RDMA (interleaved) otherwise. The mapping mirrors
-        // the sender-side ncclGetP2pPtr check above.
-        bool isNvlinkSrc;
-        {
-            constexpr int kCommId = 0;
-            ncclTeam lsa = ncclTeamLsa(devComms[kCommId]);
-            ncclTeam world = ncclTeamWorld(devComms[kCommId]);
-            isNvlinkSrc = ncclTeamRankIsMember(lsa, world, srcRank);
-        }
+        // Per-source receive region: the sender's slot is relative to this
+        // receiver (relativeRankSlot); both layouts read from it below.
+        const uint8_t* const srcRankRecvBase = reinterpret_cast<const uint8_t*>(recvBuf) +
+            static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank * numBytesPerMsg;
 
         if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
             for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens * numTopk;
@@ -1091,9 +1080,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 int tokenIdx = i / numTopk;
                 int topkIdx = i % numTopk;
 
-                const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) +
-                    static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank *
-                        numBytesPerMsg;
+                const auto recvBufUint8 = srcRankRecvBase;
                 // NVLink split layout puts the per-slot header at the head of
                 // the per-srcRank region; the legacy RDMA layout has each
                 // header inline at the start of its [hdr|data|scales] message.
@@ -1161,9 +1148,7 @@ LOW_LATENCY_DISPATCH_RECV:
             // outRecvTopkIdx/Weights are written so the user can route and reduce.
             for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens;
                  i += numWarpsPerGroup * numLocalExperts) {
-                const auto recvBufUint8 = reinterpret_cast<uint8_t*>(recvBuf) +
-                    static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank *
-                        numBytesPerMsg;
+                const auto recvBufUint8 = srcRankRecvBase;
                 const auto recvHdrPtr =
                     isNvlinkSrc ? (recvBufUint8 + i * dispatch_hdr_sz) : (recvBufUint8 + i * numBytesPerMsg);
                 const auto recvBufHdr = reinterpret_cast<const DispatchHdr<kLayout>*>(recvHdrPtr);

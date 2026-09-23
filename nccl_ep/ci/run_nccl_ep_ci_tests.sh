@@ -117,6 +117,12 @@ run_ep_bench_layout_size_sweep low-latency em rm
 # Token-distribution variants stay at the canonical LL batch size (cover the variant axis,
 # not the size axis — already swept above).
 run_ep_bench_variants low-latency 128
+# Independent LL dispatch/combine grids must remain correct when unequal and
+# not divisible by 4 or 8. Combine commonly benefits from the larger budget.
+run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+  --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+  --dispatch-num-sms 21 --combine-num-sms 23 --validate
+
 
 # Exact LL top-k specialization at the dispatch geometry boundary (31 forwarding
 # warps plus one control warp). Keep this targeted smoke test at the canonical
@@ -167,6 +173,12 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
   EP_BENCH_HIDDEN=7168
   run_ep_bench_layout_size_sweep high-throughput fl em
   run_ep_bench_variants high-throughput 4096
+  # Independent HT dispatch/combine grids, including non-multiple budgets and
+  # barrier-session separation.
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
+    --dispatch-num-sms 15 --combine-num-sms 17 --validate
+
   run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
     --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
     --validate --dispatch-only --zcopy --dispatch-quantization scales-forward \
@@ -174,7 +186,8 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
 
   # EM pull dispatch + push combine (single NVLink LSA team), with the NONE (bf16
   # dispatch + combine) and MXFP8 (fp8 tokens + E8M0 block-32 scales, dispatch-only)
-  # recipes.
+  # recipes. --mxfp8 also selects the MXFP8 combine recipe, which --dispatch-only makes
+  # moot here -- push combine does not quantize, and the library rejects the pair.
   (
     export NCCL_EP_HT_EM_PULL_PUSH=1
     run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
@@ -184,6 +197,27 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
       --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 \
       --validate --dispatch-only --mxfp8
   )
+
+  # MXFP8 combine: HT expert-major, local_permute (the only path that quantizes), single
+  # NVLink LSA team, hidden % 512 == 0 for the packed [FP8 H | E8M0 H/32] row. Needs a
+  # CUDA 12.8+ build for the E8M0 type; older toolkits reject the recipe up front.
+  # Combine-only -- BF16 dispatch, MXFP8 combine: the combine input is the dispatch output,
+  # and --validate predicts the quantization instead of widening the tolerance.
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 \
+    --validate --combine-quantization mxfp8
+  # End-to-end -- MXFP8-shaped scales-forward dispatch and MXFP8 combine in one pass, the
+  # combination --mxfp8 selects. The quantized dispatch output cannot be staged as BF16, so
+  # the bench rebuilds each slot from the (src_rank, token) the delivered row carries.
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 \
+    --validate --mxfp8
+  # Backward combine with the recipe on. The recipe is direction-agnostic -- nothing in the
+  # host gating or the kernel templates ties it to the forward pass -- but this is the only
+  # thing that instantiates the backward MXFP8 JIT variant.
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 \
+    --validate --backward --combine-quantization mxfp8
 
   # FOLLOW-UP: HT fp32 dispatch SMEM exceeds the device cap (~227KB on H100) at
   # hidden=7168 with the default stages/pipelines, and currently std::abort()s in

@@ -72,7 +72,7 @@ extern "C" {
 //       .tokens = my_tokens,
 //   };
 // ============================================================================
-#define NCCL_EP_API_VERSION 2
+#define NCCL_EP_API_VERSION 3
 #define NCCL_EP_MAGIC 0xC00FFFEEu
 
 #define NCCL_EP_STRUCT_INIT(type_, magic_) \
@@ -300,8 +300,8 @@ typedef struct {
     // Number of channels per rank (NCCL_EP_AUTO for auto).
     // In high throughput collectives, each channel occupies 2 SMs
     unsigned int num_channels;
-    // Maximum number of SMs to use for EP kernels (dispatch, combine, preprocessing).
-    // Default: NCCL_EP_AUTO — algorithm-dependent default.
+    // Shared maximum number of SMs for dispatch and combine. Retained as the
+    // fallback for dispatch_num_sms/combine_num_sms. Default: NCCL_EP_AUTO.
     unsigned int max_num_sms;
     // Device memory allocator; zero-init (all NULL) uses cudaMalloc/cudaFree.
     ncclEpAllocConfig_t alloc;
@@ -331,6 +331,10 @@ typedef struct {
     // handle's num_topk against it.
     unsigned int num_topk;
     unsigned char padding_v2[4]; // consumes V2 tail padding; future fields append after it
+    // Dispatch SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
+    unsigned int dispatch_num_sms;
+    // Combine SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
+    unsigned int combine_num_sms;
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -347,11 +351,14 @@ typedef struct {
 #define NCCL_EP_GROUP_CONFIG_V2_LAST_FIELD padding_v2
 #define NCCL_EP_GROUP_CONFIG_V2_SIZE 112u
 
-#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 2
+#define NCCL_EP_GROUP_CONFIG_V3_LAST_FIELD combine_num_sms
+#define NCCL_EP_GROUP_CONFIG_V3_SIZE 120u
+#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 3
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 1);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 2);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 3);
 
 // Opaque type forward declaration
 typedef struct ncclEpGroup* ncclEpGroup_t;
@@ -490,9 +497,12 @@ typedef struct {
     ncclEpTensor_t* tokens; // required; post-expert activation tensor
     ncclEpTensor_t* topk_weights; // optional; HT backward combine only:
   //   2D [num_recv_tokens, top_k], ncclFloat32
-    // Experimental NVFP4 combine only: FP32 per-expert-token global quantization scales.
-    // For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when amax is 0.
-    // This scale is computed from the post-expert activation before ncclEpCombine.
+    // Optional; recipe-dependent:
+    // - NCCL_EP_COMB_QUANT_NONE / NCCL_EP_COMB_QUANT_MXFP8: must be NULL
+    //   (MXFP8 generates its E8M0 block scales internally).
+    // - NCCL_EP_COMB_QUANT_NVFP4 (experimental): FP32 per-expert-token global quantization
+    //   scales. For each valid token row, pass 2688 / amax(abs(tokens[row, :])); use 0 when
+    //   amax is 0. Computed from the post-expert activation before ncclEpCombine.
     ncclEpTensor_t* scales;
 } ncclEpCombineInputs_t;
 
@@ -789,6 +799,17 @@ typedef enum {
     // The caller supplies FP32 global scales through combine inputs->scales;
     // the kernel follows the DeepEP-LL NVFP4 pack/dequantize contract.
     NCCL_EP_COMB_QUANT_NVFP4 = 1,
+    // MXFP8: inputs->tokens are BF16 and inputs->scales must be NULL. The library
+    // quantizes to FP8 E4M3 + per-block E8M0 block scales (block 32) internally,
+    // transports the packed row, and de-quantizes in the FP32 weighted reduction;
+    // combine output is BF16. Requires expert-major local-permute path (HT only)
+    // and a single LSA team: the packed row is an intra-node NVLink wire format,
+    // so a group spanning multiple LSA teams (inter-node) is rejected.
+    // Hidden must be a multiple of 512: the packed [FP8 H | E8M0 H/32] row is
+    // 16-byte aligned iff H % 512 == 0 (and the scale row is then >= 16 B for TMA).
+    // Requires a CUDA 12.8 or newer toolkit: the E8M0 reciprocal-scale conversion
+    // uses __nv_fp8_e8m0. The call is rejected on builds made with older toolkits.
+    NCCL_EP_COMB_QUANT_MXFP8 = 2,
 } ncclEpCombQuant_t;
 
 // EP dispatch configuration structure
@@ -875,7 +896,10 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                The actual number of tokens received by rank `r` is obtained via
 //                                layout_info->src_rank_counters[`r`] (see below).
 //   layout_info   - [IN,OUT] Named local tensors for layout-specific counters (see ncclEpLayoutInfo_t).
-//                              * For HT mode should be NULL, the counter information is available through ncclEpUpdateHandle.
+//                              * For HT mode normally NULL: the counter information is available through
+//                                ncclEpUpdateHandle. Exception: HT expert-major count mode may instead
+//                                pass expert_counters and recv_total_counter here, published by dispatch
+//                                itself rather than ncclEpUpdateHandle.
 //                              * For LL mode, layout-specific counter tensors must be provided (see ncclEpLayoutInfo_t doc).
 //                                * Expert-major layout: expert_counters tensor is required.
 //                                * Rank-major layout: src_rank_counters is optional; when provided,

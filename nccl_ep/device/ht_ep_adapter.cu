@@ -107,6 +107,166 @@ template void
 convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, int, int, int, int, int, cudaStream_t);
 
 // ============================================================================
+// Count-exchange path: per-destination-rank send-count histogram
+// ============================================================================
+// For each of this rank's tokens, count destinations into histograms: cnt_rank[r] = send count
+// to dest rank r, cnt_expert[e] = send count to global expert e. Ranks are deduped per token, so
+// a token hitting several experts on one dest rank counts once (rank-major dispatch sends one
+// copy per dest rank).
+template <typename TopkIdxT>
+void build_count_metadata(
+    const TopkIdxT* topk_idx,
+    int64_t* cached_topk_idx,
+    int num_tokens,
+    int num_topk,
+    int experts_per_rank,
+    int num_world_dst_ranks,
+    int num_experts,
+    int32_t* cnt_rank,
+    int32_t* cnt_expert,
+    int tokens_per_chunk,
+    int32_t* own_chunk_rank,
+    int lsa_team_size,
+    int num_lsa_teams,
+    uint64_t* token_dst_rank_bitmap,
+    int32_t* per_src_lteam_num_tokens,
+    int my_lteam,
+    bool* rdma_to_attn_map,
+    int r2a_offset,
+    int num_sms,
+    cudaStream_t stream)
+{
+    EP_HOST_ASSERT(num_experts == experts_per_rank * num_world_dst_ranks &&
+           "build_count_metadata: num_experts must equal experts_per_rank * num_world_dst_ranks");
+    EP_HOST_ASSERT(cnt_expert && own_chunk_rank && token_dst_rank_bitmap && cached_topk_idx &&
+           per_src_lteam_num_tokens && rdma_to_attn_map &&
+           "build_count_metadata: required buffers must be non-null");
+    EP_HOST_ASSERT(num_lsa_teams == 1 &&
+           "build_count_metadata: count mode is single-LSA-team only (num_lsa_teams must be 1)");
+    EP_HOST_ASSERT(num_world_dst_ranks == num_lsa_teams * lsa_team_size &&
+           "build_count_metadata: num_world_dst_ranks must equal num_lsa_teams * lsa_team_size");
+    int block = jit::kBuildCountMetadataBlockDim;
+    int grid = nccl_ep::ceil_div(num_tokens, block);
+    if (grid < 1) grid = 1;
+    // Cap the grid at the scan preprocessing SM count; the kernel grid-strides over the rest.
+    if (num_sms > 0 && grid > num_sms) grid = num_sms;
+    const int cap = nccl_ep::align(num_world_dst_ranks, 64);   // 64,128,...,1024
+    EP_HOST_ASSERT(cap >= 64 && cap <= 1024 && "num_world_dst_ranks exceeds 1024");
+
+    ::ht_ep::build_count_metadata_param_t param{};
+    param.topk_idx                          = topk_idx;
+    param.cached_topk_idx                   = cached_topk_idx;
+    param.cnt_rank                          = cnt_rank;
+    param.cnt_expert                        = cnt_expert;
+    param.own_chunk_rank                    = own_chunk_rank;
+    param.token_dst_rank_bitmap             = token_dst_rank_bitmap;
+    param.per_src_lteam_num_tokens          = per_src_lteam_num_tokens;
+    param.rdma_to_attn_map                  = rdma_to_attn_map;
+    param.num_tokens                        = num_tokens;
+    param.num_topk                          = num_topk;
+    param.tokens_per_chunk                  = tokens_per_chunk;
+    param.my_lteam                          = my_lteam;
+    param.r2a_offset                        = r2a_offset;
+
+    jit::launch_build_count_metadata_jit(
+        cap, experts_per_rank, lsa_team_size, sizeof(TopkIdxT) == 8, param, grid, stream);
+}
+
+template void build_count_metadata<int32_t>(
+    const int32_t*, int64_t*, int, int, int, int, int, int32_t*, int32_t*, int, int32_t*, int, int,
+    uint64_t*, int32_t*, int, bool*, int, int, cudaStream_t);
+template void build_count_metadata<int64_t>(
+    const int64_t*, int64_t*, int, int, int, int, int, int32_t*, int32_t*, int, int32_t*, int, int,
+    uint64_t*, int32_t*, int, bool*, int, int, cudaStream_t);
+
+// ============================================================================
+// compute_layout_info (unfused count path): reduces the world-AllGathered
+// per-source count rows into this rank's per-expert recv counts and emits the
+// caller layout tensors. Order-independent, so valid whether count mode's current
+// single-LSA-team constraint holds or is later lifted to multiple LSA teams
+// (multinode). Counts exclude dropped tokens; recv_total_counter reports the
+// pre-drop total (same DROP contract as scan mode: em_populate_cnt_tensors).
+// ============================================================================
+template <typename EM_OUT_T>
+__global__ void compute_layout_info_kernel(
+    const int32_t* __restrict__ cached_cnt_rows,   // [num_src_ranks * (num_src_ranks + num_experts)]
+    int num_src_ranks,
+    int num_experts,
+    int experts_per_rank,
+    int my_rank,
+    int em_alignment,
+    int max_recv_tokens_per_rank,
+    bool allow_overflow_drop,
+    bool out_is_int64,
+    int64_t* em_internal_offsets,     // [experts_per_rank + 1] handle expert_token_offsets
+    EM_OUT_T* em_padded_out_counts,   // caller expert_counters
+    EM_OUT_T* em_out_offsets,         // caller expert_offsets
+    int32_t* em_actual_counts_out,    // handle authoritative per-expert counts
+    void* recv_total_counter) {
+    extern __shared__ int32_t s_raw[]; // [2 * experts_per_rank + 1]: expert_total | expert_base | overflow_flag
+    ::ht_ep::scan_flat_smem_t smem{};
+    smem.expert_total = s_raw;
+    smem.expert_base = s_raw + experts_per_rank;
+    smem.overflow_flag = s_raw + 2 * experts_per_rank;
+    const size_t row_ints = (size_t)num_src_ranks + (size_t)num_experts;
+    for (int e = threadIdx.x; e < experts_per_rank; e += blockDim.x) {
+        // my_rank is the world rank, so my experts are [my_rank*epr, ...) in the world-global
+        // expert id space; this indexing holds whether count mode's current single-LSA-team
+        // constraint holds or is later lifted to multiple LSA teams (multinode).
+        const int ge = my_rank * experts_per_rank + e;
+        int c = 0;
+        // cached_cnt_rows: one row per source rank, each = [ per-rank counts (num_src_ranks) |
+        // per-expert counts (num_experts) ]. Row s starts at s*row_ints; +num_src_ranks skips the
+        // per-rank block and +ge indexes this expert in the per-expert block. Sum over all rows.
+        for (int s = 0; s < num_src_ranks; s++)
+            c += cached_cnt_rows[(size_t)s * row_ints + num_src_ranks + ge];
+        smem.expert_total[e] = c;
+    }
+    __syncthreads();
+    ::ht_ep::em_populate_cnt_tensors<EM_OUT_T>(
+        smem, experts_per_rank, em_alignment, em_internal_offsets,
+        em_padded_out_counts, em_out_offsets, em_actual_counts_out,
+        recv_total_counter, out_is_int64, max_recv_tokens_per_rank, allow_overflow_drop);
+}
+
+void compute_layout_info(
+    const int32_t* cached_cnt_rows,
+    int num_src_ranks,
+    int num_experts,
+    int experts_per_rank,
+    int my_rank,
+    int em_alignment,
+    int max_recv_tokens_per_rank,
+    bool allow_overflow_drop,
+    bool out_is_int64,
+    int64_t* em_internal_offsets,
+    void* em_padded_out_counts,
+    void* em_out_offsets,
+    int32_t* em_actual_counts_out,
+    void* recv_total_counter,
+    cudaStream_t stream)
+{
+    assert(num_experts == num_src_ranks * experts_per_rank);
+    // One thread per local expert for the count reduction (up to 1024); the stride loop
+    // still covers experts_per_rank > blockDim. The prefix-scan stays single-threaded.
+    const int block = 1024;
+    const size_t smem_bytes = ((size_t)2 * experts_per_rank + 1) * sizeof(int32_t);
+    if (out_is_int64) {
+        compute_layout_info_kernel<int64_t><<<1, block, smem_bytes, stream>>>(
+            cached_cnt_rows, num_src_ranks, num_experts, experts_per_rank, my_rank,
+            em_alignment, max_recv_tokens_per_rank, allow_overflow_drop, out_is_int64,
+            em_internal_offsets, static_cast<int64_t*>(em_padded_out_counts),
+            static_cast<int64_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter);
+    } else {
+        compute_layout_info_kernel<int32_t><<<1, block, smem_bytes, stream>>>(
+            cached_cnt_rows, num_src_ranks, num_experts, experts_per_rank, my_rank,
+            em_alignment, max_recv_tokens_per_rank, allow_overflow_drop, out_is_int64,
+            em_internal_offsets, static_cast<int32_t*>(em_padded_out_counts),
+            static_cast<int32_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter);
+    }
+}
+
+// ============================================================================
 // Convert topk to uint16 topk routing map (pull dispatch only)
 // ============================================================================
 // Alternative to the bitmap routing map: keep each token's top-k global expert
@@ -224,20 +384,30 @@ template void sparse_to_dense_prob<int64_t>(const int64_t*, const float*, float*
 // Each thread handles one token.
 __global__ void sparse_to_dense_prob_combine_kernel(
     const float* __restrict__ topk_weights,           // [num_tokens, topk]
-    const bool* __restrict__ local_expert_routing_map, // [num_tokens, experts_per_rank]
+    const bool* __restrict__ local_expert_routing_map, // [num_tokens, experts_per_rank] (bitmap if lerm_bitmap)
     float* __restrict__ dense_prob,                   // [num_tokens, experts_per_lsa_team]
     int num_tokens,
     int num_topk,
     int experts_per_rank,
     int experts_per_lsa_team,
-    int local_rank) {
+    int local_rank,
+    bool lerm_bitmap) { // true only for count mode; scan mode passes false (bool-per-expert LERM)
+    // TODO: switch all modes to the packed bitmap LERM and drop the bool-per-expert path.
     int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token >= num_tokens) return;
+
+    // Count mode packs LERM as ceil(epr/64) u64 words per token; scan mode is one bool per expert.
+    const int lerm_words = nccl_ep::bit_words(experts_per_rank);
+    const uint64_t* lerm_bits = reinterpret_cast<const uint64_t*>(local_expert_routing_map);
+    auto routed = [&](int e) -> bool {
+        return lerm_bitmap ? nccl_ep::test_bit(lerm_bits + (size_t)token * lerm_words, e)
+                           : local_expert_routing_map[(size_t)token * experts_per_rank + e];
+    };
 
     // Scan local experts in order (matches dense_to_sparse_prob output order)
     int k_in = 0;
     for (int e = 0; e < experts_per_rank && k_in < num_topk; e++) {
-        if (local_expert_routing_map[token * experts_per_rank + e]) {
+        if (routed(e)) {
             // This expert is active for this token - take next weight from sparse input
             float weight = topk_weights[token * num_topk + k_in];
 
@@ -263,6 +433,7 @@ void sparse_to_dense_prob_combine(
     int experts_per_rank,
     int experts_per_lsa_team,
     int local_rank,
+    bool lerm_bitmap,
     cudaStream_t stream) {
     if (num_tokens <= 0) return; // zero work; grid_size == 0 is an invalid launch config
     int block_size = 256;
@@ -276,7 +447,8 @@ void sparse_to_dense_prob_combine(
         num_topk,
         experts_per_rank,
         experts_per_lsa_team,
-        local_rank);
+        local_rank,
+        lerm_bitmap);
 }
 
 // ============================================================================
@@ -300,16 +472,25 @@ __global__ void dense_to_sparse_prob_kernel(
     int local_rank,
     int global_expert_offset, // = group_rank * experts_per_rank; added to local id under GLOBAL
     ncclEpExpertIdKind_t recv_topk_idx_kind,
-    bool expert_major) {
+    bool expert_major,
+    bool lerm_bitmap) {
     int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token >= num_recv_tokens) return;
+
+    // Count mode packs LERM as ceil(epr/64) u64 words per token; scan mode is one bool per expert.
+    const int lerm_words = nccl_ep::bit_words(experts_per_rank);
+    const uint64_t* lerm_bits = reinterpret_cast<const uint64_t*>(local_expert_routing_map);
+    auto routed = [&](int e) -> bool {
+        return lerm_bitmap ? nccl_ep::test_bit(lerm_bits + (size_t)token * lerm_words, e)
+                           : local_expert_routing_map[(size_t)token * experts_per_rank + e];
+    };
 
     if (expert_major) {
     // Each slot has at most one matching local expert (the one defining the slot).
     // Write the single scalar weight at recv_topk_weights[token]; default 0.
         float weight = 0.0f;
         for (int e = 0; e < experts_per_rank; e++) {
-            if (local_expert_routing_map[token * experts_per_rank + e]) {
+            if (routed(e)) {
                 int dense_idx = token * experts_per_lsa_team + local_rank * experts_per_rank + e;
                 weight = dense_prob[dense_idx];
                 break;
@@ -328,7 +509,7 @@ __global__ void dense_to_sparse_prob_kernel(
   // Scan local experts (the ones this rank is responsible for)
     for (int e = 0; e < experts_per_rank && k_out < topk; e++) {
     // Check if this token is routed to expert e
-        if (local_expert_routing_map[token * experts_per_rank + e]) {
+        if (routed(e)) {
       // Numbering: LOCAL writes within-rank id e; GLOBAL adds the per-group offset.
             int64_t expert_id = (recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL) ?
                                     static_cast<int64_t>(global_expert_offset + e) :
@@ -418,6 +599,7 @@ void dense_to_sparse_prob(
     int global_expert_offset,
     ncclEpExpertIdKind_t recv_topk_idx_kind,
     bool expert_major,
+    bool lerm_bitmap,
     cudaStream_t stream) {
     if (num_recv_tokens <= 0) return; // zero work; grid_size == 0 is an invalid launch config
     int block_size = 256;
@@ -435,7 +617,8 @@ void dense_to_sparse_prob(
         local_rank,
         global_expert_offset,
         recv_topk_idx_kind,
-        expert_major);
+        expert_major,
+        lerm_bitmap);
 }
 
 // ============================================================================
@@ -601,7 +784,7 @@ ncclResult_t call_metadata_preprocessing(
             jit::launch_scan_em(NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, num_lsa_teams, lsa_team_size, sp, stream);
         }
 
-        const int num_mask_words = (lsa_team_size + 63) / 64;
+        const int num_mask_words = nccl_ep::bit_words(lsa_team_size);
         const int num_total_attn_tokens = num_tokens_per_rank * lsa_team_size * num_lsa_teams;
         launch_build_em_tables(
             global_routing_map,
@@ -712,7 +895,7 @@ size_t get_preprocessing_scan_tmp_size(int num_blocks, int lsa_team_size) {
 }
 
 size_t get_rank_mask_elem_size(int lsa_team_size) {
-    return ((lsa_team_size + 63) / 64) * sizeof(uint64_t);
+    return nccl_ep::bit_words(lsa_team_size) * sizeof(uint64_t);
 }
 
 
@@ -990,6 +1173,32 @@ template <typename TOKEN_DATA_TYPE>
     kp.guard_enabled = params.guard_enabled;
     kp.max_recv_tokens_per_rank = params.max_recv_tokens_per_rank;
 
+    // Count-exchange in-kernel s2d build.
+    kp.dispatch_push_count.active = params.dispatch_push_count.active;
+    kp.dispatch_push_count.own_row = params.dispatch_push_count.own_row;
+    kp.dispatch_push_count.cached_cnt_rows = params.dispatch_push_count.cached_cnt_rows;
+    kp.dispatch_push_count.fused_meta_dispatch = params.dispatch_push_count.fused_meta_dispatch;
+    kp.dispatch_push_count.s2d_out = params.dispatch_push_count.s2d_out;
+    kp.dispatch_push_count.published_offset = params.dispatch_push_count.published_offset;
+    kp.dispatch_push_count.per_src_lteam_chunk_rank = params.dispatch_push_count.per_src_lteam_chunk_rank;
+    kp.dispatch_push_count.cached_topk_idx = params.dispatch_push_count.cached_topk_idx;
+    kp.dispatch_push_count.num_recv_out = params.dispatch_push_count.num_recv_out;
+    kp.dispatch_push_count.per_src_lteam_num_tokens = params.dispatch_push_count.per_src_lteam_num_tokens;
+    kp.dispatch_push_count.num_topk = params.dispatch_push_count.num_topk;
+    kp.dispatch_push_count.num_src_ranks = params.dispatch_push_count.num_src_ranks;
+    kp.dispatch_push_count.lsa_team_size = params.dispatch_push_count.lsa_team_size;
+    kp.dispatch_push_count.token_dst_rank_bitmap = params.dispatch_push_count.token_dst_rank_bitmap;
+    kp.dispatch_push_count.recv_tables_ptrs = params.dispatch_push_count.recv_tables_ptrs;
+    kp.dispatch_push_count.recv_max_slots = params.dispatch_push_count.recv_max_slots;
+    kp.dispatch_push_count.allow_overflow_drop = params.dispatch_push_count.allow_overflow_drop;
+    kp.dispatch_push_count.expert_token_offsets_out = params.dispatch_push_count.expert_token_offsets_out;
+    kp.dispatch_push_count.per_expert_counts_out = params.dispatch_push_count.per_expert_counts_out;
+    kp.dispatch_push_count.caller_offsets = params.dispatch_push_count.caller_offsets;
+    kp.dispatch_push_count.caller_counts = params.dispatch_push_count.caller_counts;
+    kp.dispatch_push_count.caller_recv_total = params.dispatch_push_count.caller_recv_total;
+    kp.dispatch_push_count.caller_out_is_int64 = params.dispatch_push_count.caller_out_is_int64;
+    kp.dispatch_push_count.em_alignment = params.dispatch_push_count.em_alignment;
+
     // Pass device communicators and windows
     kp.dcomm = params.dcomm;
     kp.token_window = params.nccl_token_window;
@@ -1133,10 +1342,12 @@ ncclResult_t dispatch_impl(
             return ncclInvalidArgument;
         }
 
-        // Warp budget caps the pipeline count (2 warps per pipeline).
+        // Warp budget caps the pipeline count (2 warps per pipeline). Count mode swaps the
+        // EM PAD warp for a 2-warp MAP group (see compute_dispatch_warp_layout), so it must
+        // be reserved here too.
         const int fixed_warps =
             (num_lsa_teams != 1 ? NCCL_EP_HT_DISPATCH_N2N_WARPS : 0) +
-            (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? 1 : 0);
+            (params.dispatch_push_count.active ? 2 : (params.layout == NCCL_EP_LAYOUT_EXPERT_MAJOR ? 1 : 0));
         const int max_pipelines = (32 - fixed_warps) / 2;
         if (pipelines_from_env && requested_pipelines > max_pipelines) {
             std::fprintf(stderr, "[nccl_ep] dispatch pipelines=%d exceeds block limit; maximum=%d.\n",
@@ -1216,7 +1427,8 @@ ncclResult_t dispatch_impl(
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
         const jit::dispatch_warp_layout_t dispatch_layout =
-            jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout, d_config.num_pipelines);
+            jit::compute_dispatch_warp_layout(num_lsa_teams, params.layout, d_config.num_pipelines,
+                                              params.dispatch_push_count.active);
         const int dispatch_wt_total = num_blocks * (dispatch_layout.block_dim / 32);
         ::ht_ep::dispatch_warp_timing_entry_t* d_wt = nullptr;
         CUDA_CHECK(cudaMalloc(&d_wt, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t)));
@@ -1234,12 +1446,14 @@ ncclResult_t dispatch_impl(
             params.layout,
             kp.hidden_dim,
             sf_bytes_per_token,
+            params.experts_per_rank,
             env,
             kernel_arg.data(),
             kernel_arg.size(),
             static_cast<int>(smem_size),
             stream,
-            kernel_spec); r != ncclSuccess)
+            kernel_spec,
+            params.dispatch_push_count.active); r != ncclSuccess)
             return r;
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
@@ -1307,6 +1521,7 @@ ncclResult_t call_dispatch(
     kp.lsa_S2G_flags = params.lsa_S2G_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
     kp.guard_enabled = params.guard_enabled;
+    kp.combine_barrier_offset = params.combine_barrier_offset;
 
     // Runtime config
     kp.local_rank = params.local_rank;
@@ -1343,10 +1558,14 @@ std::vector<uint8_t> build_combine_arg_buffer(
     using ParamBase = ::ht_ep::combine_kernel_param_base_t;
     static_assert(sizeof(ParamBase) % alignof(void*) == 0);
 
+    // Must match combine_kernel_param_t<LSA_TEAM_SIZE> exactly: base, then the
+    // expert_input_token[LSA] and expert_input_prob[LSA] pointer arrays. MXFP8 needs no
+    // scale fields: E8M0 rows ride in the packed token row emitted by the prologue.
     const size_t base_size = sizeof(ParamBase);
     const size_t token_offset = base_size;
     const size_t prob_offset = token_offset + params.lsa_team_size * sizeof(uint16_t*);
-    const size_t total_size = prob_offset + params.lsa_team_size * sizeof(float*);
+    size_t total_size = prob_offset + params.lsa_team_size * sizeof(float*);
+    total_size = (total_size + alignof(void*) - 1) & ~(alignof(void*) - 1);
 
     std::vector<uint8_t> arg(total_size);
     std::memcpy(arg.data(), &kp, sizeof(kp));
@@ -1394,6 +1613,48 @@ ncclResult_t combine_impl(
         &env->combine_num_pipelines,
         multi_lsa ? NCCL_EP_HT_COMBINE_CROSS_LSA_PIPELINES :
                     NCCL_EP_HT_COMBINE_LSA_PIPELINES);
+
+    // Mechanism A: auto-reduce pipelines to keep NUM_ACC within MAX_ACC.
+    //
+    // NUM_ACC = ceil(H/2 / THRDS_PER_PIPELINE) where THRDS = (RED_WARPS/P)*32.
+    // 1-node default P=2: H=7168 → NUM_ACC=56 ≤ 64 (safe, no change).
+    //                     H=16384 → NUM_ACC=128 > 64 → NVCC partial-unroll spills
+    //                     acc_token_fp32[] to local memory → +15% vs BF16.
+    // Auto-reducing to P=1: THRDS=128, NUM_ACC=64 ≤ 64 → fully register-resident.
+    // Multi-node already uses P=1 (CROSS_LSA default); this path does nothing.
+    // Override: NCCL_EP_COMBINE_NUM_PIPELINES=<P> pins the count and disables this.
+    if (!env->combine_num_pipelines.is_set) {
+        const int red_warps = NCCL_EP_HT_COMBINE_RED_WARPS;
+        const int orig_auto_p = c_config.num_pipelines;
+        while (c_config.num_pipelines > 1) {
+            const int thrds = (red_warps / c_config.num_pipelines) * 32;
+            const int num_acc = nccl_ep::ceil_div(kp.hidden_dim / 2, thrds);
+            if (num_acc <= NCCL_EP_COMBINE_MAX_ACC) break;
+            int new_p = c_config.num_pipelines - 1;
+            while (new_p > 1 && red_warps % new_p != 0) --new_p;
+            c_config.num_pipelines = new_p;
+        }
+        // Diagnostics only: keep the ostringstream and the announce_once mutex off the
+        // launch path when verbose logging is disabled.
+        if (c_config.num_pipelines != orig_auto_p && nccl_ep_env_verbose(*env)) {
+            const int thrds_old = (NCCL_EP_HT_COMBINE_RED_WARPS / orig_auto_p) * 32;
+            const int num_acc_old = nccl_ep::ceil_div(kp.hidden_dim / 2, thrds_old);
+            const int thrds_new = (NCCL_EP_HT_COMBINE_RED_WARPS / c_config.num_pipelines) * 32;
+            const int num_acc_new = nccl_ep::ceil_div(kp.hidden_dim / 2, thrds_new);
+            std::ostringstream auto_key;
+            auto_key << "auto_reduce_pipelines:" << kp.hidden_dim << ':'
+                     << orig_auto_p << ':' << c_config.num_pipelines;
+            if (::nccl_ep::jit::announce_once(auto_key.str())) {
+                std::fprintf(stderr,
+                    "[nccl_ep][auto] H=%d: reduced combine pipelines %d→%d "
+                    "(NUM_ACC %d→%d fits MAX_ACC=%d; fully register-resident). "
+                    "Set NCCL_EP_COMBINE_NUM_PIPELINES=%d to pin the original count.\n",
+                    kp.hidden_dim, orig_auto_p, c_config.num_pipelines,
+                    num_acc_old, num_acc_new, NCCL_EP_COMBINE_MAX_ACC, orig_auto_p);
+            }
+        }
+    }
+
     c_config.num_of_tokens_per_chunk = num_tokens_per_chunk;
     c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_TOK_PER_GROUP;
     c_config.num_of_blocks = num_blocks;
@@ -1438,11 +1699,19 @@ ncclResult_t combine_impl(
     // Bilinear SMEM coefficients: size = fixed + G2S*per_g2s + S2G*per_s2g.
     // Layout size depends only on element width, so FP16 and BF16 (both 2 B)
     // share the BF16 instantiation; only FP32 (4 B) is distinct.
-    const ::ht_ep::comb_smem_cost_t cost = (params.token_dtype == ncclFloat32) ?
-        ::ht_ep::calc_comb_smem_cost<ncclFloat32>(
-            max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
-        ::ht_ep::calc_comb_smem_cost<ncclBfloat16>(
-            max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
+    // MXFP8 sizes both G2S token rings to the packed row (H + H/32 bytes, vs 2H for BF16);
+    // the E8M0 scales ride in the token stage tail, so there is no separate scale region.
+    // S2G output buffers stay at the output dtype width. Size with the recipe on the BF16
+    // instantiation to pick up the reduced G2S cost.
+    const ::ht_ep::comb_smem_cost_t cost =
+        (params.token_dtype == ncclFloat32) ?
+            ::ht_ep::calc_comb_smem_cost<ncclFloat32, NCCL_EP_COMB_QUANT_NONE>(
+                max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
+        (params.combine_recipe == NCCL_EP_COMB_QUANT_MXFP8) ?
+            ::ht_ep::calc_comb_smem_cost<ncclBfloat16, NCCL_EP_COMB_QUANT_MXFP8>(
+                max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model) :
+            ::ht_ep::calc_comb_smem_cost<ncclBfloat16, NCCL_EP_COMB_QUANT_NONE>(
+                max_dispatch_tokens_per_rank, num_lsa_teams, c_config, model);
 
     const int max_smem = max_dynamic_smem;
     const combine_smem_fit_t fit = choose_combine_smem_config(
@@ -1506,7 +1775,9 @@ ncclResult_t combine_impl(
 #endif
 
     std::vector<uint8_t> kernel_arg = build_combine_arg_buffer(kp, params);
-    jit::launch_combine(
+    // Captured rather than NCCLCHECK'd inline so the warp-timing buffers below are still
+    // freed on the failure path.
+    const ncclResult_t combine_res = jit::launch_combine(
         c_config,
         max_dispatch_tokens_per_rank,
         num_lsa_teams,
@@ -1518,13 +1789,15 @@ ncclResult_t combine_impl(
         kernel_arg.size(),
         static_cast<int>(smem_size),
         stream,
-        params.token_dtype);
+        params.token_dtype,
+        params.combine_recipe);
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     jit::combine_dump_warp_timing(combine_layout, num_blocks, d_wt, d_bt, stream);
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
 #endif
+    NCCLCHECK(combine_res);
     return ncclSuccess;
 }
 
@@ -1670,7 +1943,7 @@ void launch_dispatch_permute(
     const int32_t* flat2em_slot_map,
     const int32_t* num_recv_tokens_dev,
     const int64_t* expert_token_offsets,
-    const int32_t* per_expert_counts_active,
+    int32_t* per_expert_counts_active,
     int top_k,
     int experts_per_rank,
     int row_bytes,
@@ -1681,8 +1954,16 @@ void launch_dispatch_permute(
     ncclEpDispQuant_t recipe,
     void* recv_scales_em,
     const void* flat_scale_staging,
-    int scale_row_bytes) {
-    assert(experts_per_rank > 0 && experts_per_rank <= ::ht_ep::kLocalPermuteMaxExpertsPerRank);
+    int scale_row_bytes,
+    int32_t* flat2em_out,
+    const bool* lerm_in,
+    bool* lerm_out,
+    int32_t* em_permute_cursors,
+    bool allow_overflow_drop) {
+    assert(experts_per_rank > 0 && top_k <= ::ht_ep::kLocalPermuteMaxActivePerToken);
+    assert((flat2em_out == nullptr) == (lerm_in == nullptr));
+    assert((flat2em_out == nullptr) == (lerm_out == nullptr));
+    assert((flat2em_out == nullptr) == (em_permute_cursors == nullptr));
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
@@ -1709,6 +1990,11 @@ void launch_dispatch_permute(
     p.recv_scales_em = recv_scales_em;
     p.flat_scale_staging = flat_scale_staging;
     p.scale_row_bytes = scale_row_bytes;
+    p.flat2em_out = flat2em_out;
+    p.lerm_in = lerm_in;
+    p.lerm_out = lerm_out;
+    p.em_permute_cursors = em_permute_cursors;
+    p.allow_overflow_drop = allow_overflow_drop;
 
     ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, stream);
 }
@@ -1752,7 +2038,7 @@ ncclResult_t launch_dispatch_pull(
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
     bool unfused_sync) {
-    assert(experts_per_rank > 0 && experts_per_rank <= ::ht_ep::kLocalPermuteMaxExpertsPerRank);
+    assert(experts_per_rank > 0 && top_k <= ::ht_ep::kPullDispatchMaxActive);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
@@ -1810,7 +2096,7 @@ size_t comb_stage_stride_bytes(int row_bytes, bool reserve_prob) {
     return static_cast<size_t>(::ht_ep::comb_stage_stride_bytes(row_bytes, reserve_prob));
 }
 
-void launch_combine_reduce(
+ncclResult_t launch_combine_reduce(
     void* flat_staging,
     const void* recv_x_em,
     const int32_t* flat2em_slot_map,
@@ -1818,16 +2104,30 @@ void launch_combine_reduce(
     const float* em_weights_in,
     float* flat_weights_out,
     int top_k,
-    int row_bytes,
+    int hidden,
+    int input_row_bytes,
     int caller_num_recv_tokens,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
-    ncclDataType_t token_dtype) {
-    assert(row_bytes > 0 && (row_bytes % 16) == 0);
+    ncclDataType_t token_dtype,
+    ncclEpCombQuant_t combine_recipe) {
+    assert(input_row_bytes > 0 && (input_row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
     assert((em_weights_in == nullptr) == (flat_weights_out == nullptr));
+    // The row the kernel writes: the caller's row for NONE, the packed
+    // [FP8 H | E8M0 H/32] row for MXFP8. Derived forwards from hidden.
+    const int packed_row_bytes =
+        ::nccl_ep::combine_recipe_packed_row_bytes(combine_recipe, hidden, input_row_bytes);
+    // MXFP8 needs hidden a multiple of NCCL_EP_MXFP8_HIDDEN_ALIGN so the scale row is
+    // 16B-aligned for TMA; validateCombineRecipe enforces it at the API boundary.
+    if (combine_recipe == NCCL_EP_COMB_QUANT_MXFP8 && (hidden % NCCL_EP_MXFP8_HIDDEN_ALIGN) != 0) {
+        fprintf(stderr,
+                "NCCL EP error: MXFP8 combine reduce hidden=%d is not a multiple of %d\n",
+                hidden, NCCL_EP_MXFP8_HIDDEN_ALIGN);
+        return ncclInternalError;
+    }
 
     const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
@@ -1839,16 +2139,17 @@ void launch_combine_reduce(
     p.em_weights_in = em_weights_in;
     p.flat_weights_out = flat_weights_out;
     p.top_k = top_k;
-    p.row_bytes = row_bytes;
+    p.row_bytes = packed_row_bytes;
     p.caller_num_recv_tokens = caller_num_recv_tokens;
 
-    ::nccl_ep::ht::jit::launch_local_permute_reduce(
+    return ::nccl_ep::ht::jit::launch_local_permute_reduce(
         top_k,
-        row_bytes,
+        input_row_bytes,
         static_cast<int>(grid),
         p,
         stream,
-        token_dtype);
+        token_dtype,
+        combine_recipe);
 }
 
 ncclResult_t launch_combine_push(
@@ -1961,3 +2262,4 @@ ncclResult_t launch_combine_reduce_stage(
 
 } // namespace ht
 } // namespace nccl_ep
+

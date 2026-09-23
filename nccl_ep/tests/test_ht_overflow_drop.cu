@@ -453,8 +453,9 @@ TEST_F(HtOverflowDropTest, EmDispatchCombineContinueOnOverflow) {
 // with 8 real rows; expert 1's zone is clamped away and all 8 of its assignments
 // (em slots 16..23) must be dropped -- pre-fix these were the OOB writes.
 TEST_F(HtOverflowDropTest, EmLocalPermuteAlignedDropNoOob) {
+    // Wrong world size is a launch error, not an environment limitation.
     if (g_nranks != 4) {
-        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+        GTEST_SKIP() << "requires exactly 4 ranks (8 experts -> 2 per rank), got " << g_nranks;
     }
     constexpr unsigned int kCap = 16;       // recv capacity; multiple of kAlign
     constexpr int kAlign = 16;              // per-expert zone alignment
@@ -684,8 +685,9 @@ TEST_F(HtOverflowDropTest, EmLocalPermuteAlignedDropNoOob) {
 // rows 4..7 are phantom and must read back zero. Expert 1's zone is clamped
 // away; ranks 2-3 are fully dropped and must combine back zeros.
 TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed) {
+    // Wrong world size is a launch error, not an environment limitation.
     if (g_nranks != 4) {
-        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+        GTEST_SKIP() << "requires exactly 4 ranks (8 experts -> 2 per rank), got " << g_nranks;
     }
     constexpr unsigned int kCap = 8;
     constexpr int kAlign = 4;
@@ -868,6 +870,152 @@ TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed) {
     cudaFree(d_tok);
     ncclEpTensorDestroy(t_total);
     cudaFree(d_total);
+    ncclEpTensorDestroy(t_idx);
+    cudaFree(d_idx);
+    (void)ncclEpHandleDestroy(h);
+    NCCL_ASSERT(ncclEpGroupDestroy(grp));
+}
+
+// Same deep-FLAT-overflow geometry as EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed,
+// but the backward dispatch pass writes into a FRESH buffer instead of reusing forward's
+// (the normal case for a real caller: backward's gradient buffer is a distinct allocation).
+// Backward never reruns publish_outputs, so its own pad warp depends entirely on
+// forward's in-place per_expert_counts_active[e] correction reaching it.
+TEST_F(HtOverflowDropTest, EmLocalPermuteDeepFlatOverflowBackwardPhantomRowsZeroed) {
+    if (g_nranks != 4) {
+        GTEST_SKIP() << "zone geometry below assumes 4 ranks (8 experts -> 2 per rank)";
+    }
+    constexpr unsigned int kCap = 8;
+    constexpr int kAlign = 4;
+    constexpr unsigned int kSlack = 64;
+
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm                    = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts                  = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes              = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size             = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank              = NCCL_EP_AUTO;
+    gcfg.num_channels                 = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank     = kCap;
+    gcfg.overflow_policy              = NCCL_EP_OVERFLOW_DROP;
+    ncclEpGroup_t grp = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&grp, g_comm, &gcfg));
+
+    ncclEpHandleConfig_t hcfg = NCCL_EP_HANDLE_CONFIG_INIT;
+    hcfg.dispatch_output_per_expert_alignment = kAlign;
+    ncclEpHandle_t h = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(&h, grp, NCCL_EP_LAYOUT_EXPERT_MAJOR, &hcfg, kTopK,
+                                 /*handle_mem=*/nullptr));
+    ASSERT_NE(h, nullptr);
+
+    // tokens 0,1 -> expert 0; tokens 2,3 -> expert 1 (same as the forward-only test).
+    int64_t h_idx[kNumTokens * kTopK];
+    for (int i = 0; i < kNumTokens; ++i) h_idx[i] = (i < 2) ? 0 : 1;
+    int64_t* d_idx = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_idx, sizeof(h_idx)));
+    CUDA_ASSERT(cudaMemcpy(d_idx, h_idx, sizeof(h_idx), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_idx = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_idx, 2, ncclInt64, d_idx, kNumTokens, kTopK));
+
+    NCCL_ASSERT(ncclEpUpdateHandle(h, t_idx, /*layout_info=*/nullptr, g_stream));
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
+        << "Rank " << g_rank << ": UpdateHandle trapped on deep FLAT overflow";
+
+    std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
+    std::vector<float> h_w(kNumTokens * kTopK);
+    for (int i = 0; i < kNumTokens; ++i) {
+        const float v = static_cast<float>(g_rank * kNumTokens + i + 1);
+        for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+        h_w[i] = static_cast<float>(g_rank * kNumTokens + i) + 0.5f;
+    }
+    const size_t recv_rows_alloc = kCap + kSlack;
+    nv_bfloat16 *d_tok = nullptr, *d_recv_fwd = nullptr, *d_recv_bwd = nullptr;
+    float *d_w = nullptr, *d_recv_w = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_fwd, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_bwd, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_w, kNumTokens * kTopK * sizeof(float)));
+    CUDA_ASSERT(cudaMalloc(&d_recv_w, recv_rows_alloc * sizeof(float)));
+    CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), kNumTokens * kHidden * sizeof(nv_bfloat16),
+                           cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_w, h_w.data(), kNumTokens * kTopK * sizeof(float),
+                           cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemset(d_recv_fwd, 0xAB, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMemset(d_recv_w, 0xAB, recv_rows_alloc * sizeof(float)));
+
+    ncclEpTensor_t *t_tok = nullptr, *t_recv_fwd = nullptr, *t_w = nullptr, *t_recv_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_recv_fwd, 2, ncclBfloat16, d_recv_fwd, kCap, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_w, kNumTokens, kTopK));
+    NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, kCap));
+
+    // Forward dispatch: establishes flat2em_slot_map and corrects
+    // per_expert_counts_active[e] in place for the phantom-row gap.
+    ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    d_in.tokens = t_tok;
+    d_in.topk_weights = t_w;
+    d_out.tokens = t_recv_fwd;
+    d_out.topk_weights = t_recv_w;
+    ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+    EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
+    EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
+        << "Rank " << g_rank << ": forward deep-FLAT-overflow dispatch must not fault";
+
+    // Backward dispatch: fresh, never-touched-by-forward buffer, canary-filled first.
+    // Drops topk_weights/topk_idx per the backward contract (token transport only).
+    CUDA_ASSERT(cudaMemset(d_recv_bwd, 0xAB, recv_rows_alloc * kHidden * sizeof(nv_bfloat16)));
+    ncclEpTensor_t* t_recv_bwd = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_recv_bwd, 2, ncclBfloat16, d_recv_bwd, kCap, kHidden));
+    d_in.topk_weights = nullptr;
+    d_out.topk_weights = nullptr;
+    d_out.tokens = t_recv_bwd;
+    dcfg.pass_direction = NCCL_EP_BWD_PASS;
+    EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
+    EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
+        << "Rank " << g_rank << ": backward deep-FLAT-overflow dispatch must not fault";
+
+    {
+        std::vector<nv_bfloat16> h_recv(recv_rows_alloc * kHidden);
+        CUDA_ASSERT(cudaMemcpy(h_recv.data(), d_recv_bwd,
+                               recv_rows_alloc * kHidden * sizeof(nv_bfloat16),
+                               cudaMemcpyDeviceToHost));
+        if (g_rank == 0) {
+            std::multiset<float> got_vals, want_vals;
+            for (int s = 0; s < 4; ++s) got_vals.insert(__bfloat162float(h_recv[s * kHidden]));
+            for (int r = 0; r < 2; ++r)
+                for (int i = 0; i < 2; ++i) want_vals.insert(static_cast<float>(r * kNumTokens + i + 1));
+            EXPECT_EQ(got_vals, want_vals)
+                << "backward's own buffer must hold the same retained expert-0 tokens";
+            // The regression check: without the in-place per_expert_counts_active fix,
+            // these rows would still hold the 0xAB canary in this fresh buffer.
+            for (unsigned int s = 4; s < kCap; ++s) {
+                EXPECT_EQ(__bfloat162float(h_recv[s * kHidden]), 0.0f)
+                    << "backward phantom row " << s << " must be zeroed, not canary";
+            }
+        }
+        const uint8_t* recv_bytes = reinterpret_cast<const uint8_t*>(h_recv.data());
+        size_t tok_bad = 0;
+        for (size_t b = kCap * kHidden * sizeof(nv_bfloat16);
+             b < recv_rows_alloc * kHidden * sizeof(nv_bfloat16); ++b) {
+            if (recv_bytes[b] != 0xAB) ++tok_bad;
+        }
+        EXPECT_EQ(tok_bad, 0u) << "Rank " << g_rank << ": OOB write past backward recv_tokens";
+    }
+
+    ncclEpTensorDestroy(t_recv_bwd);
+    cudaFree(d_recv_bwd);
+    ncclEpTensorDestroy(t_recv_w);
+    ncclEpTensorDestroy(t_w);
+    ncclEpTensorDestroy(t_recv_fwd);
+    ncclEpTensorDestroy(t_tok);
+    cudaFree(d_recv_w);
+    cudaFree(d_w);
+    cudaFree(d_recv_fwd);
+    cudaFree(d_tok);
     ncclEpTensorDestroy(t_idx);
     cudaFree(d_idx);
     (void)ncclEpHandleDestroy(h);

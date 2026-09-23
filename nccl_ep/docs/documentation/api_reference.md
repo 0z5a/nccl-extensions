@@ -81,9 +81,16 @@ ncclResult_t ncclEpGroupDestroy(
 
 ## Handle Management
 
-### Handle usage limitations
+An NCCL EP handle represents the state that connects related dispatch and combine
+operations — a dispatch/combine pair on the LL path, or both the forward and
+backward passes in HT mode. The handle holds only the metadata-related state; the
+staging buffers are owned by the EP group.
 
-Currently,  HT mode supports 1F1B mode allowing multiple handles to be active on the same EP group. LL mode currently is limited to a single Handle per Group due to a known issue (see [NCCL EP v0.2 Release Notes](../release/RELEASE_NOTES_v0.2.md#ll-one-handle-per-group))
+### Multiple handles per group
+
+Both HT and LL support several handles being active on the same EP group, as a
+1F1B / pipeline-parallel schedule requires. Creating or updating one handle does
+not disturb another handle's pending dispatch or combine.
 
 ### `ncclEpCreateHandle()`
 

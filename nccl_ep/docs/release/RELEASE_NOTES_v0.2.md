@@ -149,6 +149,8 @@ Added FP16 and FP32 data type support.
 - **HT zero receive in eager mode** — ranks receiving no tokens are now handled correctly.
 - **HT `local_permute_dup` out-of-bounds write** on overflow.
 - **LL combine stage reuse** now correctly fenced.
+- **LL epoch ring is now group-owned** — concurrent LL handles on one group no longer race on
+  the shared double-buffered RDMA banks, and CUDA-graph replay advances the bank selector.
 - **HT sync guard for consecutive same-direction ops** — enabled by default, disable via env for
   testing.
 - **Byte-padded HT routing map** to fix a scan layout mismatch.
@@ -208,20 +210,6 @@ Internal changes with no API impact, but worth knowing.
   `NCCL_EP_DISABLE_GUARD`.
 
 ## Known Limitations
-
-### LL: one handle per group
-
-LL has a single double-buffered RDMA allocation per **group**, but the bank selector is
-per-handle and is host-advanced on each dispatch or combine. Two handles on the same group
-therefore compute identical offsets into the same two banks while advancing independent
-parities. This causes data corruption due to a cross-rank race condition.
-
-CUDA-graph capture has the same ownership problem in a different form: capture bakes a
-host-selected bank parity into the graph, and replay does not advance the selector.
-
-**Use one LL handle per group, and do not capture LL dispatch or combine into a CUDA graph.**
-A fix that moves bank selection to group-owned state is available on the development branch and
-is targeted at a following release.
 
 ### HT: at most 33 RDMA domains
 

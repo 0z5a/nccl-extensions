@@ -61,9 +61,12 @@ class GroupConfig:
             :py:attr:`LayoutInfo.recv_total_counter`; eager mode supports
             neither ``OverflowPolicy.DROP`` nor CUDA Graph capture of
             dispatch. LL ignores this field.
-        max_num_sms: Maximum SMs to use for EP kernels (dispatch,
-            combine, preprocessing). 0 selects an algorithm-dependent
-            default.
+        max_num_sms: Shared dispatch/combine SM budget. 0 selects an
+            algorithm-dependent default.
+        dispatch_num_sms: Dispatch SM budget. 0 inherits the resolved
+            shared budget. NCCL_EP_DISPATCH_SMS overrides it.
+        combine_num_sms: Combine SM budget. 0 inherits the resolved
+            shared budget. NCCL_EP_COMBINE_SMS overrides it.
         alloc: Device allocator hooks. Default
             :class:`AllocConfig` selects ``cudaMalloc``/``cudaFree``.
         enable_mask: Enable active-mask support for fault tolerance
@@ -102,6 +105,8 @@ class GroupConfig:
     num_qp_per_rank: int = 0
     num_channels: int = 0
     max_num_sms: int = 0
+    dispatch_num_sms: int = 0
+    combine_num_sms: int = 0
     alloc: AllocConfig = field(default_factory=AllocConfig)
     enable_mask: bool = False
     timeout_ns: int = 0

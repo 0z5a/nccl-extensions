@@ -53,12 +53,16 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_em_nvlink_dup);
     parse_flag(cfg->ht_em_pull_push);
     parse_flag(cfg->ht_unfused_sync);
+    parse_flag(cfg->ht_em_ag_scan_mode);
+    parse_flag(cfg->ht_em_count_unfused);
     parse_flag(cfg->disable_guard);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
     parse_ulong(cfg->timeout_ms);
     parse_ulong(cfg->comm_num_sms);
+    parse_ulong(cfg->dispatch_num_sms);
+    parse_ulong(cfg->combine_num_sms);
     parse_ulong(cfg->shuffle_sms);
     parse_ulong(cfg->preprocess_num_sms);
     parse_ulong(cfg->tokens_per_chunk);
@@ -79,9 +83,13 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_em_nvlink_dup,
         &cfg.ht_em_pull_push,
         &cfg.ht_unfused_sync,
+        &cfg.ht_em_ag_scan_mode,
+        &cfg.ht_em_count_unfused,
         &cfg.disable_guard,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
+        &cfg.dispatch_num_sms,
+        &cfg.combine_num_sms,
         &cfg.shuffle_sms,
         &cfg.preprocess_num_sms,
         &cfg.tokens_per_chunk,

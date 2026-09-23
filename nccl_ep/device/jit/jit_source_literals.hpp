@@ -104,14 +104,35 @@ inline const char* layout_name_tag(ncclEpLayout_t layout) {
     }
 }
 
-// ncclEpCombQuant_t -> enumerator name for the kRecipe template
-// argument emitted into the LL combine JIT source.
+// ncclEpCombQuant_t -> enumerator name for the kRecipe / kCombineRecipe
+// template argument emitted into the LL and HT combine JIT source.
 inline const char* combine_recipe_literal(ncclEpCombQuant_t recipe) {
     switch (recipe) {
     case NCCL_EP_COMB_QUANT_NONE:
         return "NCCL_EP_COMB_QUANT_NONE";
     case NCCL_EP_COMB_QUANT_NVFP4:
         return "NCCL_EP_COMB_QUANT_NVFP4";
+    case NCCL_EP_COMB_QUANT_MXFP8:
+        return "NCCL_EP_COMB_QUANT_MXFP8";
+    default:
+        return nullptr;
+    }
+}
+
+// ncclEpCombQuant_t -> short tag folded into a JIT variant_name so distinct recipes get
+// distinct cache keys (the recipe twin of token_dtype_name_tag / layout_name_tag, and the
+// combine counterpart of the dispatch spec's recipe_cache_tag). Shared by the LL and HT
+// combine launchers. NONE contributes nothing, keeping unquantized variant names as they
+// were before recipes existed. Covers the same set as combine_recipe_literal(): callers
+// reject a null literal before naming, so a null tag cannot reach an ostringstream.
+inline const char* combine_recipe_name_tag(ncclEpCombQuant_t recipe) {
+    switch (recipe) {
+    case NCCL_EP_COMB_QUANT_NONE:
+        return "";
+    case NCCL_EP_COMB_QUANT_NVFP4:
+        return "_nvfp4";
+    case NCCL_EP_COMB_QUANT_MXFP8:
+        return "_mxfp8";
     default:
         return nullptr;
     }

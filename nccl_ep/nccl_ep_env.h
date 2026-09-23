@@ -56,9 +56,17 @@ struct ncclEpEnvConfig {
     // Launch the intra-LSA head and tail sync as separate kernels instead of
     // fusing them into the dispatch/combine kernels. Pull-push only.
     ncclEpEnvVar ht_unfused_sync{"NCCL_EP_HT_UNFUSED_SYNC", ncclEpEnvType::flag};
+    // Count exchange is the default HT EM path; set to fall back to the routing-map
+    // AllGather + scan path instead.
+    ncclEpEnvVar ht_em_ag_scan_mode{"NCCL_EP_HT_EM_AG_SCAN_MODE", ncclEpEnvType::flag};
+    // Count mode fuses the recv layout into dispatch by default; set to force the unfused
+    // AllGather + compute_layout_info path (used to compare fused vs. unfused performance).
+    ncclEpEnvVar ht_em_count_unfused{"NCCL_EP_HT_EM_COUNT_UNFUSED", ncclEpEnvType::flag};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar dispatch_num_sms{"NCCL_EP_DISPATCH_SMS", ncclEpEnvType::ulong};
+    ncclEpEnvVar combine_num_sms{"NCCL_EP_COMBINE_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};

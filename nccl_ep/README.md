@@ -6,13 +6,13 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 
 # Maintainers
 
-| GitHub | Areas |
-|--------|------|
-| @artpol84 | APIs, new features, layouts |
-| @kwen2501 | APIs, integration |
-| @sb17v | Kernels, build systems |
-| @nv-lschneider | Kernels, mnnvl |
-| @kgioioso | GIN, NCCL |
+| GitHub         | Areas                       |
+|----------------|-----------------------------|
+| @artpol84      | APIs, new features, layouts |
+| @kwen2501      | APIs, integration           |
+| @sb17v         | Kernels, build systems      |
+| @nv-lschneider | Kernels, mnnvl              |
+| @kgioioso      | GIN, NCCL                   |
 
 # Table of Contents
 
@@ -77,9 +77,11 @@ NCCL EP relies on NCCL Device API, using GIN `put`/`signal` operations for RDMA 
 ncclEpCreateGroup(&ep_group, comm, &config);
 ncclEpGroupDestroy(ep_group);
 
-// Handle management. `topk_idx` is a pointer to a caller-owned tensor
-// descriptor; the routing it carries is cached in the handle and reused by
-// all dispatches until ncclEpUpdateHandle is called with new routing.
+// Handle management. Both calls take the routing as `const ncclEpTensor_t*`.
+// Here `topk_idx` is a caller-owned descriptor passed by address; a heap
+// descriptor from ncclEpTensorAlloc would be passed directly instead. The
+// routing it carries is cached in the handle and reused by all dispatches
+// until ncclEpUpdateHandle is called with new routing.
 // `layout_info` is an optional ncclEpLayoutInfo_t* whose fields advertise
 // device-side metadata tensors (expert_counters, src_rank_counters,
 // expert_offsets, recv_total_counter).
@@ -142,16 +144,39 @@ For quantization recipes, tensor contracts, and `max_token_bytes` sizing, see
 [Quantization](docs/documentation/quantization.md).
 
 
-#### LL mode (same data type)
+#### LL mode, expert-major layout (same data type)
 
-| Operation | Struct             | Field             | Dims             |
-|:---------:|:-------------------|:------------------|:----------------:|
-| Dispatch  | dispatch_inputs    | tokens            | [B x H]          |
-|           | dispatch_outputs   | tokens            | [L x (R*B) x H]  |
-|           | layout_info        | expert_counters   | [L]              |
-| Combine   | combine_inputs     | tokens            | [L x (R*B) x H]  |
-|           | combine_outputs    | tokens            | [B x H]          |
-|           | combine_outputs    | topk_weights      | [B x K]          |
+| Operation | Struct           | Field           | Dims              |
+|:---------:|:-----------------|:----------------|:-----------------:|
+| Dispatch  | dispatch_inputs  | tokens          | [B x H]           |
+|           | dispatch_outputs | tokens          | [L x (R x B) x H] |
+|           | layout_info      | expert_counters | [L]               |
+| Combine   | combine_inputs   | tokens          | [L x (R x B) x H] |
+|           | combine_outputs  | tokens          | [B x H]           |
+|           | combine_outputs  | topk_weights    | [B x K]           |
+
+The combine kernel applies the per-token routing weights on the receive side, so
+`combine_outputs.topk_weights` is required.
+
+#### LL mode, rank-major layout (same data type)
+
+Tokens arrive grouped by source rank with no expert dimension, so dispatch also
+returns per-slot routing metadata and the caller pre-reduces across local experts
+before combine.
+
+| Operation | Struct           | Field             | Dims        |
+|:---------:|:-----------------|:------------------|:-----------:|
+| Dispatch  | dispatch_inputs  | tokens            | [B x H]     |
+|           | dispatch_inputs  | topk_weights      | [B x K]     |
+|           | dispatch_outputs | tokens            | [R x B x H] |
+|           | dispatch_outputs | topk_weights      | [R x B x K] |
+|           | dispatch_outputs | topk_idx          | [R x B x K] |
+|           | layout_info      | src_rank_counters | [R]         |
+| Combine   | combine_inputs   | tokens            | [R x B x H] |
+|           | combine_outputs  | tokens            | [B x H]     |
+
+Note `src_rank_counters`, not `expert_counters`. The caller applies the weights
+during its own pre-reduction, so `combine_outputs.topk_weights` is left unset.
 
 
 #### HT mode (same data type)
@@ -162,9 +187,9 @@ With `NCCL_EP_LAYOUT_EXPERT_MAJOR`, dispatch output is grouped by local expert, 
 
 **Handle creation**
 
-| Operation | Struct        | Field           | Dims |
-|-----------|:--------------|:----------------|:----:|
-| Create    | layout_info   | expert_counters | [L]  |
+| Operation | Struct      | Field           | Dims |
+|-----------|:------------|:----------------|:----:|
+| Create    | layout_info | expert_counters | [L]  |
 
 
 **Forward pass**
@@ -172,15 +197,15 @@ With `NCCL_EP_LAYOUT_EXPERT_MAJOR`, dispatch output is grouped by local expert, 
 `topk_idx` is supplied once via `ncclEpCreateHandle` (or refreshed via
 `ncclEpUpdateHandle`) and cached on the handle; subsequent dispatches reuse it.
 
-| Operation | Struct             | Field             | Dims       |
-|:---------:|:-------------------|:------------------|:----------:|
-| Dispatch  | dispatch_inputs    | tokens            | [B x H]    |
-|           | dispatch_inputs    | topk_weights      | [B x K]    |
-|           | dispatch_outputs   | tokens            | [N(r) x H] |
-|           | dispatch_outputs   | topk_weights      | [N(r) x K] |
-|           | dispatch_outputs   | topk_idx          | [N(r) x K] |
-| Combine   | combine_inputs     | tokens            | [N(r) x H] |
-|           | combine_outputs    | tokens            | [B x H]    |
+| Operation | Struct           | Field        | Dims       |
+|:---------:|:-----------------|:-------------|:----------:|
+| Dispatch  | dispatch_inputs  | tokens       | [B x H]    |
+|           | dispatch_inputs  | topk_weights | [B x K]    |
+|           | dispatch_outputs | tokens       | [N(r) x H] |
+|           | dispatch_outputs | topk_weights | [N(r) x K] |
+|           | dispatch_outputs | topk_idx     | [N(r) x K] |
+| Combine   | combine_inputs   | tokens       | [N(r) x H] |
+|           | combine_outputs  | tokens       | [B x H]    |
 
 **Backward pass**
 
@@ -188,17 +213,17 @@ Compared to the Forward pass, the Backward pass requires per-token routing
 weights to be passed as `combine_inputs.topk_weights` and returned via
 `combine_outputs.topk_weights`.
 
-| Operation | Struct             | Field             | Dims       |
-|:---------:|:-------------------|:------------------|:----------:|
-| Dispatch  | dispatch_inputs    | tokens            | [B x H]    |
-|           | dispatch_inputs    | topk_weights      | [B x K]    |
-|           | dispatch_outputs   | tokens            | [N(r) x H] |
-|           | dispatch_outputs   | topk_weights      | [N(r) x K] |
-|           | dispatch_outputs   | topk_idx          | [N(r) x K] |
-| Combine   | combine_inputs     | tokens            | [N(r) x H] |
-|           | combine_inputs     | **topk_weights**  | [N(r) x K] |
-|           | combine_outputs    | tokens            | [B x H]    |
-|           | combine_outputs    | **topk_weights**  | [B x K]    |
+| Operation | Struct           | Field            | Dims       |
+|:---------:|:-----------------|:-----------------|:----------:|
+| Dispatch  | dispatch_inputs  | tokens           | [B x H]    |
+|           | dispatch_inputs  | topk_weights     | [B x K]    |
+|           | dispatch_outputs | tokens           | [N(r) x H] |
+|           | dispatch_outputs | topk_weights     | [N(r) x K] |
+|           | dispatch_outputs | topk_idx         | [N(r) x K] |
+| Combine   | combine_inputs   | tokens           | [N(r) x H] |
+|           | combine_inputs   | **topk_weights** | [N(r) x K] |
+|           | combine_outputs  | tokens           | [B x H]    |
+|           | combine_outputs  | **topk_weights** | [B x K]    |
 
 
 # Usage
@@ -207,12 +232,12 @@ weights to be passed as `combine_inputs.topk_weights` and returned via
 
 ### Dependencies
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| CUDA | 13+ | Required |
-| NCCL | 2.29+ | With Device API and GIN support |
-| MPI | Any (OpenMPI, MPICH, etc.) | Required for multi-process launch |
-| GPU | Hopper (H100) or Blackwell | Tested configurations |
+| Component | Version                    | Notes                             |
+|-----------|----------------------------|-----------------------------------|
+| CUDA      | 13+                        | Required                          |
+| NCCL      | 2.29+                      | With Device API and GIN support   |
+| MPI       | Any (OpenMPI, MPICH, etc.) | Required for multi-process launch |
+| GPU       | Hopper (H100) or Blackwell | Tested configurations             |
 
 ### Discover compute capabilities
 
@@ -345,16 +370,35 @@ workload. With `NCCL_EP_ENV_VERBOSE=true`, NCCL EP also prints the requested and
 selected pipeline configuration, SMEM usage, and device limit when an HT kernel
 configuration is first used.
 
-HT SM-count controls:
+Dispatch/combine SM-budget controls (LL and HT):
 
-```bash
-# Dispatch and combine default
-export NCCL_EP_COMM_SMS=16
+    # Legacy fallback: used by both operations unless overridden below
+    export NCCL_EP_COMM_SMS=16
 
-# Shuffle and preprocessing default to all device SMs
-export NCCL_EP_SHUFFLE_SMS=<number_of_sms>
-export NCCL_EP_PREPROCESS_NUM_SMS=<number_of_sms>
-```
+    # Independent operation overrides
+    export NCCL_EP_DISPATCH_SMS=12
+    export NCCL_EP_COMBINE_SMS=24
+
+    # Shuffle and preprocessing default to all device SMs
+    export NCCL_EP_SHUFFLE_SMS=<number_of_sms>
+    export NCCL_EP_PREPROCESS_NUM_SMS=<number_of_sms>
+
+Each operation resolves its budget independently. Precedence, highest first,
+is its operation-specific environment variable, NCCL_EP_COMM_SMS, its
+operation-specific ncclEpGroupConfig_t field, max_num_sms, then the
+algorithm default (all device SMs for LL and 16 for HT). Leaving both new
+fields and variables unset therefore preserves legacy behavior; setting one
+operation does not alter the other. Values must be in [1, device_sm_count]
+after resolution and must satisfy the LL warp-group geometry when LL is used.
+
+The budgets do not need to be multiples of 4 or 8; any positive integer within
+the device and LL geometry limits is supported. Combine commonly benefits from
+a larger budget than dispatch.
+An SM budget is the upper bound supplied to an operation launch-geometry
+
+calculation. It is not always the literal CUDA grid size: LL rounds the grid to
+its expert/warp-group geometry, while HT currently launches one communication
+CTA per budgeted SM. Shuffle and preprocessing kernels have separate budgets.
 
 By default EP guards its internal communication buffers so that neighboring
 dispatch/combine calls cannot corrupt each other's data; this is safe and needs
@@ -417,7 +461,7 @@ typedef struct {
                                                 //                  doesn't fit. No reallocation ever performed.
     unsigned int num_qp_per_rank;               // Queue pairs per rank (NCCL_EP_AUTO for auto)
     unsigned int num_channels;                  // Channels per rank (NCCL_EP_AUTO for auto)
-    unsigned int max_num_sms;                   // SM cap for EP kernels (NCCL_EP_AUTO for auto)
+    unsigned int max_num_sms;                   // Legacy fallback for both dispatch and combine
     ncclEpAllocConfig_t alloc;                  // Custom device-memory allocator (zero-init → cudaMalloc/cudaFree)
     unsigned int enable_mask;                   // Enable active-mask fault tolerance (LL only)
     uint64_t timeout_ns;                        // GPU-side wait-loop timeout (0 = default)
@@ -430,6 +474,8 @@ typedef struct {
                                                 //   eager mode with the expert-major layout;
                                                 //   see docs/documentation/eager_mode.md.
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
+    unsigned int dispatch_num_sms;              // Dispatch budget (AUTO inherits max_num_sms/default)
+    unsigned int combine_num_sms;               // Combine budget (AUTO inherits max_num_sms/default)
 } ncclEpGroupConfig_t;
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.
@@ -523,7 +569,7 @@ The recorded layout offsets on every live handle are pure offsets relative to th
   2. **Reallocation drops the contents of the old RDMA buffer.** Any operation issued with `send_only = 1` that has staged data but is still awaiting its receive half via `ncclEpComplete` will lose its in-flight data. Drain all such operations before triggering a reallocation.
   3. **CUDA graph capture bakes the RDMA base pointer into the captured kernel parameters.** `ncclEpInitHandle` (in AUTO mode) must not be called between `cudaStreamBeginCapture` and `cudaStreamEndCapture`. Any previously captured graph containing EP kernels must be destroyed and re-captured after a reallocation.
 
-- **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` is purely local; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. Use this mode if you need to avoid collective handle creation, mid-stream reallocation, or graph invalidation. Use `nccl_ep::get_low_latency_rdma_size_hint(...)` to compute a worst-case upper bound across all layouts and `num_topk ≤ MAX_NUM_TOPK`.
+- **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` is purely local; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. Use this mode if you need to avoid collective handle creation, mid-stream reallocation, or graph invalidation. There is currently no public API for computing the required size — one is planned for a future release. Until then, size conservatively: a buffer that is too small for the requested `(layout, num_topk)` is reported cleanly by `ncclEpInitHandle` rather than failing later.
 
 ## Zero-copy
 
@@ -558,14 +604,14 @@ documentation for more details.
 The complete C API reference lives in **[docs/documentation/api_reference.md](docs/documentation/api_reference.md)**,
 covering all 18 public entry points:
 
-| Group | Functions |
-|---|---|
-| Library | `ncclEpGetVersion` |
-| Group Management | `ncclEpCreateGroup`, `ncclEpGroupDestroy` |
-| Tensor Descriptors | `ncclEpTensorAlloc`, `ncclEpTensorDestroy` |
-| Handle Management | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
-| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete` |
-| Fault Tolerance (LL) | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear` |
+| Group                    | Functions                                                                                                    |
+|--------------------------|--------------------------------------------------------------------------------------------------------------|
+| Library                  | `ncclEpGetVersion`                                                                                           |
+| Group Management         | `ncclEpCreateGroup`, `ncclEpGroupDestroy`                                                                    |
+| Tensor Descriptors       | `ncclEpTensorAlloc`, `ncclEpTensorDestroy`                                                                   |
+| Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
+| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete`                                                          |
+| Fault Tolerance (LL)     | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear`          |
 
 # Execution Modes
 

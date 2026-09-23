@@ -379,6 +379,12 @@ __device__ __forceinline__ uint64_t ld_relaxed_gpu_global(const uint64_t* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ int ld_relaxed_cta(const int* ptr) {
+    int ret;
+    asm volatile("ld.relaxed.cta.s32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
 //==============================================================================
 // Load Operations - Acquire
 //==============================================================================
