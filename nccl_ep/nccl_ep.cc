@@ -896,6 +896,8 @@ struct ncclEpGroup {
         struct CountScratch {
         // Per-expert EM permute write cursors; zeroed and consumed within a single dispatch.
             int32_t* em_permute_cursors = nullptr;
+        // FLAT recv-slot weights (EM local-permute only). Sized by kEpCountMaxTopk.
+            float* recv_topk_weights_flat = nullptr;
         } count_scratch;
 
     // RDMA buffers (multi-LSA-team only)
@@ -1100,6 +1102,13 @@ static void alloc_ht_count_scratch(ncclEpGroup_t ep_group) {
     CUDA_CHECK(ep_group->alloc.alloc_fn(
         reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.em_permute_cursors),
         static_cast<size_t>(ep_group->num_local_experts + 1) * sizeof(int32_t), ep_group->alloc.context));
+    // FLAT recv-slot weights only exist for EM local-permute; sized by the fixed cap.
+    if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalPermute) {
+        CUDA_CHECK(ep_group->alloc.alloc_fn(
+            reinterpret_cast<void**>(&ep_group->ht_buffers.count_scratch.recv_topk_weights_flat),
+            static_cast<size_t>(ep_group->max_recv_tokens) * nccl_ep::ht::kEpCountMaxTopk * sizeof(float),
+            ep_group->alloc.context));
+    }
 }
 
 // Free group-shared count-mode / EM local-permute scratch buffers.
@@ -1107,6 +1116,10 @@ static void free_ht_count_scratch(ncclEpGroup_t ep_group) {
     if (ep_group->ht_buffers.count_scratch.em_permute_cursors) {
         ep_group->alloc.free_fn(ep_group->ht_buffers.count_scratch.em_permute_cursors, ep_group->alloc.context);
         ep_group->ht_buffers.count_scratch.em_permute_cursors = nullptr;
+    }
+    if (ep_group->ht_buffers.count_scratch.recv_topk_weights_flat) {
+        ep_group->alloc.free_fn(ep_group->ht_buffers.count_scratch.recv_topk_weights_flat, ep_group->alloc.context);
+        ep_group->ht_buffers.count_scratch.recv_topk_weights_flat = nullptr;
     }
 }
 
@@ -2670,17 +2683,14 @@ struct ncclEpHandle {
             void* topk_idx;
 
             // FLAT-dispatch + local-permute scratch (EM-permute path only).
-            // flat2em_slot_map, recv_topk_weights_flat and token_to_recv_slot are null when
-            // em_local_permute_enabled() is false. In em-permute mode sparse_to_dense_map is
-            // FLAT-shape (inner=lsa_team_size).
+            // flat2em_slot_map and token_to_recv_slot are null when em_local_permute_enabled()
+            // is false. In em-permute mode sparse_to_dense_map is FLAT-shape (inner=lsa_team_size).
             //
             // Mapping from the local-node FLAT slot index to the Expert-major
             // slot in the output tensor. Shape [max_recv_tokens, top_k]
             // (invalid positions are -1). Written by em_scan_kernel during
             // UpdateHandle, read by the local-permute kernels.
             int32_t* flat2em_slot_map;
-            // Per-FLAT-slot topk weights; populated by dense_to_sparse_prob.
-            float* recv_topk_weights_flat;
             // [num_total_attn_tokens] FLAT recv slot per global attention
             // token; -1 when the token has no local-rank hit. Populated by
             // scan_impl_flat in em-permute mode; consumed by em_scan_kernel
@@ -2806,7 +2816,6 @@ struct HtBlockLayout {
     int emuf_max_groups; // capacity in rows; kernel must not exceed
     // EM-permute scratch (handle mem).
     size_t sz_flat2em_slot_map;
-    size_t sz_recv_topk_weights_flat;
     size_t sz_token_to_recv_slot;
     // Count-mode scratch (EM-permute count mode): sender chunk/rank/expert counts, token bitmap,
     // own + gathered count rows.
@@ -2896,9 +2905,9 @@ struct HtBlockLayout {
         const size_t max_flat_recv_tokens =
             std::min<size_t>(static_cast<size_t>(max_recv_tokens),
                              static_cast<size_t>(max_tokens) * lsa_team_size * rdma_team_size);
-        // EM-permute scratch: flat2em is per-handle for scan, count, and pull; recv-slot
-        // weights are per-handle too. pull-push caps rows at the recv-token count; the
-        // other EM paths keep full max_recv_tokens sizing.
+        // EM-permute scratch: flat2em is per-handle for scan, count, and pull. recv-slot
+        // weights are group-shared (ht_buffers.count_scratch.recv_topk_weights_flat). pull-push caps rows
+        // at the recv-token count; the other EM paths keep full max_recv_tokens sizing.
         // TODO(em-local-permute): baseline over-sizes by a num_topk factor; cap at
         // max_flat_recv_tokens once its flat2em indexing is confirmed recv-token-bounded.
         L.sz_flat2em_slot_map =
@@ -2906,12 +2915,6 @@ struct HtBlockLayout {
                 ? align256((needs_pull_buffers ? max_flat_recv_tokens : static_cast<size_t>(max_recv_tokens)) *
                            num_topk * sizeof(int32_t))
                 : 0;
-        // recv_topk_weights_flat: FLAT per-recv-token weight scratch used only by the
-        // local-permute (kLocalPermute) EM path. Pull dispatch reads weights straight
-        // from the source rank, so it is unused under pull (needs_pull_buffers).
-        L.sz_recv_topk_weights_flat = (em_permute && num_topk > 0 && !needs_pull_buffers) ?
-                                          align256(static_cast<size_t>(max_recv_tokens) * num_topk * sizeof(float)) :
-                                          0;
         // [num_total_attn_tokens] FLAT recv slot per global attention token, filled by
         // scan_impl_flat (scan and pull paths; count never runs the scan that fills it).
         // num_total_attn_tokens = max_tokens * lsa_team_size * rdma_team_size.
@@ -2949,7 +2952,6 @@ struct HtBlockLayout {
         L.zero_region = L.sz_r2a + L.sz_a2r + L.sz_ler + L.sz_ntfe;
         L.no_memset_region = L.sz_rank_mask + L.sz_scan_tmp + L.sz_prob + L.sz_topk_idx + L.sz_pec_active + L.sz_eto +
                              L.sz_emuf_group_buf + L.sz_emuf_group_count + L.sz_flat2em_slot_map +
-                             L.sz_recv_topk_weights_flat +
                              L.sz_token_to_recv_slot + L.sz_count_scratch + L.sz_recv_slot_to_src +
                              L.sz_srcpos_map;
         L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
@@ -3213,8 +3215,8 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         return ncclInvalidUsage;
     }
     if (em_local_permute_enabled(ep_group, handle->layout)) {
-        // EM local-permute packs each received token's top-k into a fixed-width row sized by
-        // kEpCountMaxTopk; a larger num_topk overruns the kernels' per-thread pack arrays.
+        // EM local-permute packs each received token's top-k into a fixed-width row and the
+        // group recv_topk_weights_flat is sized by kEpCountMaxTopk; a larger num_topk overruns it.
         if (num_topk > static_cast<int>(nccl_ep::ht::kEpCountMaxTopk)) {
             fprintf(stderr,
                 "NCCL EP: HT Expert-Major local-permute requires num_topk <= %d\n",
@@ -3303,9 +3305,6 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     handle->ht.flat2em_slot_map =
         (L.sz_flat2em_slot_map > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_flat2em_slot_map;
-    handle->ht.recv_topk_weights_flat =
-        (L.sz_recv_topk_weights_flat > 0) ? reinterpret_cast<float*>(ptr + offset) : nullptr;
-    offset += L.sz_recv_topk_weights_flat;
     handle->ht.token_to_recv_slot =
         (L.sz_token_to_recv_slot > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_token_to_recv_slot;
@@ -4949,7 +4948,7 @@ ncclResult_t ncclEpDispatch(
             // reshuffles FLAT scratch into the caller's EM recv buffer.
             {
                 const bool dsp_em = em && !em_permute_active;
-                float* dsp_topk_weights = em_permute_active ? handle->ht.recv_topk_weights_flat :
+                float* dsp_topk_weights = em_permute_active ? group->ht_buffers.count_scratch.recv_topk_weights_flat :
                                                               static_cast<float*>(recv_topk_weights->data);
                 int64_t* dsp_topk_idx =
                     em_permute_active ? nullptr : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
@@ -5164,7 +5163,7 @@ ncclResult_t ncclEpDispatch(
                     recv_x->data,
                     deliver_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
                     group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->lsa_rank],
-                    deliver_weights ? handle->ht.recv_topk_weights_flat : nullptr,
+                    deliver_weights ? group->ht_buffers.count_scratch.recv_topk_weights_flat : nullptr,
                     handle->ht.flat2em_slot_map,
                     handle->ht.num_tokens_for_experts,
                     handle->ht.expert_token_offsets,
@@ -5757,7 +5756,7 @@ ncclResult_t ncclEpCombine(
                     handle->ht.flat2em_slot_map,
                     handle->ht.num_tokens_for_experts,
                     em_permute_bwd_weights ? static_cast<const float*>(topk_weights->data) : nullptr,
-                    em_permute_bwd_weights ? handle->ht.recv_topk_weights_flat : nullptr,
+                    em_permute_bwd_weights ? group->ht_buffers.count_scratch.recv_topk_weights_flat : nullptr,
                     handle->num_topk,
                     hidden,
                     input_row_bytes,
@@ -5801,7 +5800,7 @@ ncclResult_t ncclEpCombine(
                 // the 1D EM input keyed by the EM-shape LERM scratch.
                 const bool use_flat_inputs = em_permute_combine;
                 const float* prob_input = (use_flat_inputs && expert_major_in) ?
-                                              handle->ht.recv_topk_weights_flat :
+                                              group->ht_buffers.count_scratch.recv_topk_weights_flat :
                                               static_cast<const float*>(topk_weights->data);
                 const int prob_stride = use_flat_inputs ? num_topk : input_topk_stride;
                 const bool* lerm_for_combine = handle->ht.local_expert_routing_map;
