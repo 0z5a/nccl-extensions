@@ -730,6 +730,13 @@ struct ncclEpGroup {
     int nNodes;               // Number of nodes
 
     void* ep_workspace;       // Device workspace for EP operations
+    // Dedicated, non-overlapping regions carved out of ep_workspace once at
+    // group-creation time (see ncclEpCreateGroup) -- 3 for LL dispatch's
+    // per-round counters, 1 for LL combine's completion-signaling counter.
+    int* ws_dispatch_rankSentCnt;    // numRanks ints
+    int* ws_dispatch_rankArrivedCnt; // numRanks ints
+    int* ws_dispatch_rankDone;       // numExperts ints
+    int* ws_combine_atomicCleanFlag; // 1 int
     int cuda_device_id;       // CUDA device ID
     int lsa_team_size;        // LSA team size: ncclTeamLsa(comm).nRanks
     int lsa_rank;             // Rank within LSA team: ncclTeamLsa(comm).rank
@@ -962,7 +969,9 @@ struct ncclEpGroup {
 
     // Constructor to properly initialize all members
     ncclEpGroup()
-        : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), cuda_device_id(0), lsa_team_size(0),
+        : comm(nullptr), nRanks(0), rank(0), nNodes(0), ep_workspace(nullptr), ws_dispatch_rankSentCnt(nullptr),
+          ws_dispatch_rankArrivedCnt(nullptr), ws_dispatch_rankDone(nullptr), ws_combine_atomicCleanFlag(nullptr),
+          cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
           num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
           last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0), shuffle_sms(0),
@@ -2372,6 +2381,19 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
     CUDA_CHECK(ep_group->alloc.alloc_fn(&ep_group->ep_workspace, NUM_WORKSPACE_BYTES, ep_group->alloc.context));
     CUDA_CHECK(cudaMemsetAsync(ep_group->ep_workspace, 0, NUM_WORKSPACE_BYTES, stream));
+
+    // Initialize dedicated LL counter regions
+    {
+        const int numRanks = ep_group->nRanks;
+        const int numExperts = ep_group->config.num_experts;
+        int* base = static_cast<int*>(ep_group->ep_workspace);
+        ep_group->ws_dispatch_rankSentCnt = base;
+        ep_group->ws_dispatch_rankArrivedCnt = ep_group->ws_dispatch_rankSentCnt + numRanks;
+        ep_group->ws_dispatch_rankDone = ep_group->ws_dispatch_rankArrivedCnt + numRanks;
+        ep_group->ws_combine_atomicCleanFlag = ep_group->ws_dispatch_rankDone + numExperts;
+        const size_t total_ints = static_cast<size_t>(2) * numRanks + numExperts + 1;
+        EP_HOST_ASSERT(total_ints * sizeof(int) <= static_cast<size_t>(NUM_WORKSPACE_BYTES));
+    }
 
     ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
     NCCL_CHECK_RESULT(ncclCommQueryProperties(ep_group->comm, &props));
@@ -4526,7 +4548,9 @@ ncclResult_t ncclEpDispatch(
                 params.devComm = group->nccl_dev_comm;
                 params.windows = group->nccl_wins;
                 params.signalsBase = signal_base;
-                params.workspace = group->ep_workspace;
+                params.rankSentCnt = group->ws_dispatch_rankSentCnt;
+                params.rankArrivedCnt = group->ws_dispatch_rankArrivedCnt;
+                params.rankDone = group->ws_dispatch_rankDone;
                 params.numDeviceSms = group->dispatch_num_sms;
                 params.rankMask = group->mask_buffer;
                 params.asyncErrorFlag = group->async_error_flag;
@@ -5845,7 +5869,7 @@ ncclResult_t ncclEpCombine(
                 params.devComm = handle->group->nccl_dev_comm;
                 params.windows = handle->group->nccl_wins;
                 params.signalsBase = signal_base;
-                params.workspace = handle->group->ep_workspace;
+                params.atomicCleanFlag = handle->group->ws_combine_atomicCleanFlag;
                 params.numDeviceSms = handle->group->combine_num_sms;
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;

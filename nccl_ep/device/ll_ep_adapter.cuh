@@ -104,7 +104,8 @@ struct dispatch_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvCntOff;
-    int* rankCountersBase;
+    int* rankSentCnt;
+    int* rankArrivedCnt;
     int* rankDone;
     int nextRecvCntBufSize;
     int* recvStats;
@@ -248,8 +249,11 @@ struct DispatchParams {
     const ncclWindow_t* windows;
     unsigned signalsBase;
 
-    // Runtime workspace + error tracking
-    void* workspace;
+    // Runtime workspace + error tracking. Each pointer is a dedicated,
+    // non-overlapping region computed once at group-creation time
+    int* rankSentCnt;
+    int* rankArrivedCnt;
+    int* rankDone;
     int numDeviceSms;
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
@@ -315,8 +319,9 @@ struct CombineParams {
     const ncclWindow_t* windows;
     unsigned signalsBase;
 
-    // Runtime workspace + error tracking
-    void* workspace;
+    // Runtime workspace + error tracking. Each pointer is a dedicated,
+    // non-overlapping region computed once at group-creation time.
+    int* atomicCleanFlag;
     int numDeviceSms;
     unsigned int deviceSm;
     int maxDynamicSmem;

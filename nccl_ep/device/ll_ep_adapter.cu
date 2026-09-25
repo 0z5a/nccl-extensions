@@ -51,11 +51,6 @@ ncclResult_t call_dispatch(
         return ncclInvalidUsage;
     }
 
-    // Workspace: [rankSentCnt | rankArrivedCnt | rankDone(=expertDone)].
-    auto rankCountersBase = static_cast<int*>(params.workspace);
-    auto rankDone = rankCountersBase + 2 * params.numRanks;
-    EP_HOST_ASSERT((2 * params.numRanks + params.numExperts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
-
     dispatch_kernel_args_t args{};
     args.inData = params.inData;
     args.inScalesBuf = params.inScalesBuf;
@@ -75,8 +70,9 @@ ncclResult_t call_dispatch(
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvCntOff = params.recvCntOff;
-    args.rankCountersBase = rankCountersBase;
-    args.rankDone = rankDone;
+    args.rankSentCnt = params.rankSentCnt;
+    args.rankArrivedCnt = params.rankArrivedCnt;
+    args.rankDone = params.rankDone;
     args.nextRecvCntBufSize = params.nextRecvCntBufSize;
     args.recvStats = params.recvStats;
     args.waitStats = params.waitStats;
@@ -178,12 +174,11 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         ceil_div(params.numExperts, numWarpGroups),
         numRecvPerSm == 0 ? 1 : ceil_div(params.numCombinedTokens, numRecvPerSm));
 
-    if (NUM_WORKSPACE_BYTES < sizeof(int) || params.workspace == nullptr) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep] LL combine requires at least %zu workspace bytes for its atomic flag; available=%d, "
-            "workspace=%p.\n",
-            sizeof(int), NUM_WORKSPACE_BYTES, params.workspace);
+    // atomicCleanFlag is a dedicated, non-overlapping region computed once at
+    // group-creation time (ncclEpCreateGroup) -- forwarded here as-is, never
+    // derived via offset math.
+    if (params.atomicCleanFlag == nullptr) {
+        std::fprintf(stderr, "[nccl_ep] LL combine requires a non-null atomicCleanFlag workspace pointer.\n");
         return ncclInvalidArgument;
     }
     if (params.zeroCopy && params.useLogFmt) {
@@ -191,7 +186,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         return ncclInvalidArgument;
     }
 
-    auto atomicCleanFlag = static_cast<int*>(params.workspace);
+    auto atomicCleanFlag = params.atomicCleanFlag;
 
     const int hidden = params.hidden;
     const int smem_size = smem_config.dynamic_smem_bytes;

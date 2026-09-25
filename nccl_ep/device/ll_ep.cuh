@@ -475,7 +475,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     size_t sendOffBase = args.sendOff;
     size_t recvOffBase = args.recvOff;
     size_t recvCntOffBase = args.recvCntOff;
-    int* rankCountersBase = args.rankCountersBase;
+    int* rankSentCntBase = args.rankSentCnt;
+    int* rankArrivedCntBase = args.rankArrivedCnt;
     int* rankDone = args.rankDone;
     int nextRecvCntBufSize = args.nextRecvCntBufSize;
     int* recvStats = args.recvStats;
@@ -529,8 +530,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     int* const nextRecvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOffBase + bank_next * signalSlotStride);
     signalsBase += static_cast<unsigned>(bank) * static_cast<unsigned>(numExperts);
 
-    auto rankSentCnt = rankCountersBase;
-    auto rankArrivedCnt = rankCountersBase + numRanks;
+    auto rankSentCnt = rankSentCntBase;
+    auto rankArrivedCnt = rankArrivedCntBase;
 
     using recipe_types = DispatchRecipeDeviceTypes<kRecipe, ScaleT>;
     using scale_t = typename recipe_types::scale_t;
