@@ -202,13 +202,22 @@ __global__ void compute_layout_info_kernel(
     EM_OUT_T* em_padded_out_counts,   // caller expert_counters
     EM_OUT_T* em_out_offsets,         // caller expert_offsets
     int32_t* em_actual_counts_out,    // handle authoritative per-expert counts
-    void* recv_total_counter) {
+    void* recv_total_counter,
+    int32_t* num_tokens_for_experts) {  // handle FLAT recv count (unpadded); nullable
     extern __shared__ int32_t s_raw[]; // [2 * experts_per_rank + 1]: expert_total | expert_base | overflow_flag
     ::ht_ep::scan_flat_smem_t smem{};
     smem.expert_total = s_raw;
     smem.expert_base = s_raw + experts_per_rank;
     smem.overflow_flag = s_raw + 2 * experts_per_rank;
     const size_t row_ints = (size_t)num_src_ranks + (size_t)num_experts;
+    if (threadIdx.x == 0 && num_tokens_for_experts) {
+        // Unpadded FLAT recv total: sum this rank's per-rank block entry across all source
+        // rows (matches the fused push-count path's num_recv_out; see dispatch_push_map_publish_outputs).
+        int32_t tot = 0;
+        for (int s = 0; s < num_src_ranks; s++) tot += cached_cnt_rows[(size_t)s * row_ints + my_rank];
+        *num_tokens_for_experts =
+            (allow_overflow_drop && tot > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : tot;
+    }
     for (int e = threadIdx.x; e < experts_per_rank; e += blockDim.x) {
         // my_rank is the world rank, so my experts are [my_rank*epr, ...) in the world-global
         // expert id space; this indexing holds whether count mode's current single-LSA-team
@@ -244,6 +253,7 @@ void compute_layout_info(
     void* em_out_offsets,
     int32_t* em_actual_counts_out,
     void* recv_total_counter,
+    int32_t* num_tokens_for_experts,
     cudaStream_t stream)
 {
     assert(num_experts == num_src_ranks * experts_per_rank);
@@ -256,13 +266,15 @@ void compute_layout_info(
             cached_cnt_rows, num_src_ranks, num_experts, experts_per_rank, my_rank,
             em_alignment, max_recv_tokens_per_rank, allow_overflow_drop, out_is_int64,
             em_internal_offsets, static_cast<int64_t*>(em_padded_out_counts),
-            static_cast<int64_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter);
+            static_cast<int64_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter,
+            num_tokens_for_experts);
     } else {
         compute_layout_info_kernel<int32_t><<<1, block, smem_bytes, stream>>>(
             cached_cnt_rows, num_src_ranks, num_experts, experts_per_rank, my_rank,
             em_alignment, max_recv_tokens_per_rank, allow_overflow_drop, out_is_int64,
             em_internal_offsets, static_cast<int32_t*>(em_padded_out_counts),
-            static_cast<int32_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter);
+            static_cast<int32_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter,
+            num_tokens_for_experts);
     }
 }
 

@@ -114,6 +114,7 @@ void compute_layout_info(
     void* em_out_offsets,          // caller expert_offsets, nullable
     int32_t* em_actual_counts_out, // handle authoritative counts, nullable
     void* recv_total_counter,      // caller recv_total_counter, nullable
+    int32_t* num_tokens_for_experts, // handle FLAT recv count (unpadded); nullable
     cudaStream_t stream);
 
 // ============================================================================

@@ -3646,6 +3646,7 @@ static ncclResult_t ht_update_handle_count_mode(
             out_offsets,
             per_expert_counts_device,
             recv_total_counter,
+            handle->ht.num_tokens_for_experts,
             stream);
         handle->ht.dispatch_push_count.fused_meta_dispatch = false;
     }
@@ -3729,6 +3730,7 @@ static ncclResult_t ht_update_handle_pull_count_mode(
             out_offsets,
             per_expert_counts_device,
             recv_total_counter,
+            handle->ht.num_tokens_for_experts,
             stream);
         handle->ht.dispatch_push_count.fused_meta_dispatch = false;
     }
