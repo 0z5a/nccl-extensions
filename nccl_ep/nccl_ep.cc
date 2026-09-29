@@ -492,6 +492,10 @@ static ncclResult_t validateDispatchRecipe(
                 expected_rows = static_cast<size_t>(launch.num_local_experts);
                 expected_slots = static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks;
             }
+            if (output_tokens->ndim != 3 || output_tokens->sizes[0] != expected_rows ||
+                output_tokens->sizes[1] != expected_slots || output_tokens->sizes[2] != tokens->sizes[1]) {
+                return fail("DS_FP8E3M4 outputs->tokens must be 3D matching the selected layout and hidden");
+            }
             if (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32 ||
                 output_scales->sizes[0] != expected_rows ||
                 output_scales->sizes[1] != expected_slots ||
@@ -4785,24 +4789,20 @@ ncclResult_t ncclEpDispatch(
                 static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_prob, 0, dense_prob_size, stream));
 
+            const auto build_dense_prob = [&](const auto* cached_topk_idx) {
+                nccl_ep::ht::sparse_to_dense_prob(
+                    cached_topk_idx,
+                    static_cast<const float*>(topk_weights->data),
+                    dense_prob,
+                    handle->num_tokens,
+                    handle->num_topk,
+                    group->config.num_experts,
+                    stream);
+            };
             if (topk_idx_cache_is_int32(group, handle)) {
-                nccl_ep::ht::sparse_to_dense_prob(
-                    static_cast<const int32_t*>(handle->ht.topk_idx),
-                    static_cast<const float*>(topk_weights->data),
-                    dense_prob,
-                    handle->num_tokens,
-                    handle->num_topk,
-                    group->config.num_experts,
-                    stream);
+                build_dense_prob(static_cast<const int32_t*>(handle->ht.topk_idx));
             } else {
-                nccl_ep::ht::sparse_to_dense_prob(
-                    static_cast<const int64_t*>(handle->ht.topk_idx),
-                    static_cast<const float*>(topk_weights->data),
-                    dense_prob,
-                    handle->num_tokens,
-                    handle->num_topk,
-                    group->config.num_experts,
-                    stream);
+                build_dense_prob(static_cast<const int64_t*>(handle->ht.topk_idx));
             }
         }
 
@@ -5141,7 +5141,9 @@ ncclResult_t ncclEpDispatch(
                 /*expert_output_token=*/
                 params.expert_output_token_ptrs[group->lsa_rank],
                 /*expert_output_prob=*/
-                forward_dispatch ? group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank] : nullptr,
+                forward_dispatch
+                    ? group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank]
+                    : nullptr,
                 handle->ht.emuf_group_buf,
                 handle->ht.emuf_group_count,
                 handle->ht.emuf_group_stride,
@@ -6357,24 +6359,20 @@ ncclResult_t ncclEpCombine(
             assert(
                 handle->ht.topk_idx != nullptr &&
                 "HT BWD combine: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
+            const auto gather_sparse = [&](const auto* cached_topk_idx) {
+                nccl_ep::ht::dense_to_sparse_prob_combine(
+                    dense_output_prob,
+                    cached_topk_idx,
+                    static_cast<float*>(combined_topk_weights->data),
+                    num_combined_tokens,
+                    num_topk,
+                    group->config.num_experts,
+                    stream);
+            };
             if (topk_idx_cache_is_int32(group, handle)) {
-                nccl_ep::ht::dense_to_sparse_prob_combine(
-                    dense_output_prob,
-                    static_cast<const int32_t*>(handle->ht.topk_idx),
-                    static_cast<float*>(combined_topk_weights->data),
-                    num_combined_tokens,
-                    num_topk,
-                    group->config.num_experts,
-                    stream);
+                gather_sparse(static_cast<const int32_t*>(handle->ht.topk_idx));
             } else {
-                nccl_ep::ht::dense_to_sparse_prob_combine(
-                    dense_output_prob,
-                    static_cast<const int64_t*>(handle->ht.topk_idx),
-                    static_cast<float*>(combined_topk_weights->data),
-                    num_combined_tokens,
-                    num_topk,
-                    group->config.num_experts,
-                    stream);
+                gather_sparse(static_cast<const int64_t*>(handle->ht.topk_idx));
             }
         }
 
