@@ -142,6 +142,13 @@ set(NCCL_EP_JIT_HEADERS
     device/ll_ep.cuh
     device/ll_ep_adapter.cuh
     device/ll_ep_smem.cuh
+    device/ll/ll_common.cuh
+    device/ll/ll_gin.cuh
+    device/ll/ll_lsa_primitives.cuh
+    device/ll/ll_mask.cuh
+    device/ll/ll_logfmt.cuh
+    device/ll/ll_dispatch_lsa.cuh
+    device/ll/ll_combine_lsa.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")
