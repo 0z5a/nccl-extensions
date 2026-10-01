@@ -77,7 +77,14 @@ NCCL_EP_JIT_HEADERS := \
     device/macros.cuh \
     device/ll_ep.cuh \
     device/ll_ep_adapter.cuh \
-    device/ll_ep_smem.cuh
+    device/ll_ep_smem.cuh \
+    device/ll/ll_common.cuh \
+    device/ll/ll_gin.cuh \
+    device/ll/ll_lsa_primitives.cuh \
+    device/ll/ll_mask.cuh \
+    device/ll/ll_logfmt.cuh \
+    device/ll/ll_dispatch_lsa.cuh \
+    device/ll/ll_combine_lsa.cuh
 NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h include/cuda_fp_features.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)
@@ -254,7 +261,7 @@ endif
 # they were built against rather than risk binding a stale system libnccl.
 # --no-as-needed keeps libnccl in DT_NEEDED despite its weak-only exports.
 EP_EXE_NCCL_LDFLAGS := -L$(LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -Xlinker --no-as-needed -lnccl -Xlinker --as-needed \
-                       -Xlinker -rpath -Xlinker $(abspath $(NCCL_LIBDIR)) -Xlinker -rpath -Xlinker $(abspath $(LIBDIR))
+                       -Xlinker -rpath -Xlinker $(abspath $(LIBDIR)) -Xlinker -rpath -Xlinker $(abspath $(NCCL_LIBDIR))
 
 # Build ep_test and ep_bench (require MPI)
 ifeq ($(MPI), 1)

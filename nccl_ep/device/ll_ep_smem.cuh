@@ -100,4 +100,15 @@ constexpr int dynamic_smem_bytes(int hidden, int elem_bytes, int num_warps, int 
     return send_bytes > recv_bytes ? send_bytes : recv_bytes;
 }
 
+// Upper bound on numRanks for combine_kernel_impl_2sided_rm_lsa's CTA-local
+// active-rank bitmask (ll/ll_combine_lsa.cuh), which has no other
+// compile-time bound. 128 matches the HT path's enforced lsa_team_size cap.
+constexpr int kMaxLsaCombineRanks = 128;
+constexpr int kActiveRankMaskWords = (kMaxLsaCombineRanks + 31) / 32;
+
+// Static __shared__ footprint of that bitmask -- separate from (and not
+// covered by) the dynamic_smem_bytes() budget above; must be reserved out
+// of max_dynamic_smem by choose_combine_smem_config (ll_ep_adapter.cuh).
+constexpr int kLsaStaticSmemBytes = kActiveRankMaskWords * static_cast<int>(sizeof(std::uint32_t));
+
 } // namespace nccl_ep::ll::combine_smem

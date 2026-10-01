@@ -561,7 +561,7 @@ inline ncclResult_t launch_combine_push(
             << "      p.flat2em_slot_map,\n"
             << "      p.recv_slot_to_src,\n"
             << "      p.num_recv_tokens_dev,\n"
-            << "      p.dcomms,\n"
+            << "      p.dcomm,\n"
             << "      p.head_sync_flag,\n"
             << "      p.grid_barrier_counter,\n"
             << "      p.top_k,\n"

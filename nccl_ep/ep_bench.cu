@@ -21,6 +21,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <mpi.h>
 #include <cuda_runtime.h>
@@ -1092,6 +1093,20 @@ static double calc_diff(const double* x, const double* y, size_t n) {
 // When dispatch_inputs.tokens is BF16: fills with rank value + token ID in last TOKEN_ID_COLS cols.
 // When dispatch_inputs.tokens is scales-forward: fills with scalesForwardTokenByte pattern; fills scales if present.
 // topk_weights are filled the same way for both.
+// Deterministic per-rank topk_weights: mt19937(42 + rank), abs(normal), clamped
+// to >= 1e-6f. THE single definition of the weight pattern -- used by source
+// generation AND every validator that regenerates expectations; keep in sync
+// by calling this, never by re-inlining the triple.
+static void generateTopkWeights(float* out, size_t count, int rank) {
+    std::mt19937 rng(42 + rank);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (size_t i = 0; i < count; i++) {
+        float w = std::abs(normal(rng));
+        out[i] = (w < 1e-6f) ? 1e-6f : w;
+    }
+}
+
+
 void initializeValidationData(
     const BenchmarkAllocState& alloc,
     ncclEpDispatchInputs_t& dispatch_inputs,
@@ -1195,12 +1210,7 @@ void initializeValidationData(
     // LL: weights applied during combine → affects combined output
     // HT: weights forwarded during dispatch → does NOT affect combined output
     float* topk_weights_host = new float[num_tokens * top_k];
-    std::mt19937 rng(42 + myRank);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    for (unsigned int i = 0; i < num_tokens * top_k; i++) {
-        topk_weights_host[i] = std::abs(normal(rng));
-        if (topk_weights_host[i] < 1e-6f) topk_weights_host[i] = 1e-6f;
-    }
+    generateTopkWeights(topk_weights_host, static_cast<size_t>(num_tokens) * top_k, myRank);
     if (is_ht_mode && dispatch_inputs.topk_weights) {
         void* dtw_data;
         NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.topk_weights, &dtw_data));
@@ -1264,17 +1274,6 @@ static void generateTopkIndicesHT(
     }
 }
 
-// Regenerate rank's per-token topk_weights, byte-for-byte matching initializeValidationData
-// (mt19937(42+rank), abs(normal(0,1)), 1e-6 floor). Used to validate the dispatched EM weights.
-static void generateTopkWeightsHT(float* weights_host, unsigned int num_tokens, unsigned int top_k, int rank) {
-    std::mt19937 rng(42 + rank);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    for (unsigned int i = 0; i < num_tokens * top_k; i++) {
-        float w = std::abs(normal(rng));
-        weights_host[i] = (w < 1e-6f) ? 1e-6f : w;
-    }
-}
-
 // Extract (source_rank, token_id) from a received token row using first and last columns.
 // `max_token_id` is the upper bound on encoded token id used as a sanity check; pass the
 // group-wide max_tokens_per_rank (== num_tokens under uniform; >= every rank's count under
@@ -1332,6 +1331,115 @@ struct ErrorReporter {
         errors++;
     }
 };
+
+// Weight comparison tolerance used by every HT weight check: the bench's existing
+// convention (LL rank-major and expert-major validators), 1e-5 relative with a
+// 1e-6 floor so zero-valued pads compare sensibly.
+static bool htWeightMismatch(float got, float expected) {
+    return !std::isfinite(got) || std::abs(got - expected) > 1e-5f * (std::abs(expected) + 1e-6f);
+}
+
+// First expert id that appears twice in a source top-k row, or -1. A duplicate
+// violates the top-k contract (ids must be distinct) and has no defined wire
+// expectation, so every HT validator reports it as an error instead of guessing.
+static int64_t firstDuplicateExpertId(const int64_t* row, unsigned int top_k) {
+    std::set<int64_t> seen;
+    for (unsigned int k = 0; k < top_k; k++) {
+        if (row[k] < 0) continue;
+        if (!seen.insert(row[k]).second) return row[k];
+    }
+    return -1;
+}
+
+// Check of one HT FLAT ([slot][top_k], no per-rank padding -- HT has no
+// rank-major layout) received weight row. The kernel emits the source token's weights for THIS rank's experts in
+// ascending local-expert order and zero-fills the remaining slots; the source
+// weights are regenerated with generateTopkWeights and compared with the
+// bench's usual 1e-5 relative tolerance (htWeightMismatch). Shared by the bf16
+// and the scales-forward HT validators so both check identically.
+static void checkHTFlatRecvWeights(
+    ErrorReporter& rep,
+    const char* tag,
+    int myRank,
+    unsigned int slot,
+    int src_rank,
+    int token_id,
+    const int64_t* src_topk_row,
+    const float* src_weight_row,
+    const float* recv_weight_row,
+    unsigned int top_k,
+    unsigned int num_local_experts) {
+    const int64_t dup = firstDuplicateExpertId(src_topk_row, top_k);
+    if (dup >= 0) {
+        rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) duplicate expert id %lld in the source top-k row "
+                  "(invalid routing: top-k ids must be distinct)\n",
+                  myRank, tag, slot, src_rank, token_id, static_cast<long long>(dup));
+        return;
+    }
+    std::map<int64_t, float> weight_by_expert;  // ascending expert id == emission order
+    for (unsigned int k = 0; k < top_k; k++) {
+        const int64_t eid = src_topk_row[k];
+        if (eid < 0) continue;
+        if (static_cast<int>(eid) / static_cast<int>(num_local_experts) != myRank) continue;
+        weight_by_expert.emplace(eid, src_weight_row[k]);
+    }
+    unsigned int k_out = 0;
+    for (const auto& ew : weight_by_expert) {
+        const float got = recv_weight_row[k_out];
+        if (htWeightMismatch(got, ew.second)) {
+            rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) weight mismatch at k=%u (expert=%lld expected=%.9g "
+                      "got=%.9g)\n",
+                      myRank, tag, slot, src_rank, token_id, k_out, static_cast<long long>(ew.first), ew.second, got);
+        }
+        k_out++;
+    }
+    for (; k_out < top_k; k_out++) {
+        const float got = recv_weight_row[k_out];
+        if (htWeightMismatch(got, 0.0f)) {
+            rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) pad weight non-zero at k=%u (got=%.9g)\n",
+                      myRank, tag, slot, src_rank, token_id, k_out, got);
+        }
+    }
+}
+
+// Check of one HT expert-major received weight (1-D [slot] weights): the slot
+// sits in local expert e's zone and must carry the source token's weight for global
+// expert myRank * num_local_experts + e. Used by the scales-forward validator for EM.
+static void checkHTExpertMajorRecvWeight(
+    ErrorReporter& rep,
+    const char* tag,
+    int myRank,
+    unsigned int slot,
+    int src_rank,
+    int token_id,
+    const int64_t* src_topk_row,
+    const float* src_weight_row,
+    float got,
+    unsigned int local_expert,
+    unsigned int top_k,
+    unsigned int num_local_experts) {
+    const int64_t dup = firstDuplicateExpertId(src_topk_row, top_k);
+    if (dup >= 0) {
+        rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) duplicate expert id %lld in the source top-k row "
+                  "(invalid routing: top-k ids must be distinct)\n",
+                  myRank, tag, slot, src_rank, token_id, static_cast<long long>(dup));
+        return;
+    }
+    const int64_t ge = static_cast<int64_t>(myRank) * num_local_experts + local_expert;
+    int p = -1;
+    for (unsigned int k = 0; k < top_k; k++) {
+        if (src_topk_row[k] == ge) { p = static_cast<int>(k); break; }
+    }
+    if (p < 0) {
+        rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) local expert %u absent from the source top-k row\n",
+                  myRank, tag, slot, src_rank, token_id, local_expert);
+        return;
+    }
+    if (htWeightMismatch(got, src_weight_row[p])) {
+        rep.error("[Rank %d] %s: slot %u (rank=%d token=%d) weight mismatch (expert=%lld expected=%.9g got=%.9g)\n",
+                  myRank, tag, slot, src_rank, token_id, static_cast<long long>(ge), src_weight_row[p], got);
+    }
+}
 
 // Decode+integrity+expected-match over [zone_offset, zone_offset+zone_count); returns decoded keys.
 //   skip_invalid_identity=true  → invalid rows silently skipped (HT-EM padding).
@@ -1962,14 +2070,7 @@ static ValidationResult validateDispatchOutputLLRankMaj(
         unsigned int r_tokens = num_tokens_per_rank[r];
         // Regenerate expected topk indices and weights for rank r (must match initializeValidationData)
         generateRandomTopkIndicesLL(src_topk, r_tokens, num_experts, top_k, r);
-        {
-            std::mt19937 rng(42 + r);
-            std::normal_distribution<float> normal_dist(0.0f, 1.0f);
-            for (unsigned int i = 0; i < r_tokens * top_k; i++) {
-                src_wgt[i] = std::abs(normal_dist(rng));
-                if (src_wgt[i] < 1e-6f) src_wgt[i] = 1e-6f;
-            }
-        }
+        generateTopkWeights(src_wgt, static_cast<size_t>(r_tokens) * top_k, r);
 
         // Build ordered list of tokens from rank r that map at least one expert to myRank
         std::vector<int> expected_tokens;
@@ -2197,8 +2298,9 @@ static void preReduceRankMajor(
 // Tokens and scales are opaque physical rows. For each valid recv slot we recover the
 // source (rank, token) from the first three token bytes, then memcmp the full token byte row and the
 // full scale row against the deterministic byte recompute. Routing replay
-// (generateTopkIndicesHT) gives the expected (rank, token) set for missing/unexpected accounting.
-// Mirrors validateDispatchOutputHTRankMaj's valid-slot scan via recv_topk_idx.
+// (generateTopkIndicesHT) gives the expected (rank, token, local expert) rows for expert-major output;
+// FLAT output has one row per (rank, token), represented by local expert -1.
+// Mirrors validateDispatchOutputHTFlat's valid-slot scan via recv_topk_idx.
 static ValidationResult validateDispatchOutputHTScalesForward(
     const BenchmarkAllocState& alloc,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
@@ -2238,12 +2340,15 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     CUDACHECK(
         cudaMemcpy(recv_sf_raw, recv_scales, recv_sf_size, cudaMemcpyDeviceToHost));
 
+    const bool expert_major = meta_expert_counts_padded != nullptr && meta_expert_offsets != nullptr;
+    std::vector<int> slot_expert(buf_rows, -1);
     bool* valid_slot = new bool[buf_rows]();
-    if (meta_expert_counts_padded != nullptr && meta_expert_offsets != nullptr) {
+    if (expert_major) {
         for (unsigned int e = 0; e < num_local_experts; ++e) {
             const int64_t begin = meta_expert_offsets[e];
             const int64_t end = begin + meta_expert_counts_padded[e];
             for (int64_t j = begin; j < end && j < static_cast<int64_t>(buf_rows); ++j) {
+                slot_expert[j] = static_cast<int>(e);
                 const uint8_t* row = recv_tok + static_cast<size_t>(j) * token_row_bytes;
                 valid_slot[j] =
                     std::any_of(row, row + token_row_bytes, [](uint8_t value) { return value != 0; });
@@ -2269,33 +2374,69 @@ static ValidationResult validateDispatchOutputHTScalesForward(
         for (unsigned int j = 0; j < buf_rows; j++) valid_slot[j] = true;
     }
 
-    // Expected (rank, token) set via routing replay.
-    int64_t* src_topk = new int64_t[static_cast<size_t>(max_tokens_per_rank) * top_k];
-    std::set<std::pair<int, int>> expected;
+    // Include every local expert copy in the routing replay, independently of optional weights.
+    // FLAT rows use expert -1 so multiple local routes still require only one received row.
+    using RowKey = std::tuple<int, int, int>;
+    std::vector<std::vector<int64_t>> topk_by_rank(nRanks);
+    std::vector<std::vector<float>> weights_by_rank(nRanks);
+    std::set<RowKey> expected;
     for (int r = 0; r < nRanks; r++) {
         unsigned int r_tokens = num_tokens_per_rank[r];
-        generateTopkIndicesHT(src_topk, r_tokens, num_experts, top_k, r);
+        topk_by_rank[r].resize(static_cast<size_t>(r_tokens) * top_k);
+        generateTopkIndicesHT(topk_by_rank[r].data(), r_tokens, num_experts, top_k, r);
+        weights_by_rank[r].resize(static_cast<size_t>(r_tokens) * top_k);
+        generateTopkWeights(weights_by_rank[r].data(), weights_by_rank[r].size(), r);
         for (unsigned int t = 0; t < r_tokens; t++) {
             for (unsigned int k = 0; k < top_k; k++) {
-                int64_t expert_id = src_topk[t * top_k + k];
+                int64_t expert_id = topk_by_rank[r][static_cast<size_t>(t) * top_k + k];
                 int expert_rank = static_cast<int>(expert_id) / static_cast<int>(num_local_experts);
                 if (expert_rank == myRank) {
-                    expected.insert({r, static_cast<int>(t)});
-                    break;
+                    const int local_expert = expert_major
+                        ? static_cast<int>(expert_id % num_local_experts) : -1;
+                    expected.emplace(r, static_cast<int>(t), local_expert);
+                    if (!expert_major) break;
                 }
             }
         }
     }
-    delete[] src_topk;
 
-    if (meta_expert_counts_padded == nullptr && dispatch_outputs.topk_idx != nullptr) {
+    // recv_topk_weights [buf_rows, top_k] (FLAT shape): same check as the bf16 HT
+    // validator -- quantizing the tokens must leave the fp32 weights untouched.
+    float* recv_topk_w = nullptr;
+    if (dispatch_outputs.topk_weights != nullptr && dispatch_outputs.topk_weights->ndim == 2) {
+        void* outw_data = nullptr;
+        NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &outw_data));
+        if (outw_data != nullptr) {
+            recv_topk_w = new float[static_cast<size_t>(buf_rows) * top_k];
+            CUDACHECK(cudaMemcpy(
+                recv_topk_w,
+                outw_data,
+                static_cast<size_t>(buf_rows) * top_k * sizeof(float),
+                cudaMemcpyDeviceToHost));
+        }
+    }
+    // Expert-major: 1-D [buf_rows] weights, one per slot; slot -> local expert via the
+    // zone table (meta offsets/counts), then the same source comparison.
+    float* recv_w_em = nullptr;
+    if (dispatch_outputs.topk_weights != nullptr && dispatch_outputs.topk_weights->ndim == 1 &&
+        expert_major) {
+        void* outw_data = nullptr;
+        NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &outw_data));
+        if (outw_data != nullptr) {
+            recv_w_em = new float[buf_rows];
+            CUDACHECK(cudaMemcpy(recv_w_em, outw_data, static_cast<size_t>(buf_rows) * sizeof(float),
+                                 cudaMemcpyDeviceToHost));
+        }
+    }
+
+    if (!expert_major && dispatch_outputs.topk_idx != nullptr) {
         std::fill(valid_slot, valid_slot + buf_rows, false);
         const unsigned int populated = std::min<unsigned int>(buf_rows, expected.size());
         for (unsigned int j = 0; j < populated; ++j) valid_slot[j] = true;
     }
 
     // Per valid slot: decode identity from token bytes 0-2, memcmp token + scale rows.
-    std::set<std::pair<int, int>> found;
+    std::set<RowKey> found;
     std::vector<uint8_t> exp_tok(token_row_bytes);
     std::vector<uint8_t> exp_sf(numScales * scale_bytes);
     for (unsigned int j = 0; j < buf_rows; j++) {
@@ -2318,16 +2459,33 @@ static ValidationResult validateDispatchOutputHTScalesForward(
             continue;
         }
 
-        auto key = std::make_pair(src_rank, token_id);
+        const auto key = std::make_tuple(src_rank, token_id, slot_expert[j]);
         if (expected.find(key) == expected.end()) {
             rep.error(
-                "[Rank %d] QUANT_FWD dispatch: slot %u: unexpected token (rank=%d, token=%d)\n",
+                "[Rank %d] QUANT_FWD dispatch: slot %u: unexpected token (rank=%d, token=%d, local_expert=%d)\n",
                 myRank,
                 j,
                 src_rank,
-                token_id);
+                token_id,
+                slot_expert[j]);
         }
         found.insert(key);
+
+        if (recv_topk_w != nullptr && token_id < static_cast<int>(num_tokens_per_rank[src_rank])) {
+            checkHTFlatRecvWeights(
+                rep, "HT QUANT_FWD dispatch", myRank, j, src_rank, token_id,
+                topk_by_rank[src_rank].data() + static_cast<size_t>(token_id) * top_k,
+                weights_by_rank[src_rank].data() + static_cast<size_t>(token_id) * top_k,
+                recv_topk_w + static_cast<size_t>(j) * top_k,
+                top_k, num_local_experts);
+        }
+        if (recv_w_em != nullptr && slot_expert[j] >= 0 && token_id < static_cast<int>(num_tokens_per_rank[src_rank])) {
+            checkHTExpertMajorRecvWeight(
+                rep, "HT QUANT_FWD dispatch", myRank, j, src_rank, token_id,
+                topk_by_rank[src_rank].data() + static_cast<size_t>(token_id) * top_k,
+                weights_by_rank[src_rank].data() + static_cast<size_t>(token_id) * top_k,
+                recv_w_em[j], static_cast<unsigned int>(slot_expert[j]), top_k, num_local_experts);
+        }
 
         // Recompute and byte-compare the full token row.
         for (size_t byte = 0; byte < token_row_bytes; byte++)
@@ -2369,11 +2527,13 @@ static ValidationResult validateDispatchOutputHTScalesForward(
 
     for (const auto& key : expected) {
         if (found.find(key) == found.end()) {
-            rep.error("[Rank %d] HT QUANT_FWD dispatch: missing token (rank=%d, token=%d)\n",
-                      myRank, key.first, key.second);
+            rep.error("[Rank %d] HT QUANT_FWD dispatch: missing token (rank=%d, token=%d, local_expert=%d)\n",
+                      myRank, std::get<0>(key), std::get<1>(key), std::get<2>(key));
         }
     }
 
+    delete[] recv_w_em;
+    delete[] recv_topk_w;
     delete[] valid_slot;
     delete[] recv_sf_raw;
     delete[] recv_tok;
@@ -2388,11 +2548,11 @@ static ValidationResult validateDispatchOutputHTScalesForward(
     return result;
 }
 
-// ==================== HT rank-major dispatch validation ====================
+// ==================== HT FLAT dispatch validation ====================
 // Output: 2D [nRanks*max_tokens_per_rank, hidden]; row valid iff any recv_topk_idx[k] >= 0.
 // FIXME: ncclEpHandleGetNumRecvTokens returns buffer max, not actual count -- scan recv_topk_idx as workaround.
 // recv_topk_idx numbering: LOCAL (default) or GLOBAL per dispatch_layout_info.recv_topk_idx_kind.
-static ValidationResult validateDispatchOutputHTRankMaj(
+static ValidationResult validateDispatchOutputHTFlat(
     const BenchmarkAllocState& alloc,
     const ncclEpDispatchOutputs_t& dispatch_outputs,
     const ncclEpLayoutInfo_t& dispatch_layout_info,
@@ -2423,11 +2583,17 @@ static ValidationResult validateDispatchOutputHTRankMaj(
     // writes recv_topk_idx / recv_data for [0, actual_recv).
     // The trailing [actual_recv, buf_rows) is undefined and should be ignored.
     std::vector<std::vector<int64_t>> topk_by_rank(nRanks);
+    // Source-side topk_weights are deterministic per rank (mt19937(42 + rank),
+    // see initializeValidationData); regenerate them so recv_topk_weights can be
+    // validated exactly (float transport, no precision loss).
+    std::vector<std::vector<float>> weights_by_rank(nRanks);
     std::set<std::pair<int, int>> expected;
     for (int r = 0; r < nRanks; r++) {
         unsigned int r_tokens = num_tokens_per_rank[r];
         topk_by_rank[r].resize(static_cast<size_t>(r_tokens) * top_k);
         generateTopkIndicesHT(topk_by_rank[r].data(), r_tokens, num_experts, top_k, r);
+        weights_by_rank[r].resize(static_cast<size_t>(r_tokens) * top_k);
+        generateTopkWeights(weights_by_rank[r].data(), weights_by_rank[r].size(), r);
         for (unsigned int t = 0; t < r_tokens; t++) {
             for (unsigned int k = 0; k < top_k; k++) {
                 int64_t expert_id = topk_by_rank[r][static_cast<size_t>(t) * top_k + k];
@@ -2477,6 +2643,21 @@ static ValidationResult validateDispatchOutputHTRankMaj(
                 break;
             }
         }
+    }
+
+    // recv_topk_weights [buf_rows, top_k]: match against regenerated source
+    // weights (kernel emits them in ascending local-expert order).
+    ErrorReporter weight_rep(max_errors_to_print);
+    float* recv_topk_w = nullptr;
+    if (dispatch_outputs.topk_weights != nullptr) {
+        recv_topk_w = new float[static_cast<size_t>(buf_rows) * top_k];
+        void* outw_data;
+        NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &outw_data));
+        CUDACHECK(cudaMemcpy(
+            recv_topk_w,
+            outw_data,
+            static_cast<size_t>(buf_rows) * top_k * sizeof(float),
+            cudaMemcpyDeviceToHost));
     }
 
     std::set<std::pair<int, int>> found;
@@ -2577,6 +2758,17 @@ static ValidationResult validateDispatchOutputHTRankMaj(
             }
             errors++;
         }
+
+        // recv_topk_weights: check this slot's received weight row (ascending
+        // local-expert order, zero pads; duplicates are an error).
+        if (recv_topk_w != nullptr) {
+            checkHTFlatRecvWeights(
+                weight_rep, "HT dispatch", myRank, j, source_rank, token_id,
+                sr_topk.data() + static_cast<size_t>(token_id) * top_k,
+                weights_by_rank[source_rank].data() + static_cast<size_t>(token_id) * top_k,
+                recv_topk_w + static_cast<size_t>(j) * top_k,
+                top_k, num_local_experts);
+        }
     }
 
     for (const auto& key : expected) {
@@ -2589,6 +2781,8 @@ static ValidationResult validateDispatchOutputHTRankMaj(
         }
     }
 
+    errors += weight_rep.errors;
+    delete[] recv_topk_w;
     delete[] recv_topk_idx;
     delete[] valid_slot;
     delete[] recv_data;
@@ -2633,8 +2827,8 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
     NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
     CUDACHECK(cudaMemcpy(recv_data, output0_data, recv_size * eb, cudaMemcpyDeviceToHost));
 
-    // HT-EM expected: flat (src_rank, token_id) — token reaches at least one local expert.
-    std::set<std::pair<int, int>> expected;
+    // Each routed local expert must receive its own copy of (src_rank, token_id).
+    std::vector<std::set<std::pair<int, int>>> expected(num_local_experts);
     for (int r = 0; r < nRanks; r++) {
         unsigned int r_tokens = num_tokens_per_rank[r];
         generateTopkIndicesHT(src_topk, r_tokens, num_experts, top_k, r);
@@ -2643,16 +2837,14 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
                 int64_t expert_id = src_topk[t * top_k + k];
                 int expert_rank = static_cast<int>(expert_id) / static_cast<int>(num_local_experts);
                 if (expert_rank == myRank) {
-                    expected.insert({r, static_cast<int>(t)});
-                    break;
+                    expected[expert_id % num_local_experts].insert({r, static_cast<int>(t)});
                 }
             }
         }
     }
 
-    std::set<std::pair<int, int>> found;
     for (unsigned int e = 0; e < num_local_experts; e++) {
-        auto z = scanExpertZone(
+        const auto found = scanExpertZone(
             recv_data,
             meta_expert_offsets[e],
             meta_expert_counts_padded[e],
@@ -2660,18 +2852,17 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
             token_dtype,
             nRanks,
             max_tokens_per_rank,
-            expected,
+            expected[e],
             /*skip_invalid_identity=*/true,
             "HT dispatch",
             myRank,
             e,
             rep);
-        found.insert(z.begin(), z.end());
-    }
-
-    for (const auto& key : expected) {
-        if (found.find(key) == found.end()) {
-            rep.error("[Rank %d] HT dispatch: missing token (rank=%d, token=%d)\n", myRank, key.first, key.second);
+        for (const auto& key : expected[e]) {
+            if (found.find(key) == found.end()) {
+                rep.error("[Rank %d] HT dispatch: expert %u missing token (rank=%d, token=%d)\n",
+                          myRank, e, key.first, key.second);
+            }
         }
     }
 
@@ -2696,7 +2887,7 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
                 topk_by_rank[r].resize(static_cast<size_t>(max_tokens_per_rank) * top_k);
                 wgt_by_rank[r].resize(static_cast<size_t>(max_tokens_per_rank) * top_k);
                 generateTopkIndicesHT(topk_by_rank[r].data(), max_tokens_per_rank, num_experts, top_k, r);
-                generateTopkWeightsHT(wgt_by_rank[r].data(), max_tokens_per_rank, top_k, r);
+                generateTopkWeights(wgt_by_rank[r].data(), static_cast<size_t>(max_tokens_per_rank) * top_k, r);
             }
         }
     }
@@ -2737,27 +2928,15 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
             }
             locs[{src_rank, tok_id}].push_back({e, s});
 
-            // Phase C: weight for this slot must match the source's topk_weight at the
-            // position where the source routed to this expert (order-preserving).
+            // Phase C: the weight for this slot must be the source token's topk_weight
+            // for the expert owning the slot (order-preserving). Same shared check the
+            // scales-forward validator uses for expert-major runs.
             if (check_weights) {
-                const int ge = myRank * static_cast<int>(num_local_experts) + static_cast<int>(e);
-                const int64_t* tk = topk_by_rank[src_rank].data() + static_cast<size_t>(tok_id) * top_k;
-                int p = -1;
-                for (unsigned int kk = 0; kk < top_k; kk++) {
-                    if (tk[kk] == ge) { p = static_cast<int>(kk); break; }
-                }
-                if (p < 0) {
-                    rep.error("[Rank %d] HT dispatch weight: expert %u absent from src (rank=%d tok=%d) topk\n",
-                              myRank, e, src_rank, tok_id);
-                } else {
-                    float expected_w = wgt_by_rank[src_rank][static_cast<size_t>(tok_id) * top_k + p];
-                    float got = recv_wgt[static_cast<size_t>(off + s)];
-                    if (std::abs(got - expected_w) > 1e-5f * (std::abs(expected_w) + 1e-6f)) {
-                        rep.error("[Rank %d] HT dispatch weight: E%u slot %ld (src=%d tok=%d) w=%.6f expected=%.6f "
-                                  "(srcpos=%d)\n",
-                                  myRank, e, (long)s, src_rank, tok_id, got, expected_w, p);
-                    }
-                }
+                checkHTExpertMajorRecvWeight(
+                    rep, "HT dispatch", myRank, static_cast<unsigned int>(off + s), src_rank, tok_id,
+                    topk_by_rank[src_rank].data() + static_cast<size_t>(tok_id) * top_k,
+                    wgt_by_rank[src_rank].data() + static_cast<size_t>(tok_id) * top_k,
+                    recv_wgt[static_cast<size_t>(off + s)], e, top_k, num_local_experts);
             }
         }
     }
@@ -2879,7 +3058,7 @@ ValidationResult validateDispatchOutput(
                 meta_expert_offsets,
                 token_dtype);
         }
-        return validateDispatchOutputHTRankMaj(
+        return validateDispatchOutputHTFlat(
             alloc,
             dispatch_outputs,
             dispatch_layout_info,
@@ -4844,7 +5023,7 @@ int main(int argc, char* argv[]) {
         {"disable-token-dropping", no_argument, 0, 1001},
         {"fused-meta-dispatch", no_argument, 0, 1005},
         {"backward", no_argument, 0, 'B'},
-        {"overflow-drop", no_argument, 0, 1006},
+        {"overflow-drop", no_argument, 0, 1008},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -5079,7 +5258,7 @@ int main(int argc, char* argv[]) {
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
             break;
-        case 1006:  // --overflow-drop
+        case 1008:  // --overflow-drop
             overflow_drop = true;
             break;
         case 1005:  // --fused-meta-dispatch

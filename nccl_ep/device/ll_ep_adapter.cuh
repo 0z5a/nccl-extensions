@@ -47,6 +47,10 @@ inline int ll_combine_dynamic_smem_bytes(
 // Keep the requested mapping from warp groups to experts, reducing only the
 // per-group parallelism. This preserves correctness while trading throughput
 // to fit the device's opt-in dynamic shared-memory limit.
+//
+// max_dynamic_smem is taken as the exact usable dynamic-smem budget --
+// callers that also need to reserve room for a kernel's static __shared__
+// usage must subtract it before calling this.
 inline combine_smem_config_t choose_combine_smem_config(
     int hidden,
     ncclDataType_t token_dtype,
@@ -79,8 +83,7 @@ inline combine_smem_config_t choose_combine_smem_config(
 //
 // The struct layouts must match what the kernel expects, so any field added
 // here must also be threaded through the matching kernel entry: the JIT sources
-// device/jit/ll_dispatch_jit.cuh / ll_combine_jit.cuh for dispatch and combine,
-// and the precompiled clean kernel in device/ll_ep_adapter.cu.
+// device/jit/ll_dispatch_jit.cuh, ll_combine_jit.cuh, and ll_clean_jit.cuh.
 // ============================================================================
 
 struct dispatch_kernel_args_t {
@@ -105,7 +108,8 @@ struct dispatch_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvCntOff;
-    int* rankCountersBase;
+    int* rankSentCnt;
+    int* rankArrivedCnt;
     int* rankDone;
     int nextRecvCntBufSize;
     int* recvStats;
@@ -127,8 +131,7 @@ struct dispatch_kernel_args_t {
     // recv_topk_idx numbering (LOCAL/GLOBAL); resolved on the host (never AUTO).
     ncclEpExpertIdKind_t recvTopkIdxKind;
     int phases;
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
     uint64_t timeoutCycles;
@@ -156,7 +159,7 @@ struct combine_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
-    int* atomicCleanFlag;
+    int* combineSync;
     int nextRecvCntBufSize;
     int64_t* waitStats;
     LowLatencyEpochState* epochState;
@@ -173,8 +176,7 @@ struct combine_kernel_args_t {
     int numWarpsPerGroup;
     int phases;
     bool zeroCopy;
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
     uint64_t timeoutCycles;
@@ -188,7 +190,7 @@ struct clean_low_latency_buffer_kernel_args_t {
     int* rankMask;
     int* syncBuffer;
     ncclWindow_t* syncWindow;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     unsigned barrierSignalBase;
     uint64_t timeoutCycles;
 };
@@ -247,13 +249,15 @@ struct DispatchParams {
     ncclEpLayout_t layout;
 
     // GIN / NCCL device context
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
 
-    // Runtime workspace + error tracking
-    void* workspace;
+    // Runtime workspace + error tracking. Each pointer is a dedicated,
+    // non-overlapping region computed once at group-creation time
+    int* rankSentCnt;
+    int* rankArrivedCnt;
+    int* rankDone;
     int numDeviceSms;
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
@@ -315,13 +319,13 @@ struct CombineParams {
     ncclEpLayout_t layout;
 
     // GIN / NCCL device context
-    int numComms;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     const ncclWindow_t* windows;
     unsigned signalsBase;
 
-    // Runtime workspace + error tracking
-    void* workspace;
+    // Runtime workspace + error tracking. Each pointer is a dedicated,
+    // non-overlapping region computed once at group-creation time.
+    int* combineSync;
     int numDeviceSms;
     unsigned int deviceSm;
     int maxDynamicSmem;
@@ -340,6 +344,11 @@ struct CombineParams {
     // halves kMaxNumGroups to stay within the dynamic-SMEM cap).
     ncclDataType_t tokenDtype = ncclBfloat16;
     ncclEpCombQuant_t quantizationRecipe = NCCL_EP_COMB_QUANT_NONE;
+
+    // True when every destination is NVLink-reachable (the whole world fits in
+    // one LSA team). One of the inputs ll_combine_select_algo uses to pick an
+    // LSA-only kernel; ignored by the general (kDefault) JIT path.
+    bool nvlinkOnly = false;
 };
 
 struct CleanLowLatencyBufferParams {
@@ -350,7 +359,7 @@ struct CleanLowLatencyBufferParams {
     int* rankMask;
     int* syncBuffer;
     ncclWindow_t* syncWindow;
-    ncclDevComm* devComms;
+    ncclDevComm* devComm;
     unsigned barrierSignalBase;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
 };
@@ -370,7 +379,7 @@ ncclResult_t call_dispatch(
 
 ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream = 0);
 
-void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
+ncclResult_t call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
 
 } // namespace ll
 } // namespace nccl_ep

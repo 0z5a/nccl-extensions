@@ -1099,7 +1099,7 @@ struct dispatch_kernel_param_base_t {
     // The number of token output by attn layer on a rank/GPU.
     int num_of_tokens_per_rank;
     // NCCL GIN context
-    ncclDevComm dcomm; // Device communicator
+    ncclDevComm* dcomm; // Device communicator (device pointer)
     ncclWindow_t token_window; // Source window handle for token data
     ncclWindow_t prob_window; // Source window handle for probability data
     ncclWindow_t sf_window; // Source window handle for scaling-factor data
@@ -1176,11 +1176,10 @@ struct combine_kernel_param_base_t {
     // Per-rank grid-barrier counter that elects the last block at the combine tail.
     uint32_t* combine_grid_barrier_counter;
     // NCCL GIN context
-    ncclDevComm_t* dcomms; // Device communicators array (1 element, on device)
+    ncclDevComm_t* dcomm; // Device communicator (device pointer)
     ncclWindow_t token_window; // Source window handle for token data
     ncclWindow_t prob_window; // Source window handle for probability data
     ncclWindow_t dest_window; // Destination window handle
-    int num_gin_comms; // Number of GIN communicators (1)
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
     unsigned signals_base; // Base signal ID
@@ -1217,13 +1216,6 @@ __forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t b
 // Map a data channel onto its GIN context, skipping the reserved contexts.
 __forceinline__ __device__ int get_data_ctx(int channel, int num_ctx_per_comm) {
     return NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (channel % num_ctx_per_comm);
-}
-
-// Helper to compute communicator index and context index from global channel
-// Used for 6-comm x 4-ctx GIN configuration (6 communicators with 4 contexts each = 24 total channels)
-__forceinline__ __device__ void get_comm_ctx(int global_channel, int num_ctx_per_comm, int& comm_idx, int& ctx_idx) {
-    comm_idx = global_channel / num_ctx_per_comm;
-    ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
 }
 
 // Advance a ring-buffer slot; on wrap (slot == num_slots) reset to 0 and flip phase parity.
@@ -2124,7 +2116,12 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     int num_ctx_per_comm,
     void* gin_base_ptr,
     const struct dispatch_memory_region_info_t* mr_info,
-    SMEM_TYPE* smem_buffer_ptr) {
+    SMEM_TYPE* smem_buffer_ptr,
+    // Count-mode: gates the rdma_to_attn_map read via s2d_unit_wait (see its doc comment
+    // above). Without this, G2S can decide a token is "needed" from a stale pre-clear read
+    // that disagrees with S2G's paired consumer, desyncing the smem FIFO producer/consumer
+    // counts and deadlocking the pipeline.
+    const int* s2d_chunks_ready = nullptr) {
     using routing_loads_t = uint4;
 
     static_assert(sizeof(bool) == 1, "Routing map loads assume sizeof(bool) == 1");
@@ -2193,6 +2190,12 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     gin_base_ptr,
                     mr_info);
 
+                // Count mode: wait for the in-kernel MAP warp to finish this (chunk, LSA
+                // team) unit's rdma_to_attn_map drop-clear before reading it (see
+                // s2d_chunks_ready doc comment above).
+                if (s2d_chunks_ready) {
+                    s2d_unit_wait<NUM_MAP_WARPS>(s2d_chunks_ready, (chunk_iter - 1) * LSA_TEAMS + j);
+                }
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
                     rdma_to_attn_map + (lteam_id * routing_map_lsa_stride) + (cidx * TOKENS_PER_CHUNK));
 
@@ -3231,11 +3234,10 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     const int num_of_tokens_per_rank,
     const int experts_per_rank,
     // CONFIG: ncclGin RDMA plumbing
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     ncclWindow_t nccl_token_window,
     ncclWindow_t nccl_prob_window,
     ncclWindow_t nccl_internal_window,
-    int num_gin_comms,
     int num_ctx_per_comm,
     void* gin_base_ptr,
     unsigned signals_base,
@@ -3283,13 +3285,11 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         const int rank_in_remote = lteam_id < my_lteam ? my_lteam - 1 : my_lteam;
         const bool is_residue = (chunk_id >= cpr);
 
-        // Distribute chunks across comms/contexts for parallelism.
-        int total_channels = num_gin_comms * num_ctx_per_comm;
-        int global_channel = chunk_id % total_channels;
-        int comm_idx, ctx_idx;
-        get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-        ncclGin net(dcomms[comm_idx], ctx_idx);
-        ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
+        // Distribute chunks across communicator contexts for parallelism.
+        int global_channel = chunk_id % num_ctx_per_comm;
+        int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
+        ncclGin net(*dcomm, ctx_idx);
+        ncclTeam rail = ncclTeamRail(*dcomm);
         int rdma_tile_id = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         int chunk_base_token_idx = lteam_id * rdma_per_lsa_sz + chunk_id * TOKENS_PER_CHUNK;
         // Residue chunks carry no tokens; real chunks use the scheduled size (tail = remainder).
@@ -3536,10 +3536,9 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const uint64_t expected_flag_value,
     const bool combine_local_reduce_enabled,
     // CONFIG: ncclGin RDMA plumbing
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     unsigned signals_base,
     unsigned combine_signal_offset,
-    int num_gin_comms,
     int num_ctx_per_comm) {
     // The G2S group is split into single-warp pipelines (warp == pipeline), matching the cross-LSA-team red
     // group; each warp owns an equal slice of the G2S FIFO.
@@ -3611,11 +3610,9 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
 
             if (lane_id == 0) {
                 constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
-                int total_channels = num_gin_comms * num_ctx_per_comm;
-                int global_channel = cidx % total_channels;
-                int comm_idx, ctx_idx;
-                get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
-                ncclGin net(dcomms[comm_idx], ctx_idx);
+                int global_channel = cidx % num_ctx_per_comm;
+                int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
+                ncclGin net(*dcomm, ctx_idx);
                 for (int n = 1; n < LSA_TEAMS; n++) {
                     int signal_lteam_id = my_lteam >= n ? my_lteam - n : my_lteam + LSA_TEAMS - n;
                     unsigned signal_id = signals_base + combine_signal_offset +
@@ -4335,7 +4332,7 @@ warp_rdma_guard_wait(const uint64_t* peer_flags, int my_lteam, int lsa_teams, ui
 // Publish the expected round into this rank's slot (my_slot) of every rail peer's window.
 // Runs on reserved context 0, so it never shares QP state with a data channel.
 __device__ __forceinline__ void warp_rdma_guard_publish(
-    ncclDevComm dcomm,
+    const ncclDevComm& dcomm,
     ncclWindow_t dest_window,
     size_t my_slot,
     int my_lteam,
@@ -5051,7 +5048,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             if (param.guard_enabled || count_fanout) {
                 ncclLsaBarrierSession<ncclCoopWarp> bar(
                     ncclCoopWarp(),
-                    param.dcomm,
+                    *param.dcomm,
                     ncclTeamTagLsa(),
                     (uint32_t)blockIdx.x);
                 bar.sync(
@@ -5092,7 +5089,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 HIDDEN_DIM,
                 SF_BYTES_PER_TOKEN,
                 param.experts_per_rank,
-                param.dcomm,
+                *param.dcomm,
                 param.num_ctx_per_comm,
                 param.token_window,
                 param.prob_window,
@@ -5110,8 +5107,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.rdma_to_attn_map, param.attn_input_token, param.attn_input_prob, \
             param.attn_input_token_scaling_factor, param.gin_G2S_flags, param.local_rank, \
             my_lteam, param.num_of_tokens_per_rank, HIDDEN_DIM, SF_BYTES_PER_TOKEN, \
-            param.experts_per_rank, *param.expected_gin_flag_val, param.dcomm, \
-            param.num_ctx_per_comm, param.gin_base_ptr, &param.mr_info, smem_buffer_ptr)
+            param.experts_per_rank, *param.expected_gin_flag_val, *param.dcomm, \
+            param.num_ctx_per_comm, param.gin_base_ptr, &param.mr_info, smem_buffer_ptr, \
+            param.dispatch_push_count.active ? s_s2d_chunks_ready : nullptr)
         if (param.dispatch_push_count.active) {
             DISPATCH_G2S_TEMPLATE(TOKENS_PER_CHUNK);
         } else {
@@ -5248,7 +5246,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 const uint64_t expected = *param.expected_gin_flag_val;
                 if (param.guard_enabled)
                     warp_rdma_guard_publish(
-                        param.dcomm,
+                        *param.dcomm,
                         param.dest_window,
                         param.mr_info.guard_offset + static_cast<size_t>(my_lteam) * sizeof(uint64_t),
                         my_lteam,
@@ -5503,10 +5501,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.experts_per_rank,
             *param.expected_gin_flag_val,
             param.combine_local_reduce_enabled,
-            param.dcomms,
+            param.dcomm,
             param.signals_base,
             param.combine_signal_offset,
-            param.num_gin_comms,
             param.num_ctx_per_comm);
 #undef COMBINE_G2S_INTER_TEMPLATE
     } else if (
@@ -5529,11 +5526,10 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 my_lteam,
                 param.num_of_tokens_per_rank,
                 param.experts_per_rank,
-                param.dcomms,
+                param.dcomm,
                 param.token_window,
                 param.prob_window,
                 param.dest_window,
-                param.num_gin_comms,
                 param.num_ctx_per_comm,
                 param.gin_base_ptr,
                 param.signals_base,
@@ -5574,7 +5570,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 const uint64_t expected = *param.expected_gin_flag_val;
                 if (param.guard_enabled)
                     warp_rdma_guard_publish(
-                        param.dcomms[0],
+                        *param.dcomm,
                         param.dest_window,
                         param.mr_info.guard_offset + static_cast<size_t>(my_lteam) * sizeof(uint64_t),
                         my_lteam,
@@ -5589,7 +5585,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 if (param.guard_enabled) {
                     ncclLsaBarrierSession<ncclCoopWarp> bar(
                         ncclCoopWarp(),
-                        param.dcomms[0],
+                        *param.dcomm,
                         ncclTeamTagLsa(),
                         param.combine_barrier_offset);
                     bar.sync(ncclCoopWarp(), cuda::memory_order_relaxed);
@@ -6491,6 +6487,10 @@ constexpr int pull_dispatch_threads(int pull_warps) {
 // Max EM slots one recv token can scatter to on this rank (== MAX_NUM_TOPK: a token
 // routes to at most top_k <= 32 experts, so at most 32 kept copies land here).
 constexpr int kPullDispatchMaxActive = 32;
+// Fused pull-count: two MAP warps build the recv-slot/EM maps in-kernel. Barrier 0 is
+// reserved for block-wide sync; the MAP warps use barrier 1.
+constexpr int kPullDispatchMapWarps = 2;
+constexpr int kPullMapBarrierId = 1;
 
 // Max NVLink single-LSA-team ranks. The peer-pointer arrays live inline in the kernel
 // param struct so they ride the stream-ordered launch marshaling; a persistent host
@@ -6510,21 +6510,35 @@ __device__ __forceinline__ decoded_src_t decode_src(int32_t g, int tokens_per_ra
 // Block-uniform LSA grid head gate shared by pull dispatch and push combine.
 // TODO: try replacing the ncclLsaBarrier rendezvous with a bare peer-ptr + atomic-flag sync
 // (as EM local-permute uses) and measure whether it lowers the head/tail sync overhead.
-__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomms, uint32_t* head_sync_flag) {
+struct lsa_head_sync_param_t {
+    ncclDevComm_t* dcomm;
+    uint32_t* head_sync_flag;
+};
+
+struct lsa_tail_sync_param_t {
+    ncclDevComm_t* dcomm;
+    uint32_t* grid_barrier_counter;
+    uint32_t* head_sync_flag;
+};
+
+// ready: the value the head gate publishes/waits for. Fused pull-count publishes its
+// metadata before this gate and signals ready=2 so a straggler that only observed the
+// (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
+__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag, int ready = 1) {
     int* head_flag = reinterpret_cast<int*>(head_sync_flag);
     if (blockIdx.x == 0) {
         if (threadIdx.x < 32) {
-            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), dcomms[0], ncclTeamTagLsa(), 0u);
+            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), *dcomm, ncclTeamTagLsa(), 0u);
             bar.sync(ncclCoopWarp(), cuda::memory_order_acq_rel);
         }
         __syncthreads();
         // Sys-scope hand-off: the waiter blocks read remote NVLink peer memory after this gate,
         // so their acquire must invalidate stale peer cache lines (a .gpu acquire only covers the
         // local GPU coherence domain). The paired release keeps the sync morally strong at sys scope.
-        if (threadIdx.x == 0) nccl_ep::st_release_sys_global(head_flag, 1);
+        if (threadIdx.x == 0) nccl_ep::st_release_sys_global(head_flag, ready);
     } else {
         if (threadIdx.x == 0) {
-            while (nccl_ep::ld_relaxed_gpu_global(head_sync_flag) == 0) {}
+            while (nccl_ep::ld_relaxed_gpu_global(head_sync_flag) != static_cast<uint32_t>(ready)) {}
             (void)nccl_ep::ld_acquire_sys_global(head_flag);
         }
         __syncthreads();
@@ -6533,13 +6547,13 @@ __device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomms, uint32
 
 // Block-uniform LSA grid tail barrier shared by pull dispatch and push combine.
 __device__ __forceinline__ void lsa_grid_tail_barrier(
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* grid_barrier_counter,
     uint32_t* head_sync_flag) {
     __threadfence_system();
     if (elect_last_block(reinterpret_cast<const int*>(grid_barrier_counter), static_cast<int>(gridDim.x))) {
         if (threadIdx.x < 32) {
-            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), dcomms[0], ncclTeamTagLsa(), 1u);
+            ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), *dcomm, ncclTeamTagLsa(), 1u);
             bar.sync(ncclCoopWarp(), cuda::memory_order_acq_rel);
         }
         if (threadIdx.x == 0) {
@@ -6553,15 +6567,16 @@ struct dispatch_pull_param_t {
     void* recv_x_em;                            // EM output token buffer
     float* recv_topk_weights_em;                // EM 1D weights out (null if not delivered)
     uint8_t* recv_x_scale_em;                   // QUANT_FWD: EM output scale buffer (null for NONE)
-    const int32_t* flat2em_slot_map;            // [num_recv, top_k]
-    const int32_t* srcpos_map;                  // [num_recv, top_k] source top-k pos of each hit (weights)
-    const int32_t* recv_slot_to_src;            // [num_recv] recv slot -> global src token id
+    // Fused pull-count builds these during dispatch; scan builds them during UpdateHandle.
+    int32_t* flat2em_slot_map;                  // [num_recv, top_k]
+    int32_t* srcpos_map;                        // [num_recv, top_k] source top-k pos of each hit (weights)
+    int32_t* recv_slot_to_src;                  // [num_recv] recv slot -> global src token id
     const void* peer_input_ptrs[kPullMaxLsaRanks];   // [lsa_team_size] source token bases (NVLink)
     const float* peer_weight_ptrs[kPullMaxLsaRanks]; // [lsa_team_size] source topk_weights bases (null if not delivered)
     const void* peer_scale_ptrs[kPullMaxLsaRanks];   // [lsa_team_size] source scale bases (QUANT_FWD; null for NONE)
-    const int32_t* num_recv_tokens_dev;
-    const int64_t* expert_token_offsets;
-    const int32_t* per_expert_counts_active;
+    int32_t* num_recv_tokens_dev;                // fused: written by the MAP group's Phase 0
+    int64_t* expert_token_offsets;               // fused: written by the MAP group's Phase 0
+    int32_t* per_expert_counts_active;           // fused: written by the MAP group's Phase 0
     int top_k;
     int experts_per_rank;
     int row_bytes;
@@ -6570,11 +6585,37 @@ struct dispatch_pull_param_t {
     int tokens_per_rank;                        // decode src token = g % tokens_per_rank
     int lsa_team_size;                          // decode src rank within the LSA team
     // Intra-LSA head/tail sync: source ready before any peer read, reads done before reuse.
-    ncclDevComm_t* dcomms;
+    ncclDevComm_t* dcomm;
     uint32_t* head_sync_flag;                   // grid head gate (idle counter during dispatch)
     uint32_t* grid_barrier_counter;             // tail elect-last-block
     // When set, head/tail sync runs as separate kernels; this kernel skips the inline sync.
     bool unfused_sync;
+
+    // Fused pull-count inputs; unused on the scan path.
+    const uint8_t* meta_ptrs[kPullMaxLsaRanks];  // peer metadata inboxes (NVLink)
+    int topk_off_bytes;                 // byte offset of the uint16 topk half within a slice
+    int32_t* rank_cursor;               // [lsa_team_size] per-source-rank recv-slot cursor (zeroed)
+    int32_t* expert_cursor;             // [experts_per_rank] per-expert EM-slot cursor (zeroed)
+    int32_t* layout_ready;              // single grid-wide "layout published" flag (zeroed)
+    int my_rank;                        // this rank's slot within the LSA team
+    int max_recv_tokens_per_rank;       // EM-slot budget (em_slot overflow bound)
+    int flat_recv_capacity;             // FLAT recv-slot overflow bound
+    int em_alignment;
+    bool allow_overflow_drop;
+    // Publish handle-local snapshots at dispatch so batched UpdateHandles stay independent.
+    const int32_t* own_row;             // [lsa_team_size + num_experts]
+    const uint16_t* own_topk_snapshot;  // [tokens_per_rank, top_k] this rank's packed topk
+    uint8_t* own_meta_staging;          // local inbox with one metadata row per source rank
+    // CTA 0 publishes layout bases for the rest of the grid.
+    int32_t* layout_slot_base;          // [lsa_team_size]
+    int32_t* layout_expert_base;        // [experts_per_rank]
+    const int32_t* cached_cnt_rows;     // optional handle-local AllGather from UpdateHandle
+    // Caller's dispatch-time layout_info outputs (mirrors dispatch_push_count_kparams_t); null
+    // when the caller didn't request them at this ncclEpDispatch call.
+    void* caller_offsets;               // [experts_per_rank] padded per-expert offsets
+    void* caller_counts;                // [experts_per_rank] padded per-expert counts
+    void* caller_recv_total;            // scalar pre-drop padded total
+    bool caller_out_is_int64;
 };
 
 // Zero-fill the per-expert pad rows (disjoint from real slots) that the pull warps skip. One warp
@@ -6618,60 +6659,388 @@ __device__ __forceinline__ void dispatch_pull_pad_fill(
     }
 }
 
+// CTA 0 publishes this handle's metadata before the peer head barrier.
+__device__ __forceinline__ void dispatch_pull_map_publish(
+    const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
+    const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
+    int tokens_per_rank, int top_k, int my_rank, int nRanks) {
+    if (blockIdx.x != 0) return;
+    const int count_ints = own_row ? topk_off_bytes / sizeof(int32_t) : 0;
+    for (int i = threadIdx.x; i < count_ints; i += blockDim.x) {
+        const int32_t v = own_row[i];
+        for (int r = 0; r < nRanks; ++r) {
+            volatile int32_t* dst = reinterpret_cast<volatile int32_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride);
+            dst[i] = v;
+        }
+    }
+    const int total = tokens_per_rank * top_k;
+    if ((topk_off_bytes & 15) == 0) {
+        for (int i = threadIdx.x; i < total / 8; i += blockDim.x) {
+            const uint4 v = reinterpret_cast<const uint4*>(own_topk)[i];
+            for (int r = 0; r < nRanks; ++r) {
+                uint4* dst = reinterpret_cast<uint4*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+                asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};"
+                             :: "l"(dst + i), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+            }
+        }
+    }
+    const int tail = (topk_off_bytes & 15) == 0 ? (total / 8) * 8 : 0;
+    for (int i = tail + threadIdx.x; i < total; i += blockDim.x) {
+        const uint16_t v = own_topk[i];
+        for (int r = 0; r < nRanks; ++r) {
+            volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+            dst[i] = v;
+        }
+    }
+    __threadfence_system();
+}
+
+// Two MAP warps build maps and publish completed chunk ranges.
+// CTA 0 computes the layout once and releases it to the other blocks.
+__device__ __forceinline__ void dispatch_pull_map_warp(
+    int topk_off_bytes,
+    int32_t* __restrict__ recv_slot_to_src,
+    int32_t* __restrict__ srcpos_map,
+    int32_t* __restrict__ flat2em_slot_map,
+    int32_t* __restrict__ num_recv_tokens_dev,
+    int64_t* __restrict__ expert_token_offsets,
+    int32_t* __restrict__ per_expert_counts_active,
+    int32_t* __restrict__ rank_cursor,
+    int32_t* __restrict__ expert_cursor,
+    int32_t* __restrict__ layout_ready,
+    int32_t* __restrict__ s_base,
+    int32_t* __restrict__ s_expert_total,
+    int32_t* __restrict__ s_expert_base,
+    int32_t* __restrict__ g_slot_base,    // block 0 publishes s_base here; every other block reads it
+    int32_t* __restrict__ g_expert_base,  // block 0 publishes s_expert_base here; every other block reads it
+    int top_k,
+    int experts_per_rank,
+    int lsa_team_size,
+    int tokens_per_rank,  // == max_tokens (source token stride; matches decode_src's encoding)
+    int my_rank,
+    int max_recv_tokens_per_rank,
+    int flat_recv_capacity,
+    int em_alignment,
+    bool allow_overflow_drop,
+    void* __restrict__ caller_offsets,
+    void* __restrict__ caller_counts,
+    void* __restrict__ caller_recv_total,
+    bool caller_out_is_int64,
+    int map_idx,
+    int lane,
+    const uint8_t* local_meta,
+    size_t meta_stride,
+    int2* chunk_ranges,
+    unsigned* chunks_ready,
+    const int32_t* cached_cnt_rows) {
+    constexpr int nMapThreads = kPullDispatchMapWarps * 32;
+    const int tid = map_idx * 32 + lane;
+    const int nRanks = lsa_team_size;
+    const int epr = experts_per_rank;
+    const int expert_base_gid = my_rank * epr;
+    auto peer_meta = [&](int r) { return local_meta + r * meta_stride; };
+    const uint8_t* count_base = cached_cnt_rows
+        ? reinterpret_cast<const uint8_t*>(cached_cnt_rows) : local_meta;
+    const size_t count_stride = cached_cnt_rows
+        ? static_cast<size_t>(nRanks) * (epr + 1) * sizeof(int32_t) : meta_stride;
+    auto peer_count = [&](int r, int i) {
+        const int32_t* src = reinterpret_cast<const int32_t*>(count_base + r * count_stride) + i;
+        return *src;
+    };
+
+    // Build the shared recv-slot and per-expert layout once.
+    if (blockIdx.x == 0) {
+        // Load source counts in parallel, then reduce the local-expert columns.
+        for (int e = tid; e < epr; e += nMapThreads) s_expert_total[e] = 0;
+        for (int r = tid; r < nRanks; r += nMapThreads) {
+            s_base[r] = peer_count(r, my_rank);
+        }
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+        for (int i = tid; i < nRanks * epr; i += nMapThreads) {
+            const int r = i / epr;
+            const int e = i % epr;
+            atomicAdd(&s_expert_total[e], peer_count(r, nRanks + expert_base_gid + e));
+        }
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+
+        // Rank-major recv slots and aligned per-expert output zones.
+        if (tid == 0) {
+            int cum = 0;
+            for (int r = 0; r < nRanks; r++) {
+                const int count = s_base[r];
+                s_base[r] = cum;
+                cum += count;
+            }
+            const int true_total = cum;
+            const bool overflow = true_total > max_recv_tokens_per_rank;
+            if (overflow && !allow_overflow_drop) {
+                printf("ncclEpDispatch: HT fused pull-count FLAT recv tokens %d > max_recv_tokens_per_rank %d; "
+                       "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
+                       "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
+                       true_total, max_recv_tokens_per_rank);
+                __trap();
+            }
+            // Also clamp to flat_recv_capacity: slots beyond it were never written by the MAP phase.
+            const int capped_total = overflow ? max_recv_tokens_per_rank : true_total;
+            *num_recv_tokens_dev = (capped_total < flat_recv_capacity) ? capped_total : flat_recv_capacity;
+
+            const int align = (em_alignment > 1) ? em_alignment : 1;
+            int ecum = 0;
+            for (int k = 0; k < epr; k++) {
+                const int c = s_expert_total[k];
+                s_expert_base[k] = ecum;
+                const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
+                const int room = (allow_overflow_drop)
+                    ? ((ecum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - ecum) : 0)
+                    : padded;
+                const int zone_base =
+                    (allow_overflow_drop && ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
+                expert_token_offsets[k] = zone_base;
+                if (per_expert_counts_active) {
+                    int out_actual = c;
+                    if (allow_overflow_drop) out_actual = (c < room) ? c : room;
+                    per_expert_counts_active[k] = out_actual;
+                }
+                // Caller's layout_info API reports the padded zone (not the raw count
+                // per_expert_counts_active carries), matching dispatch_push_map_warp's caller_counts.
+                if (caller_offsets || caller_counts) {
+                    const int out_padded = allow_overflow_drop ? ((padded < room) ? padded : room) : padded;
+                    if (caller_offsets) {
+                        if (caller_out_is_int64) static_cast<int64_t*>(caller_offsets)[k] = zone_base;
+                        else static_cast<int32_t*>(caller_offsets)[k] = zone_base;
+                    }
+                    if (caller_counts) {
+                        if (caller_out_is_int64) static_cast<int64_t*>(caller_counts)[k] = out_padded;
+                        else static_cast<int32_t*>(caller_counts)[k] = out_padded;
+                    }
+                }
+                ecum += padded;
+            }
+            // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
+            // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
+            if (!allow_overflow_drop && ecum > max_recv_tokens_per_rank) {
+                printf("ncclEpDispatch: HT fused pull-count padded EM total %d > max_recv_tokens_per_rank %d; "
+                       "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
+                       "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
+                       ecum, max_recv_tokens_per_rank);
+                __trap();
+            }
+            expert_token_offsets[epr] = (ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
+            // recv_total_counter reports the pre-drop padded total (unclamped ecum); equals the
+            // unpadded FLAT recv total when em_alignment == 1. Matches dispatch_push_map_warp.
+            if (caller_recv_total) {
+                if (caller_out_is_int64) *static_cast<int64_t*>(caller_recv_total) = ecum;
+                else *static_cast<int32_t*>(caller_recv_total) = ecum;
+            }
+        }
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+
+        for (int r = tid; r < nRanks; r += nMapThreads) g_slot_base[r] = s_base[r];
+        for (int k = tid; k < epr; k += nMapThreads) g_expert_base[k] = s_expert_base[k];
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+        if (tid == 0) {
+            // Publish the completed layout before other blocks read it.
+            nccl_ep::st_release_sys_global(layout_ready, 1);
+        }
+    } else {
+        while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {}
+        for (int r = tid; r < nRanks; r += nMapThreads) s_base[r] = g_slot_base[r];
+        for (int k = tid; k < epr; k += nMapThreads) s_expert_base[k] = g_expert_base[k];
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    }
+
+    // Each warp reads 32 contiguous tokens from one source rank. Cycling ranks
+    // across warps spreads recv-slot claims over the per-rank cursors.
+    const int max_hits = top_k;
+    const int num_cblocks = nccl_ep::ceil_div(tokens_per_rank, 32);
+    const size_t total_chunks = static_cast<size_t>(nRanks) * num_cblocks;
+    const size_t stride = static_cast<size_t>(gridDim.x) * kPullDispatchMapWarps;
+    const size_t warp_base = static_cast<size_t>(blockIdx.x) * kPullDispatchMapWarps + static_cast<size_t>(map_idx);
+    // Use vector loads and stores when top-k rows have the required alignment.
+    const bool row_vec_ok = (top_k % 8 == 0) && ((topk_off_bytes & 15) == 0);
+    const bool map_vec_ok = (top_k % 4 == 0) &&
+        (((reinterpret_cast<uintptr_t>(flat2em_slot_map) | reinterpret_cast<uintptr_t>(srcpos_map)) & 15) == 0);
+    unsigned built = 0;
+    for (size_t chunk = warp_base; chunk < total_chunks; chunk += stride) {
+        const int cblock = static_cast<int>(chunk / nRanks);
+        const int r = static_cast<int>(chunk % nRanks);
+        const int t = cblock * 32 + lane;
+        const bool valid = t < tokens_per_rank;
+        static_assert(kLocalPermuteMaxActivePerToken * MAX_NUM_TOPK <= 65536);
+        uint16_t hits[MAX_NUM_TOPK];
+        int n = 0;
+        if (valid) {
+            const uint8_t* row_base = peer_meta(r) + topk_off_bytes + static_cast<size_t>(t) * top_k * sizeof(uint16_t);
+            if (row_vec_ok) {
+                for (int k = 0; k < top_k; k += 8) {
+                    const uint4* src = reinterpret_cast<const uint4*>(row_base + k * sizeof(uint16_t));
+                    const uint4 v = *src;
+                    const uint16_t* vals = reinterpret_cast<const uint16_t*>(&v);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const int ge = static_cast<int>(vals[j]);
+                        const int el = ge - expert_base_gid;
+                        if (el >= 0 && el < epr && n < max_hits) {
+                            hits[n++] = static_cast<uint16_t>(el * MAX_NUM_TOPK + k + j);
+                        }
+                    }
+                }
+            } else {
+                const uint16_t* row = reinterpret_cast<const uint16_t*>(row_base);
+                for (int k = 0; k < top_k; k++) {
+                    const int ge = static_cast<int>(row[k]);
+                    const int el = ge - expert_base_gid;
+                    if (el >= 0 && el < epr && n < max_hits) {
+                        hits[n++] = static_cast<uint16_t>(el * MAX_NUM_TOPK + k);
+                    }
+                }
+            }
+        }
+        // Warp-aggregated recv-slot claim: one ballot+atomic for the whole warp (r is uniform),
+        // instead of a per-lane atomic. recv_slot indexes FLAT buffers (bound by flat_recv_capacity).
+        const unsigned pmask_r = __ballot_sync(0xffffffffu, n > 0);
+        int base_r = 0;
+        if (pmask_r != 0) {
+            const int leader = __ffs(pmask_r) - 1;
+            if (lane == leader) base_r = atomicAdd(&rank_cursor[r], __popc(pmask_r));
+            base_r = __shfl_sync(0xffffffffu, base_r, leader);
+        }
+        const int recv_slot = s_base[r] + base_r + __popc(pmask_r & ((1u << lane) - 1));
+        // Overflowing slots are skipped unconditionally (matches the scan oracle's clamp): under
+        // no-drop an overflow already trapped in Phase 0, but other blocks race ahead here, so an
+        // unguarded write would go out of bounds before the host observes the trap. em_slot indexes
+        // the EM budget.
+        bool produce = false;
+        if (n > 0) {
+            if (!slot_overflows(recv_slot, flat_recv_capacity)) {
+                produce = true;
+                recv_slot_to_src[recv_slot] = r * tokens_per_rank + t;
+                for (int j = 0; j < n; j++) {
+                    const int hit = hits[j];
+                    const int e = hit / MAX_NUM_TOPK;
+                    const int em_slot = s_expert_base[e] + atomicAdd(&expert_cursor[e], 1);
+                    const bool dropped = allow_overflow_drop && slot_overflows(em_slot, max_recv_tokens_per_rank);
+                    const size_t o = static_cast<size_t>(recv_slot) * top_k + j;
+                    flat2em_slot_map[o] = dropped ? -1 : em_slot;
+                    srcpos_map[o] = dropped ? -1 : hit % MAX_NUM_TOPK;
+                }
+                int j = n;
+                if (map_vec_ok) {
+                    for (; j < top_k && (j & 3) != 0; ++j) {
+                        const size_t o = static_cast<size_t>(recv_slot) * top_k + j;
+                        flat2em_slot_map[o] = -1;
+                        srcpos_map[o] = -1;
+                    }
+                    for (; j < top_k; j += 4) {
+                        const size_t o = static_cast<size_t>(recv_slot) * top_k + j;
+                        *reinterpret_cast<int4*>(flat2em_slot_map + o) = int4{-1, -1, -1, -1};
+                        *reinterpret_cast<int4*>(srcpos_map + o) = int4{-1, -1, -1, -1};
+                    }
+                }
+                for (; j < top_k; ++j) {
+                    const size_t o = static_cast<size_t>(recv_slot) * top_k + j;
+                    flat2em_slot_map[o] = -1;
+                    srcpos_map[o] = -1;
+                }
+            }
+        }
+        // Order all lanes' map writes before lane 0 publishes the chunk.
+        __syncwarp();
+        const unsigned pmask = __ballot_sync(0xffffffffu, produce);
+        if (lane == 0) {
+            chunk_ranges[built * kPullDispatchMapWarps + map_idx] =
+                make_int2(s_base[r] + base_r, __popc(pmask));
+            cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(chunks_ready[map_idx]);
+            ready.store(++built, cuda::memory_order_release);
+        }
+    }
+}
+
+
 // ScaleInt4PerLane: per-lane int4 capacity for the QUANT_FWD scale row (loaded once
 // into registers, scattered to every EM slot). JIT-sized from the actual scale row
 // (ceil(scale_row_int4 / 32)), so any scale dtype / quantization block size is covered.
 // ScaleTmaRowBytes: when non-zero, the scale row is moved by TMA through smem instead
 // (exact row size; 0 keeps the register-held ld/st path).
+// Fused count uses two MAP producers; scan consumes prebuilt maps.
 template <int HiddenInt4, class Policy,
           ncclEpDispQuant_t kRecipe = NCCL_EP_DISP_QUANT_NONE, int ScaleInt4PerLane = 1,
-          int ScaleTmaRowBytes = 0, int PullWarps = kPullDispatchMaxPullWarps>
+          int ScaleTmaRowBytes = 0, int PullWarps = kPullDispatchMaxPullWarps, bool FusedMap = false>
 __device__ __forceinline__ void dispatch_pull(
-    uint8_t* __restrict__ recv_x_em,
-    float* __restrict__ recv_topk_weights_em,
-    uint8_t* __restrict__ recv_x_scale_em,
-    const int32_t* __restrict__ flat2em_slot_map,
-    const int32_t* __restrict__ srcpos_map,
-    const int32_t* __restrict__ recv_slot_to_src,
-    const void* const* __restrict__ peer_input_ptrs,
-    const float* const* __restrict__ peer_weight_ptrs,
-    const void* const* __restrict__ peer_scale_ptrs,
-    const int32_t* __restrict__ num_recv_tokens_dev,
-    const int64_t* __restrict__ expert_token_offsets,
-    const int32_t* __restrict__ per_expert_counts_active,
+    const dispatch_pull_param_t& dp,
+    // FusedMap literal-substitutes these at JIT-source-generation time, so they stay
+    // separate (not read from dp) to keep the constant-folding/unrolling win.
     int top_k,
     int experts_per_rank,
-    int /*row_bytes*/,
-    int scale_row_bytes,
-    int caller_num_recv_tokens,
-    int tokens_per_rank,
-    int lsa_team_size,
-    ncclDevComm_t* __restrict__ dcomms,
-    uint32_t* __restrict__ head_sync_flag,
-    uint32_t* __restrict__ grid_barrier_counter,
-    bool unfused_sync) {
+    int lsa_team_size) {
+    uint8_t* __restrict__ recv_x_em = static_cast<uint8_t*>(dp.recv_x_em);
+    float* __restrict__ recv_topk_weights_em = dp.recv_topk_weights_em;
+    uint8_t* __restrict__ recv_x_scale_em = dp.recv_x_scale_em;
+    int32_t* __restrict__ flat2em_slot_map = dp.flat2em_slot_map;
+    int32_t* __restrict__ srcpos_map = dp.srcpos_map;
+    int32_t* __restrict__ recv_slot_to_src = dp.recv_slot_to_src;
+    const void* const* __restrict__ peer_input_ptrs = dp.peer_input_ptrs;
+    const float* const* __restrict__ peer_weight_ptrs = dp.peer_weight_ptrs;
+    const void* const* __restrict__ peer_scale_ptrs = dp.peer_scale_ptrs;
+    int32_t* __restrict__ num_recv_tokens_dev = dp.num_recv_tokens_dev;
+    int64_t* __restrict__ expert_token_offsets = dp.expert_token_offsets;
+    int32_t* __restrict__ per_expert_counts_active = dp.per_expert_counts_active;
+    const int scale_row_bytes = dp.scale_row_bytes;
+    const int caller_num_recv_tokens = dp.caller_num_recv_tokens;
+    const int tokens_per_rank = dp.tokens_per_rank;
+    ncclDevComm_t* __restrict__ dcomm = dp.dcomm;
+    uint32_t* __restrict__ head_sync_flag = dp.head_sync_flag;
+    uint32_t* __restrict__ grid_barrier_counter = dp.grid_barrier_counter;
+    const bool unfused_sync = dp.unfused_sync;
+    // FusedMap inputs only; ignored otherwise.
+    const uint8_t* const* __restrict__ meta_ptrs = dp.meta_ptrs;
+    const int topk_off_bytes = dp.topk_off_bytes;
+    int32_t* __restrict__ rank_cursor = dp.rank_cursor;
+    int32_t* __restrict__ expert_cursor = dp.expert_cursor;
+    int32_t* __restrict__ layout_ready = dp.layout_ready;
+    const int my_rank = dp.my_rank;
+    const int max_recv_tokens_per_rank = dp.max_recv_tokens_per_rank;
+    const int flat_recv_capacity = dp.flat_recv_capacity;
+    const int em_alignment = dp.em_alignment;
+    const bool allow_overflow_drop = dp.allow_overflow_drop;
+    const int32_t* __restrict__ own_row = dp.own_row;
+    const uint16_t* __restrict__ own_topk_snapshot = dp.own_topk_snapshot;
+    uint8_t* __restrict__ own_meta_staging = dp.own_meta_staging;
+    int32_t* __restrict__ layout_slot_base = dp.layout_slot_base;
+    int32_t* __restrict__ layout_expert_base = dp.layout_expert_base;
+    const int32_t* __restrict__ cached_cnt_rows = dp.cached_cnt_rows;
+    void* __restrict__ caller_offsets = dp.caller_offsets;
+    void* __restrict__ caller_counts = dp.caller_counts;
+    void* __restrict__ caller_recv_total = dp.caller_recv_total;
+    const bool caller_out_is_int64 = dp.caller_out_is_int64;
     static_assert(kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_FWD,
                   "pull dispatch: only NONE and FWD (scales-forward) recipes are supported");
     constexpr bool kFwd = (kRecipe == NCCL_EP_DISP_QUANT_FWD);
     constexpr bool kScaleTma = kFwd && (ScaleTmaRowBytes > 0);
+    constexpr bool kFusedMap = FusedMap;
+    constexpr int kMapWarps = FusedMap ? kPullDispatchMapWarps : 0;
+    constexpr int kPayloadWarps = PullWarps - kMapWarps;
+    static_assert(kPayloadWarps > 0, "dispatch requires a payload warp");
+    const size_t meta_stride = nccl_ep::align<size_t>(
+        static_cast<size_t>(topk_off_bytes) + static_cast<size_t>(tokens_per_rank) * MAX_NUM_TOPK * sizeof(uint16_t),
+        16);
     using ScalePolicy = PullTmaStage<kScaleTma ? ScaleTmaRowBytes : 16>;
 
     const int warp_id = threadIdx.x / kPullDispatchThreadsPerSlot;
     const int lane = threadIdx.x & (kPullDispatchThreadsPerSlot - 1);
     const bool is_pad = warp_id >= PullWarps;
     const int pad_idx = warp_id - PullWarps;
-
-    const int num_recv = *num_recv_tokens_dev;
-    const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
-    EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
+    const bool is_map = kFusedMap && warp_id < kMapWarps;
+    const int map_idx = warp_id;
+    const int payload_warp = warp_id - kMapWarps;
 
     int4* dst_int4 = reinterpret_cast<int4*>(recv_x_em);
     // QUANT_FWD: per-token scale row (16B units), forwarded alongside the token row.
     const int scale_row_int4 = kFwd ? (scale_row_bytes >> 4) : 0;
     EP_DEVICE_ASSERT(!kFwd || scale_row_int4 <= 32 * ScaleInt4PerLane);
 
-    __shared__ int32_t s_active[PullWarps][kPullDispatchMaxActive];
-    __shared__ int s_count[PullWarps];
+    __shared__ int32_t s_active[kPayloadWarps][kPullDispatchMaxActive];
+    __shared__ int s_count[kPayloadWarps];
     // Per-pull-warp policy staging.
     extern __shared__ uint8_t s_policy[];
 
@@ -6679,130 +7048,254 @@ __device__ __forceinline__ void dispatch_pull(
     // inits before the block-wide fence, which every warp (incl. pad) must reach.
     Policy p;
     ScalePolicy sp;
-    if (!is_pad) {
-        p.init(lane, s_policy + static_cast<size_t>(warp_id) * Policy::smem_bytes_per_warp);
+    if (!is_pad && !is_map) {
+        p.init(lane, s_policy + static_cast<size_t>(payload_warp) * Policy::smem_bytes_per_warp);
         if constexpr (kScaleTma) {
             sp.init(lane, s_policy +
-                              static_cast<size_t>(PullWarps) * Policy::smem_bytes_per_warp +
-                              static_cast<size_t>(warp_id) * ScalePolicy::smem_bytes_per_warp);
+                              static_cast<size_t>(kPayloadWarps) * Policy::smem_bytes_per_warp +
+                              static_cast<size_t>(payload_warp) * ScalePolicy::smem_bytes_per_warp);
         }
     }
     Policy::block_init_fence();
 
-    // Head sync: every rank's source is ready+visible before any peer read. Block 0
-    // rendezvous with every peer's block 0 (slot 0), then publishes the grid flag the
-    // other resident blocks spin on. Skipped when a separate head-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_head_gate(dcomms, head_sync_flag);
+    // Fused pull-count MAP smem: [s_base(lsa_team_size) | s_expert_total(epr) | s_expert_base(epr)],
+    // laid out right after the pull warps' Policy/ScalePolicy staging region. Unused when kMapWarps == 0.
+    int32_t* s_map_base = nullptr;
+    int32_t* s_map_expert_total = nullptr;
+    int32_t* s_map_expert_base = nullptr;
+    int2* s_chunk_ranges = nullptr;
+    if constexpr (kFusedMap) {
+        constexpr size_t kPolicyTotalBytes =
+            static_cast<size_t>(kPayloadWarps) * Policy::smem_bytes_per_warp +
+            (kScaleTma ? static_cast<size_t>(kPayloadWarps) * ScalePolicy::smem_bytes_per_warp : 0);
+        int32_t* s_map = reinterpret_cast<int32_t*>(s_policy + kPolicyTotalBytes);
+        s_map_base = s_map;
+        s_map_expert_total = s_map_base + lsa_team_size;
+        s_map_expert_base = s_map_expert_total + experts_per_rank;
+        const size_t map_bytes = static_cast<size_t>(lsa_team_size + 2 * experts_per_rank) * sizeof(int32_t);
+        s_chunk_ranges = reinterpret_cast<int2*>(s_policy + kPolicyTotalBytes +
+            ((map_bytes + alignof(int2) - 1) & ~size_t(alignof(int2) - 1)));
+    }
+
+    __shared__ unsigned s_chunks_ready[kFusedMap ? kPullDispatchMapWarps : 1];
+    __shared__ unsigned s_chunk_next;
+    if constexpr (kFusedMap) {
+        if (threadIdx.x < kMapWarps) s_chunks_ready[threadIdx.x] = 0;
+        if (threadIdx.x == 0) s_chunk_next = 0;
+        __syncthreads();
+    }
+
+    const bool copy_weights = (recv_topk_weights_em != nullptr && peer_weight_ptrs != nullptr);
+    const int kNWarps = PullWarps * static_cast<int>(gridDim.x);
+    const int gwarp = static_cast<int>(blockIdx.x) * PullWarps + warp_id;
+    // Read + scatter one recv slot: NVLink token pull + destination resolve + EM store.
+    auto process_slot = [&](int token) {
+        // Decode the source (rank, token) that routes to this recv slot.
+        const int32_t g = recv_slot_to_src[token];
+        const decoded_src_t src_id = decode_src(g, tokens_per_rank, lsa_team_size);
+        const int src_rank = src_id.rank;
+        const int src_token = src_id.token;
+        const int4* src = reinterpret_cast<const int4*>(peer_input_ptrs[src_rank]) +
+                          static_cast<size_t>(src_token) * HiddenInt4;
+        const int32_t* slot_row = flat2em_slot_map + static_cast<size_t>(token) * top_k;
+
+        // Start the token row read, then resolve the destination slot(s) while it
+        // is in flight so the control-plane reads hide under the token transfer.
+        p.issue(src);
+
+        // QUANT_FWD: ingest the source scale row under the in-flight token TMA, then
+        // scatter it to each EM slot alongside the token row. kScaleTma rides the async
+        // proxy through a second smem stage; otherwise the row is held in registers.
+        // TODO: the register path holds the whole scale row; for very large scale rows, chunk
+        // it through a register tile to bound register pressure. Deferred.
+        int4 sreg[kScaleTma ? 1 : ScaleInt4PerLane];
+        if constexpr (kFwd) {
+            const uint8_t* ssrc = static_cast<const uint8_t*>(peer_scale_ptrs[src_rank]) +
+                                  static_cast<size_t>(src_token) * scale_row_bytes;
+            if constexpr (kScaleTma) {
+                sp.issue(ssrc);
+            } else {
+#pragma unroll
+                for (int i = 0; i < ScaleInt4PerLane; ++i) {
+                    const int idx = i * 32 + lane;
+                    if (idx < scale_row_int4) sreg[i] = __ldg(reinterpret_cast<const int4*>(ssrc) + idx);
+                }
+            }
+        }
+        auto scatter_scale = [&](int32_t slot) {
+            uint8_t* sd = recv_x_scale_em + static_cast<size_t>(slot) * scale_row_bytes;
+            if constexpr (kScaleTma) {
+                sp.store(sd);
+            } else {
+#pragma unroll
+                for (int i = 0; i < ScaleInt4PerLane; ++i) {
+                    const int idx = i * 32 + lane;
+                    if (idx < scale_row_int4) nccl_ep::st_cg_global(reinterpret_cast<int4*>(sd) + idx, sreg[i]);
+                }
+            }
+        };
+
+        // Lane-parallel pass over the top_k slots: each lane reads its flat2em entry,
+        // relocates its weight, and compacts the kept slots into s_active via a ballot
+        // prefix. Chunked by 32 to support top_k > warp width.
+        const float* src_w = copy_weights
+            ? peer_weight_ptrs[src_rank] + static_cast<size_t>(src_token) * top_k
+            : nullptr;
+        const int32_t* srcpos_row = srcpos_map ? srcpos_map + static_cast<size_t>(token) * top_k : nullptr;
+        int c = 0;
+        for (int base = 0; base < top_k; base += 32) {
+            const int k = base + lane;
+            // MAP warps can write these rows during this kernel.
+            const int32_t es = (k < top_k) ? slot_row[k] : -1;
+            const bool keep = (es >= 0);
+            if (keep) {
+                // Per-slot capacity backstop (mirror of local_permute_dup).
+                EP_DEVICE_ASSERT(es < caller_num_recv_tokens);
+                // Read the weight at the source's top-k position (order-preserving),
+                // not the packed flat2em index. srcpos_row aligns 1:1 with slot_row.
+                if (copy_weights) {
+                    const int wpos = srcpos_row ? srcpos_row[k] : k;
+                    recv_topk_weights_em[es] = __ldg(src_w + wpos);
+                }
+            }
+            const unsigned mask = __ballot_sync(0xffffffffu, keep);
+            const int pos = c + __popc(mask & ((1u << lane) - 1));
+            if (keep && pos < kPullDispatchMaxActive) s_active[payload_warp][pos] = es;
+            c += __popc(mask);
+        }
+        if (lane == 0) s_count[payload_warp] = c;
+        __syncwarp();
+
+        p.wait(); // token row resident
+        if constexpr (kScaleTma) sp.wait();
+        const int cnt = s_count[payload_warp];
+        for (int a = 0; a < cnt; ++a) {
+            const int32_t slot = s_active[payload_warp][a];
+            p.store(dst_int4 + static_cast<size_t>(slot) * HiddenInt4);
+            if constexpr (kFwd) scatter_scale(slot);
+        }
+        bulk_wait_reads(lane);
+    };
+
+    if constexpr (kFusedMap) {
+        // Reset the layout flag before publication and the fresh peer head gate.
+        if (blockIdx.x == 0 && threadIdx.x == 0) *layout_ready = 0;
+        dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot, meta_ptrs, meta_stride,
+            topk_off_bytes, tokens_per_rank, top_k, my_rank, lsa_team_size);
+        __syncthreads();
+        lsa_grid_head_gate(dcomm, head_sync_flag, 2);
+    } else if (!unfused_sync) {
+        lsa_grid_head_gate(dcomm, head_sync_flag);
+    }
+
+    if constexpr (kFusedMap) {
+        if (is_map) {
+            dispatch_pull_map_warp(
+                topk_off_bytes, recv_slot_to_src, srcpos_map, flat2em_slot_map,
+                num_recv_tokens_dev, expert_token_offsets, per_expert_counts_active, rank_cursor,
+                expert_cursor, layout_ready, s_map_base, s_map_expert_total,
+                s_map_expert_base, layout_slot_base, layout_expert_base, top_k, experts_per_rank,
+                lsa_team_size, tokens_per_rank, my_rank,
+                max_recv_tokens_per_rank, flat_recv_capacity, em_alignment, allow_overflow_drop,
+                caller_offsets, caller_counts, caller_recv_total, caller_out_is_int64,
+                map_idx, lane, own_meta_staging, meta_stride, s_chunk_ranges, s_chunks_ready,
+                cached_cnt_rows);
+        } else {
+            while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {}
+        }
+    }
+
+    const int num_recv = *num_recv_tokens_dev;
+    const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
+    EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
 
     if (is_pad) {
         dispatch_pull_pad_fill<HiddenInt4, kFwd, kPullDispatchThreadsPerSlot, kPullDispatchPadWarps>(
             dst_int4, recv_x_scale_em, recv_topk_weights_em, expert_token_offsets,
             per_expert_counts_active, experts_per_rank, scale_row_bytes, scale_row_int4, pad_idx, lane);
     } else {
-        const bool copy_weights = (recv_topk_weights_em != nullptr && peer_weight_ptrs != nullptr);
-        // Transposed read schedule: each wave's warps read recv slots strided by num_waves,
-        // not a contiguous window. The scan clusters recv slots by source rank, so striding
-        // spreads each wave's reads across all source ranks instead of one.
-        const int kNWarps = PullWarps * static_cast<int>(gridDim.x);
-        const int gwarp = static_cast<int>(blockIdx.x) * PullWarps + warp_id;
-        const int num_waves = (num_recv + kNWarps - 1) / kNWarps;
-        for (int wave = 0; wave < num_waves; ++wave) {
-            const int token = gwarp * num_waves + wave;
-            if (token >= num_recv) continue;
-
-            // Decode the source (rank, token) that routes to this recv slot.
-            const int32_t g = recv_slot_to_src[token];
-            const decoded_src_t src_id = decode_src(g, tokens_per_rank, lsa_team_size);
-            const int src_rank = src_id.rank;
-            const int src_token = src_id.token;
-            const int4* src = reinterpret_cast<const int4*>(peer_input_ptrs[src_rank]) +
-                              static_cast<size_t>(src_token) * HiddenInt4;
-            const int32_t* slot_row = flat2em_slot_map + static_cast<size_t>(token) * top_k;
-
-            // Start the token row read, then resolve the destination slot(s) while it
-            // is in flight so the control-plane reads hide under the token transfer.
-            p.issue(src);
-
-            // QUANT_FWD: ingest the source scale row under the in-flight token TMA, then
-            // scatter it to each EM slot alongside the token row. kScaleTma rides the async
-            // proxy through a second smem stage; otherwise the row is held in registers.
-            // TODO: the register path holds the whole scale row; for very large scale rows, chunk
-            // it through a register tile to bound register pressure. Deferred.
-            int4 sreg[kScaleTma ? 1 : ScaleInt4PerLane];
-            if constexpr (kFwd) {
-                const uint8_t* ssrc = static_cast<const uint8_t*>(peer_scale_ptrs[src_rank]) +
-                                      static_cast<size_t>(src_token) * scale_row_bytes;
-                if constexpr (kScaleTma) {
-                    sp.issue(ssrc);
-                } else {
-#pragma unroll
-                    for (int i = 0; i < ScaleInt4PerLane; ++i) {
-                        const int idx = i * 32 + lane;
-                        if (idx < scale_row_int4) sreg[i] = __ldg(reinterpret_cast<const int4*>(ssrc) + idx);
+        if constexpr (kFusedMap) {
+            if (!is_map) {
+                const size_t total_chunks = static_cast<size_t>(lsa_team_size) * nccl_ep::ceil_div(tokens_per_rank, 32);
+                const size_t first_chunk = static_cast<size_t>(blockIdx.x) * kMapWarps;
+                const size_t chunk_stride = static_cast<size_t>(gridDim.x) * kMapWarps;
+                // Claim small batches from 32 slot positions per chunk; skip the unused tail.
+                constexpr unsigned kSlotBatch = 4;
+                for (;;) {
+                    unsigned ticket = 0;
+                    if (lane == 0) ticket = atomicAdd(&s_chunk_next, kSlotBatch);
+                    ticket = __shfl_sync(0xffffffffu, ticket, 0);
+                    const unsigned unit = ticket / 32;
+                    const int owner = unit % kMapWarps;
+                    const size_t chunk = first_chunk + (unit / kMapWarps) * chunk_stride + owner;
+                    if (chunk >= total_chunks) break;
+                    int first = 0, count = 0;
+                    if (lane == 0) {
+                        cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(s_chunks_ready[owner]);
+                        while (ready.load(cuda::memory_order_acquire) <= unit / kMapWarps) {}
+                        const int2 range = s_chunk_ranges[unit];
+                        first = range.x;
+                        count = range.y;
                     }
+                    first = __shfl_sync(0xffffffffu, first, 0);
+                    count = __shfl_sync(0xffffffffu, count, 0);
+                    __syncwarp();
+                    const int offset = ticket % 32;
+                    const int end = min(offset + static_cast<int>(kSlotBatch), count);
+                    for (int i = offset; i < end; ++i) process_slot(first + i);
                 }
             }
-            auto scatter_scale = [&](int32_t slot) {
-                uint8_t* sd = recv_x_scale_em + static_cast<size_t>(slot) * scale_row_bytes;
-                if constexpr (kScaleTma) {
-                    sp.store(sd);
-                } else {
-#pragma unroll
-                    for (int i = 0; i < ScaleInt4PerLane; ++i) {
-                        const int idx = i * 32 + lane;
-                        if (idx < scale_row_int4) nccl_ep::st_cg_global(reinterpret_cast<int4*>(sd) + idx, sreg[i]);
-                    }
-                }
-            };
-
-            // Lane-parallel pass over the top_k slots: each lane reads its flat2em entry,
-            // relocates its weight, and compacts the kept slots into s_active via a ballot
-            // prefix. Chunked by 32 to support top_k > warp width.
-            const float* src_w = copy_weights
-                ? peer_weight_ptrs[src_rank] + static_cast<size_t>(src_token) * top_k
-                : nullptr;
-            const int32_t* srcpos_row = srcpos_map ? srcpos_map + static_cast<size_t>(token) * top_k : nullptr;
-            int c = 0;
-            for (int base = 0; base < top_k; base += 32) {
-                const int k = base + lane;
-                const int32_t es = (k < top_k) ? __ldg(slot_row + k) : -1;
-                const bool keep = (es >= 0);
-                if (keep) {
-                    // Per-slot capacity backstop (mirror of local_permute_dup).
-                    EP_DEVICE_ASSERT(es < caller_num_recv_tokens);
-                    // Read the weight at the source's top-k position (order-preserving),
-                    // not the packed flat2em index. srcpos_row aligns 1:1 with slot_row.
-                    if (copy_weights) {
-                        const int wpos = srcpos_row ? __ldg(srcpos_row + k) : k;
-                        recv_topk_weights_em[es] = __ldg(src_w + wpos);
-                    }
-                }
-                const unsigned mask = __ballot_sync(0xffffffffu, keep);
-                const int pos = c + __popc(mask & ((1u << lane) - 1));
-                if (keep && pos < kPullDispatchMaxActive) s_active[warp_id][pos] = es;
-                c += __popc(mask);
+        } else {
+            const int num_waves = (num_recv + kNWarps - 1) / kNWarps;
+            for (int wave = 0; wave < num_waves; ++wave) {
+                const int token = gwarp * num_waves + wave;
+                if (token >= num_recv) continue;
+                process_slot(token);
             }
-            if (lane == 0) s_count[warp_id] = c;
-            __syncwarp();
-
-            p.wait(); // token row resident
-            if constexpr (kScaleTma) sp.wait();
-            const int cnt = s_count[warp_id];
-            for (int a = 0; a < cnt; ++a) {
-                const int32_t slot = s_active[warp_id][a];
-                p.store(dst_int4 + static_cast<size_t>(slot) * HiddenInt4);
-                if constexpr (kFwd) scatter_scale(slot);
-            }
-            bulk_wait_reads(lane);
         }
         bulk_drain(lane);
     }
 
     __syncthreads(); // policy async stores must complete before the block exits.
 
+    if constexpr (kFusedMap) {
+        // DROP only: per_expert_counts_active[e]'s pre-scan estimate (dispatch_pull_map_warp's
+        // Phase 0) and expert_cursor[e]'s live per-slot tally can disagree under a real
+        // FLAT-vs-EM-budget overflow, the same way local_permute_dup's phantom-row fixup
+        // handles it on the push side. Elect the last-arriving block (expert_cursor's
+        // trailing slot is the arrival counter) to zero the gap in this call's own buffer
+        // and correct per_expert_counts_active[e] in place.
+        if (allow_overflow_drop && expert_cursor != nullptr &&
+            elect_last_block(expert_cursor + experts_per_rank, static_cast<int>(gridDim.x))) {
+            const int total_warps = PullWarps + kPullDispatchPadWarps;
+            for (int e = warp_id; e < experts_per_rank; e += total_warps) {
+                const int32_t active = per_expert_counts_active[e];
+                const int32_t delivered = expert_cursor[e];
+                const int32_t true_active = delivered < active ? delivered : active;
+                if (true_active >= active) continue;
+                if (lane == 0) per_expert_counts_active[e] = true_active;
+                const int64_t zone_start = expert_token_offsets[e];
+                for (int64_t slot = zone_start + true_active; slot < zone_start + active; slot++) {
+                    int4* row = dst_int4 + static_cast<size_t>(slot) * HiddenInt4;
+                    for (int j = lane; j < HiddenInt4; j += kPullDispatchThreadsPerSlot) {
+                        nccl_ep::st_cg_global(&row[j], int4{0, 0, 0, 0});
+                    }
+                    if (recv_topk_weights_em != nullptr && lane == 0) recv_topk_weights_em[slot] = 0.0f;
+                    if constexpr (kFwd) {
+                        int4* srow = reinterpret_cast<int4*>(
+                            recv_x_scale_em + static_cast<size_t>(slot) * scale_row_bytes);
+                        for (int j = lane; j < scale_row_int4; j += kPullDispatchThreadsPerSlot) {
+                            nccl_ep::st_cg_global(&srow[j], int4{0, 0, 0, 0});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Tail sync: all ranks finished reading peer source before it can be reused.
     // Skipped when a separate tail-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_tail_barrier(dcomms, grid_barrier_counter, head_sync_flag);
+    if (!unfused_sync) lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
 }
 
 // Local EM reduce kernel (inverse of local_permute_dup). Sums the top_k EM
@@ -7052,7 +7545,7 @@ struct combine_push_param_t {
     const float* topk_weights_em;     // 1D EM input weights, indexed by em_slot
     const int32_t* srcpos_map;        // [num_recv, top_k] source topk position per copy
     // Intra-LSA sync (head gate + tail barrier)
-    ncclDevComm_t* dcomms;
+    ncclDevComm_t* dcomm;
     uint32_t* head_sync_flag;         // grid head gate (idle dispatch_grid_barrier_counter)
     uint32_t* grid_barrier_counter;   // tail elect-last-block (combine_grid_barrier_counter)
     // Scalar config
@@ -7076,7 +7569,7 @@ __device__ __forceinline__ void combine_push(
     const int32_t* __restrict__ flat2em_slot_map,
     const int32_t* __restrict__ recv_slot_to_src,
     const int32_t* __restrict__ num_recv_tokens_dev,
-    ncclDevComm_t* __restrict__ dcomms,
+    ncclDevComm_t* __restrict__ dcomm,
     uint32_t* __restrict__ head_sync_flag,
     uint32_t* __restrict__ grid_barrier_counter,
     int top_k,
@@ -7102,7 +7595,7 @@ __device__ __forceinline__ void combine_push(
     // ---- HEAD SYNC: gates peer pushes until all ranks reach combine, so a push can't
     // land while the previous iteration's combine_reduce is still reading staging. ----
     // Skipped when a separate head-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_head_gate(dcomms, head_sync_flag);
+    if (!unfused_sync) lsa_grid_head_gate(dcomm, head_sync_flag);
 
     // Metadata smem is sized to the max block; only the first kSlotsPerBlock rows are used.
     __shared__ int32_t smem_flat2em_slot_map[kCombinePushMaxSlots][MaxTopK];
@@ -7302,7 +7795,7 @@ __device__ __forceinline__ void combine_push(
 
     // ---- TAIL SYNC: all peer pushes globally visible before combine_reduce reads ----
     // Skipped when a separate tail-sync kernel runs it.
-    if (!unfused_sync) lsa_grid_tail_barrier(dcomms, grid_barrier_counter, head_sync_flag);
+    if (!unfused_sync) lsa_grid_tail_barrier(dcomm, grid_barrier_counter, head_sync_flag);
 }
 
 struct combine_reduce_param_t {
@@ -7459,3 +7952,12 @@ __device__ __forceinline__ void combine_reduce(
 
 #include "scan_kernel.cuh"
 #include "count_kernel.cuh"
+
+namespace ht_ep {
+
+// Shared layout scratch: source-rank bases, expert totals, and expert bases.
+__host__ __device__ __forceinline__ size_t dispatch_pull_map_smem_ints(int nRanks, int epr) {
+    return static_cast<size_t>(nRanks) + 2u * static_cast<size_t>(epr);
+}
+
+}  // namespace ht_ep

@@ -114,6 +114,7 @@ void compute_layout_info(
     void* em_out_offsets,          // caller expert_offsets, nullable
     int32_t* em_actual_counts_out, // handle authoritative counts, nullable
     void* recv_total_counter,      // caller recv_total_counter, nullable
+    int32_t* num_tokens_for_experts, // handle FLAT recv count (unpadded); nullable
     cudaStream_t stream);
 
 // ============================================================================
@@ -134,6 +135,23 @@ void pack_topk_idx(
     int num_tokens,
     int max_tokens,
     int num_topk,
+    cudaStream_t stream);
+
+// Fused pull-count: pack the handle-local top-k snapshot to uint16 and accumulate its
+// send-count histogram (per-source-rank and per-expert) in one pass, feeding
+// dispatch_pull_param_t's own_row/own_topk_snapshot inputs directly.
+template <typename TopkIdxT>
+void pack_topk_and_count_row(
+    const TopkIdxT* topk_idx,
+    uint16_t* topk_idx_u16,
+    int num_tokens,
+    int max_tokens,
+    int num_topk,
+    int experts_per_rank,
+    int num_experts,
+    int32_t* cnt_rank,
+    int32_t* cnt_expert,
+    int num_sms,
     cudaStream_t stream);
 
 // ============================================================================
@@ -370,15 +388,15 @@ ncclResult_t launch_dispatch_pull(
     void* recv_x_em,
     float* recv_topk_weights_em,
     void* recv_x_scale_em,
-    const int32_t* flat2em_slot_map,
-    const int32_t* srcpos_map,
-    const int32_t* recv_slot_to_src,
+    int32_t* flat2em_slot_map,
+    int32_t* srcpos_map,
+    int32_t* recv_slot_to_src,
     const void* const* peer_input_ptrs,
     const float* const* peer_weight_ptrs,
     const void* const* peer_scale_ptrs,
-    const int32_t* num_recv_tokens_dev,
-    const int64_t* expert_token_offsets,
-    const int32_t* per_expert_counts_active,
+    int32_t* num_recv_tokens_dev,
+    int64_t* expert_token_offsets,
+    int32_t* per_expert_counts_active,
     int top_k,
     int experts_per_rank,
     int row_bytes,
@@ -389,12 +407,37 @@ ncclResult_t launch_dispatch_pull(
     int sm_count,
     unsigned int shuffle_sms,
     ncclEpDispQuant_t recipe,
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
     // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
-    bool unfused_sync = false);
+    bool unfused_sync = false,
+    // Fused pull-count inputs; leave at defaults for the scan path. layout_ready != nullptr
+    // selects the MAP-warp-group kernel variant that builds flat2em_slot_map/srcpos_map/
+    // recv_slot_to_src in-kernel instead of reading them prebuilt by the scan.
+    const uint8_t* const* meta_ptrs = nullptr,
+    int topk_off_bytes = 0,
+    int32_t* rank_cursor = nullptr,
+    int32_t* expert_cursor = nullptr,
+    int32_t* layout_ready = nullptr,
+    int my_rank = 0,
+    int max_recv_tokens_per_rank = 0,
+    int flat_recv_capacity = 0,
+    int em_alignment = 1,
+    bool allow_overflow_drop = false,
+    const int32_t* own_row = nullptr,
+    const uint16_t* own_topk_snapshot = nullptr,
+    uint8_t* own_meta_staging = nullptr,
+    int32_t* layout_slot_base = nullptr,
+    int32_t* layout_expert_base = nullptr,
+    const int32_t* cached_cnt_rows = nullptr,
+    // Caller's dispatch-time layout_info outputs (mirrors dispatch_push_count's caller_offsets/
+    // caller_counts/caller_recv_total); null when the caller didn't request them.
+    void* caller_offsets = nullptr,
+    void* caller_counts = nullptr,
+    void* caller_recv_total = nullptr,
+    bool caller_out_is_int64 = false);
 
 // Minimum shared-memory bytes launch_dispatch_pull requires for a given row width
 // (int4 units): what a single pull warp needs, static and dynamic. Callers compare this
@@ -417,7 +460,7 @@ ncclResult_t launch_combine_push(
     const int32_t* flat2em_slot_map,
     const int32_t* recv_slot_to_src,
     const int32_t* num_recv_tokens_dev,
-    ncclDevComm_t* dcomms,
+    ncclDevComm_t* dcomm,
     uint32_t* head_sync_flag,
     uint32_t* grid_barrier_counter,
     int top_k,
@@ -583,7 +626,7 @@ struct DispatchParams {
     uint32_t* dispatch_grid_barrier_counter;
 
     // GIN context (from ep_group, multi-LSA-team only)
-    ncclDevComm dcomm; // Device communicator (single comm, by value)
+    ncclDevComm* dcomm; // Device communicator
     ncclWindow_t nccl_token_window; // Source window handle for token data
     ncclWindow_t nccl_prob_window; // Registered window handle for probability data
     ncclWindow_t nccl_sf_window; // Registered window handle for scaling-factor data
@@ -669,11 +712,10 @@ struct CombineParams {
     uint32_t* combine_grid_barrier_counter;
 
     // GIN context (multi-LSA-team only)
-    ncclDevComm_t* dcomms; // Device communicators array
+    ncclDevComm_t* dcomm; // Device communicator (device pointer)
     ncclWindow_t nccl_token_window; // Source window handle for token data
     ncclWindow_t nccl_prob_window; // Source window handle for probability data
     ncclWindow_t nccl_internal_window; // Internal destination window handle
-    int num_gin_comms; // Number of GIN communicators
     int num_ctx_per_comm; // Number of contexts per communicator
     void* gin_base_ptr; // Base pointer for offset calculations
     unsigned signals_base; // Base signal ID

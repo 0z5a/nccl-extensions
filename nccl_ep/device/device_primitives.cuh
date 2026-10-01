@@ -302,6 +302,14 @@ __device__ __forceinline__ void memory_fence() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
 
+// Release-only system-scope fence: orders this thread's preceding writes
+// before whatever it stores next, without also acquiring (cheaper than
+// memory_fence() when only the publish side is needed, e.g. before signaling
+// readiness to a peer that will separately acquire on its own read).
+__device__ __forceinline__ void memory_fence_release_sys() {
+    asm volatile("fence.release.sys;" ::: "memory");
+}
+
 __device__ __forceinline__ void memory_fence_gpu() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }

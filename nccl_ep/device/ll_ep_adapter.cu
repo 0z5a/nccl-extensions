@@ -5,11 +5,11 @@
  */
 
 #include "device/ll_ep_adapter.cuh"
-#include "device/ll_ep.cuh"
 #include "device/macros.cuh"
 #include "common.hpp"
 #include "jit/ll_dispatch_jit.cuh"
 #include "jit/ll_combine_jit.cuh"
+#include "jit/ll_clean_jit.cuh"
 #include "quantization_recipe.hpp"
 
 #include <algorithm>
@@ -51,11 +51,6 @@ ncclResult_t call_dispatch(
         return ncclInvalidUsage;
     }
 
-    // Workspace: [rankSentCnt | rankArrivedCnt | rankDone(=expertDone)].
-    auto rankCountersBase = static_cast<int*>(params.workspace);
-    auto rankDone = rankCountersBase + 2 * params.numRanks;
-    EP_HOST_ASSERT((2 * params.numRanks + params.numExperts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
-
     dispatch_kernel_args_t args{};
     args.inData = params.inData;
     args.inScalesBuf = params.inScalesBuf;
@@ -75,8 +70,9 @@ ncclResult_t call_dispatch(
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvCntOff = params.recvCntOff;
-    args.rankCountersBase = rankCountersBase;
-    args.rankDone = rankDone;
+    args.rankSentCnt = params.rankSentCnt;
+    args.rankArrivedCnt = params.rankArrivedCnt;
+    args.rankDone = params.rankDone;
     args.nextRecvCntBufSize = params.nextRecvCntBufSize;
     args.recvStats = params.recvStats;
     args.waitStats = params.waitStats;
@@ -94,8 +90,7 @@ ncclResult_t call_dispatch(
     args.roundScale = params.roundScale;
     args.recvTopkIdxKind = params.recvTopkIdxKind;
     args.phases = params.phases;
-    args.numComms = params.numComms;
-    args.devComms = params.devComms;
+    args.devComm = params.devComm;
     args.windows = params.windows;
     args.signalsBase = params.signalsBase;
     args.timeoutCycles = params.timeoutCycles;
@@ -118,6 +113,7 @@ ncclResult_t call_dispatch(
         params.topkIdxIsInt64,
         kernel_spec,
         params.tokenDtype,
+        recipe,
         params.numTopk,
         numSms,
         numWarps,
@@ -156,35 +152,45 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         return ncclInvalidArgument;
     }
 
+    // Reserve room for the LSA combine kernel's static __shared__ usage,
+    // which draws from the same per-block budget as the dynamic portion
+    // sized below -- see choose_combine_smem_config's doc comment. Only the
+    // LSA path declares that static usage, so only trim the budget when
+    // this call is actually eligible for it.
+    const bool lsaCombineEligible =
+        jit::ll_combine_select_algo(params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout) ==
+        jit::LlCombineAlgo::k2SidedRmLsa;
+    const int max_dynamic_smem_for_combine =
+        params.maxDynamicSmem - (lsaCombineEligible ? combine_smem::kLsaStaticSmemBytes : 0);
     const combine_smem_config_t smem_config = choose_combine_smem_config(
         params.hidden,
         params.tokenDtype,
         params.quantizationRecipe,
         numWarpGroups,
         requestedWarpsPerGroup,
-        params.maxDynamicSmem);
+        max_dynamic_smem_for_combine);
     if (!smem_config.feasible) {
         std::fprintf(
             stderr,
             "[nccl_ep] LL combine shared memory cannot fit: hidden=%d, dtype=%d, warp_groups=%d, "
             "requested_warps_per_group=%d, limit=%d bytes.\n",
             params.hidden, static_cast<int>(params.tokenDtype), numWarpGroups, requestedWarpsPerGroup,
-            params.maxDynamicSmem);
+            max_dynamic_smem_for_combine);
         return ncclInvalidArgument;
     }
     const int numWarpsPerGroup = smem_config.num_warps_per_group;
     const int numWarps = smem_config.num_warps;
+    const int smem_size = smem_config.dynamic_smem_bytes;
     if (params.resolvedWarpsPerGroup != nullptr) *params.resolvedWarpsPerGroup = numWarpsPerGroup;
     const int numSms = std::max(
         ceil_div(params.numExperts, numWarpGroups),
         numRecvPerSm == 0 ? 1 : ceil_div(params.numCombinedTokens, numRecvPerSm));
 
-    if (NUM_WORKSPACE_BYTES < sizeof(int) || params.workspace == nullptr) {
-        std::fprintf(
-            stderr,
-            "[nccl_ep] LL combine requires at least %zu workspace bytes for its atomic flag; available=%d, "
-            "workspace=%p.\n",
-            sizeof(int), NUM_WORKSPACE_BYTES, params.workspace);
+    // combineSync is a dedicated, non-overlapping region computed once at
+    // group-creation time (ncclEpCreateGroup) -- forwarded here as-is, never
+    // derived via offset math.
+    if (params.combineSync == nullptr) {
+        std::fprintf(stderr, "[nccl_ep] LL combine requires a non-null combineSync workspace pointer.\n");
         return ncclInvalidArgument;
     }
     if (params.zeroCopy && params.useLogFmt) {
@@ -192,10 +198,9 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         return ncclInvalidArgument;
     }
 
-    auto atomicCleanFlag = static_cast<int*>(params.workspace);
+    auto combineSync = params.combineSync;
 
     const int hidden = params.hidden;
-    const int smem_size = smem_config.dynamic_smem_bytes;
 
     combine_kernel_args_t args{};
     args.inData = params.inData;
@@ -211,7 +216,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvFlagOff = params.recvFlagOff;
-    args.atomicCleanFlag = atomicCleanFlag;
+    args.combineSync = combineSync;
     args.nextRecvCntBufSize = params.nextRecvCntBufSize;
     args.waitStats = params.waitStats;
     args.epochState = params.epochState;
@@ -227,13 +232,13 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     args.numWarpsPerGroup = numWarpsPerGroup;
     args.phases = params.phases;
     args.zeroCopy = params.zeroCopy;
-    args.numComms = params.numComms;
-    args.devComms = params.devComms;
+    args.devComm = params.devComm;
     args.windows = params.windows;
     args.signalsBase = params.signalsBase;
     args.timeoutCycles = params.timeoutCycles;
 
     return jit::launch_ll_combine(
+        params.nvlinkOnly,
         params.useLogFmt,
         params.quantizationRecipe,
         params.deviceSm,
@@ -250,28 +255,9 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
 }
 
 // ============================================================================
-// LL buffer-clean kernel (precompiled).
-//
-// Unlike dispatch/combine, clean has no runtime template parameters, so it is
-// statically compiled and launched directly (one cooperative block) instead of
-// going through JIT.
-// ============================================================================
-constexpr int kLlCleanNumThreads = 256;
-
-__launch_bounds__(kLlCleanNumThreads, 1) __global__ void ll_clean_low_latency_buffer_kernel(
-    const __grid_constant__ clean_low_latency_buffer_kernel_args_t p) {
-    clean_low_latency_buffer_kernel_impl<kLlCleanNumThreads>(
-        p.clean_0, p.num_clean_int_0,
-        p.clean_1, p.num_clean_int_1,
-        p.rankMask,
-        p.syncBuffer, p.syncWindow,
-        p.devComms, p.barrierSignalBase, p.timeoutCycles);
-}
-
-// ============================================================================
 // LL buffer-clean wrapper
 // ============================================================================
-void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream) {
+ncclResult_t call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream) {
     clean_low_latency_buffer_kernel_args_t args{};
     args.clean_0 = params.clean_0;
     args.num_clean_int_0 = params.num_clean_int_0;
@@ -280,12 +266,11 @@ void call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cu
     args.rankMask = params.rankMask;
     args.syncBuffer = params.syncBuffer;
     args.syncWindow = params.syncWindow;
-    args.devComms = params.devComms;
+    args.devComm = params.devComm;
     args.barrierSignalBase = params.barrierSignalBase;
     args.timeoutCycles = params.timeoutCycles;
 
-    SETUP_LAUNCH_CONFIG(1, kLlCleanNumThreads, stream);
-    LAUNCH_KERNEL(&cfg, ll_clean_low_latency_buffer_kernel, args);
+    return jit::launch_ll_clean_low_latency_buffer(args, stream);
 }
 
 } // namespace ll
